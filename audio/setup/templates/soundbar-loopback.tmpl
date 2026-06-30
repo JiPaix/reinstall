@@ -1,0 +1,13 @@
+#!/bin/bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u {{.Username}})
+export PULSE_SERVER=unix:$XDG_RUNTIME_DIR/pulse/native
+
+if [ "$1" = "start" ]; then
+  sleep 1
+  pactl set-default-sink bt_swap_sink
+
+elif [ "$1" = "stop" ]; then
+  # Clear configured default so WirePlumber falls back to pure priority order
+  rm -f $HOME/.local/state/wireplumber/default-nodes
+  wpctl clear-default
+fi

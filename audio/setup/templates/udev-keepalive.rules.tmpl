@@ -1,0 +1,5 @@
+ACTION=="add", SUBSYSTEM=="input", ATTRS{name}=="{{.BtInputName}}", \
+  RUN+="{{.ScriptsDir}}/soundbar-keepalive start"
+
+ACTION=="remove", SUBSYSTEM=="input", ATTRS{name}=="{{.BtInputName}}", \
+  RUN+="{{.ScriptsDir}}/soundbar-keepalive stop"

@@ -1,0 +1,4 @@
+#!/bin/bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u {{.Username}})
+systemctl --user --machine={{.Username}}@ $1 soundbar-keepalive.service
+systemctl --user --machine={{.Username}}@ $1 soundbar-loopback.service

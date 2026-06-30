@@ -1,0 +1,13 @@
+[Unit]
+Description=Soundbar channel swap loopback
+After=pipewire-pulse.service
+Requires=pipewire-pulse.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={{.ScriptsDir}}/soundbar-loopback start
+ExecStop={{.ScriptsDir}}/soundbar-loopback stop
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,36 @@
+wireplumber.settings = {
+  default-policy.move   = true
+  linking.follow-default-target = true
+}
+{{if or .BTPriorities .DisabledBT}}
+monitor.bluez.rules = [
+{{- range .BTPriorities}}
+  {
+    matches = [{ node.name = "{{.Name}}" }]
+    actions = { update-props = { priority.session = {{.Prio}} } }
+  }
+{{- end}}
+{{- range .DisabledBT}}
+  {
+    matches = [{ node.name = "{{.}}" }]
+    actions = { update-props = { device.disabled = true } }
+  }
+{{- end}}
+]
+{{end -}}
+{{if or .ALSAPriorities .DisabledCards}}
+monitor.alsa.rules = [
+{{- range .ALSAPriorities}}
+  {
+    matches = [{ node.name = "{{.Name}}" }]
+    actions = { update-props = { priority.session = {{.Prio}} } }
+  }
+{{- end}}
+{{- range .DisabledCards}}
+  {
+    matches = [{ device.name = "{{.}}" }]
+    actions = { update-props = { device.profile = "off" } }
+  }
+{{- end}}
+]
+{{end -}}

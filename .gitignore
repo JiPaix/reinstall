@@ -1,0 +1,36 @@
+# --- Secrets / credentials (defensive: never commit, even to a private repo) ---
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*.secret
+secrets.*
+credentials.*
+*.crt
+
+# --- Compiled binaries / build artifacts ---
+# Go binaries are also covered by per-subdir .gitignore, repeated here for safety.
+/screen/swapscreen-server
+/screen/swapscreen-setup
+/audio/soundbar-status-server
+/audio/soundbar-setup
+*.exe
+*.out
+
+# --- Machine-specific files generated at install time ---
+/screen/swapscreen.sh
+/screen/setup/profiles.conf
+/audio/setup/generated/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

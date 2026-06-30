@@ -1,0 +1,11 @@
+#!/bin/sh
+# Reports whether the primary soundbar is active as JSON: { "soundbar": true|false }
+# Bluetooth: the monitor source is absent while disconnected, so reports false.
+state=$(
+  pactl list short sources |
+  awk -v src="{{.MonitorSource}}" '$2 == src { print $NF }'
+)
+
+[ "$state" = "RUNNING" ] && val=true || val=false
+
+printf '{ "soundbar": %s }\n' "$val"

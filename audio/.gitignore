@@ -1,0 +1,6 @@
+# Build artifacts (rebuilt by ../audio.sh)
+/soundbar-status-server
+/soundbar-setup
+
+# Staged by soundbar-setup at install time (udev rule + vars.sh)
+/setup/generated/

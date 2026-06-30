@@ -1,0 +1,21 @@
+[Unit]
+Description=swapscreen HTTP server (wraps the swapscreen display-toggle script)
+# Tie the service to the graphical user session: gdctl/mutter (used by
+# swapscreen) need the session D-Bus and the display to be up. PartOf +
+# graphical-session.target means it starts once the GUI session is ready and
+# stops when the session ends.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/swapscreen-server
+# swapscreen lives in ~/.local/bin; gdctl/systemctl/journalctl/sed/... in the
+# system bin dirs. The binary inherits this PATH when it shells out.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PORT=7920
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

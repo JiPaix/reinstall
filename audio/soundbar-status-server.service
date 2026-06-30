@@ -1,0 +1,20 @@
+[Unit]
+Description=soundbar-status HTTP server (wraps the soundbar-status script)
+# soundbar-status shells out to pactl, which needs the user PipeWire/PulseAudio
+# session to be up. Order after pipewire-pulse so the socket exists; Wants (not
+# Requires) so the server still starts to report "false" if audio is down.
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/soundbar-status-server
+# soundbar-status lives in ~/.local/bin; pactl/awk/... in the system bin dirs.
+# The binary inherits this PATH when it shells out.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PORT=7921
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
