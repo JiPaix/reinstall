@@ -1,0 +1,52 @@
+name: Release
+
+# Build the four Go binaries (server + interactive setup, for each of screen
+# and audio) and attach them — plus the two static systemd unit files — to a
+# GitHub Release. The install scripts (screen.sh / audio.sh) download these
+# assets, so no Go toolchain is needed on the target machine.
+#
+# Trigger: push a version tag, e.g.
+#     git tag v1.0.0 && git push origin v1.0.0
+# Or run manually from the Actions tab (workflow_dispatch).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the Release and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build screen binaries
+        working-directory: screen
+        run: |
+          go build -trimpath -ldflags='-s -w' -o ../dist/swapscreen-server .
+          go build -trimpath -ldflags='-s -w' -o ../dist/swapscreen-setup ./setup
+
+      - name: Build audio binaries
+        working-directory: audio
+        run: |
+          go build -trimpath -ldflags='-s -w' -o ../dist/soundbar-status-server .
+          go build -trimpath -ldflags='-s -w' -o ../dist/soundbar-setup ./setup
+
+      - name: Stage static systemd units
+        run: |
+          cp screen/swapscreen-server.service dist/
+          cp audio/soundbar-status-server.service dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

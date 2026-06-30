@@ -13,6 +13,13 @@ secrets.*
 credentials.*
 *.crt
 
+# --- Go vendored dependencies ---
+# Not committed: binaries are built in CI (go mod download) and the install
+# scripts download them from the GitHub Release. Kept on disk for offline
+# local builds; regenerate any time with `go mod vendor` in screen/ or audio/.
+/screen/vendor/
+/audio/vendor/
+
 # --- Compiled binaries / build artifacts ---
 # Go binaries are also covered by per-subdir .gitignore, repeated here for safety.
 /screen/swapscreen-server

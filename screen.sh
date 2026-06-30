@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # swapscreen Setup Script
-# - Builds the Go HTTP server + the interactive setup CLI in screen/
+# - Downloads the prebuilt HTTP server + interactive setup CLI from the Release
 # - Runs the interactive setup (detect monitors → build monitor/tv/taiko grids),
 #   which generates screen/swapscreen.sh from the engine template
 # - Installs swapscreen + swapscreen-server to ~/.local/bin and the systemd unit
@@ -43,14 +43,33 @@ ask() {
   echo -e "${BOLD}$1${NC}"
 }
 
-# Paths — resolved relative to this script so it works from any CWD.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$SCRIPT_DIR/screen"
+# --- Release source ---------------------------------------------------------
+# Binaries are built by GitHub Actions and downloaded from the Release here, so
+# this script needs no Go toolchain and works piped from curl. Override REPO or
+# pin RELEASE_TAG via the environment if you fork or want a specific version.
+REPO="${REPO:-JiPaix/reinstall}"
+RELEASE_TAG="${RELEASE_TAG:-latest}"
+
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 SERVICE="swapscreen-server.service"
 SERVER_PORT=7920   # must match Environment=PORT= in $SERVICE
 SUNSHINE_KMS_CACHE="$HOME/.config/sunshine/kms_index_cache"
+
+# Temp workspace for the downloaded binaries + generated script. Auto-removed.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# fetch <asset> <dest> — download one asset from the GitHub Release.
+fetch() {
+  local asset="$1" dest="$2" url
+  if [ "$RELEASE_TAG" = latest ]; then
+    url="https://github.com/$REPO/releases/latest/download/$asset"
+  else
+    url="https://github.com/$REPO/releases/download/$RELEASE_TAG/$asset"
+  fi
+  curl -fSL --proto '=https' --tlsv1.2 "$url" -o "$dest"
+}
 
 # =============================================================================
 # STEP 0 — Cleanup previous install if any
@@ -69,10 +88,6 @@ if command -v ufw &>/dev/null; then
   sudo ufw delete allow "$SERVER_PORT/tcp" 2>/dev/null && print_ok "Removed ufw rule $SERVER_PORT/tcp" || true
 fi
 
-# Remove generated artifacts so the run regenerates them from fresh choices.
-[ -f "$SRC/swapscreen.sh" ]          && rm -f "$SRC/swapscreen.sh"          && print_ok "Removed generated swapscreen.sh"
-[ -f "$SRC/setup/profiles.conf" ]    && rm -f "$SRC/setup/profiles.conf"    && print_ok "Removed generated profiles.conf"
-
 # Remove the engine's runtime KMS cache (leaves sunshine.conf untouched).
 [ -f "$SUNSHINE_KMS_CACHE" ]         && rm -f "$SUNSHINE_KMS_CACHE"         && print_ok "Removed Sunshine KMS cache"
 
@@ -80,12 +95,12 @@ systemctl --user daemon-reload
 print_ok "Cleanup done"
 
 # =============================================================================
-# STEP 1 — Toolchain (Go)
+# STEP 1 — Download prebuilt binaries from the GitHub Release
 # =============================================================================
-print_header "Checking Go Toolchain"
+print_header "Downloading Binaries"
 
-if ! command -v go &>/dev/null; then
-  print_warn "go is not installed"
+if ! command -v curl &>/dev/null; then
+  print_warn "curl is not installed"
   ask "Which package manager do you use?"
   echo "  1) pacman"
   echo "  2) paru"
@@ -99,28 +114,16 @@ if ! command -v go &>/dev/null; then
     *) print_error "Invalid choice"; exit 1 ;;
   esac
 
-  print_info "Installing go with: $PKG_MANAGER"
-  $PKG_MANAGER go
-
-  if ! command -v go &>/dev/null; then
-    print_error "go still not found after install — aborting"
-    exit 1
-  fi
+  print_info "Installing curl with: $PKG_MANAGER"
+  $PKG_MANAGER curl
 fi
-print_ok "go available: $(go version)"
 
-# =============================================================================
-# STEP 2 — Build the server and the interactive setup CLI
-# =============================================================================
-print_header "Building Go Binaries"
-
-# Build into the source tree first so a failed build never clobbers a working
-# install (the cleanup step already removed the old binary, the new ones only
-# reach ~/.local/bin in STEP 5). vendor/ makes this build offline.
-( cd "$SRC" && go build -o swapscreen-server . )
-print_ok "Built $SRC/swapscreen-server"
-( cd "$SRC" && go build -o swapscreen-setup ./setup )
-print_ok "Built $SRC/swapscreen-setup"
+print_info "Fetching from $REPO ($RELEASE_TAG)"
+fetch swapscreen-server          "$WORK/swapscreen-server"
+fetch swapscreen-setup           "$WORK/swapscreen-setup"
+fetch swapscreen-server.service  "$WORK/swapscreen-server.service"
+chmod +x "$WORK/swapscreen-server" "$WORK/swapscreen-setup"
+print_ok "Downloaded swapscreen-server, swapscreen-setup, and unit file"
 
 # =============================================================================
 # STEP 3 — Interactive setup (generates swapscreen.sh)
@@ -130,13 +133,13 @@ print_header "Interactive Display Setup"
 print_info "Detecting monitors and building the monitor/tv/taiko layouts."
 print_warn "This needs a graphical session (gdctl) and an interactive terminal."
 
-( cd "$SRC" && ./swapscreen-setup )
+( cd "$WORK" && ./swapscreen-setup -profiles "$WORK/profiles.conf" -out "$WORK/swapscreen.sh" )
 
-if [ ! -f "$SRC/swapscreen.sh" ]; then
-  print_error "setup did not produce $SRC/swapscreen.sh — aborting"
+if [ ! -f "$WORK/swapscreen.sh" ]; then
+  print_error "setup did not produce swapscreen.sh — aborting"
   exit 1
 fi
-print_ok "Generated $SRC/swapscreen.sh"
+print_ok "Generated swapscreen.sh"
 
 # =============================================================================
 # STEP 4 — Install directories
@@ -150,15 +153,15 @@ print_ok "Ensured $BIN_DIR and $UNIT_DIR exist"
 # STEP 5 — Install server, generated script, and unit
 # (swapscreen-setup is a build-time tool — not installed; reconfigure = re-run.)
 # =============================================================================
-cp "$SRC/swapscreen-server" "$BIN_DIR/swapscreen-server"
+cp "$WORK/swapscreen-server" "$BIN_DIR/swapscreen-server"
 chmod +x "$BIN_DIR/swapscreen-server"
 print_ok "Installed $BIN_DIR/swapscreen-server"
 
-cp "$SRC/swapscreen.sh" "$BIN_DIR/swapscreen"
+cp "$WORK/swapscreen.sh" "$BIN_DIR/swapscreen"
 chmod +x "$BIN_DIR/swapscreen"
 print_ok "Installed $BIN_DIR/swapscreen"
 
-cp "$SRC/$SERVICE" "$UNIT_DIR/$SERVICE"
+cp "$WORK/$SERVICE" "$UNIT_DIR/$SERVICE"
 print_ok "Installed $UNIT_DIR/$SERVICE"
 
 # =============================================================================

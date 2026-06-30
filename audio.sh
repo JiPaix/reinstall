@@ -4,8 +4,8 @@
 # - Detect/install dependencies, then drive the Go interactive setup CLI
 #   (audio/setup → soundbar-setup) which renders all configs from templates
 #   straight to their final locations.
-# - This script orchestrates: cleanup, package install, Go build, running the
-#   wizard, the privileged udev install, service reload, and the firewall.
+# - This script orchestrates: cleanup, package install, binary download, running
+#   the wizard, the privileged udev install, service reload, and the firewall.
 # =============================================================================
 
 set -e
@@ -25,10 +25,30 @@ SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
 SCRIPTS_DIR="$HOME/.local/bin"
 UDEV_DIR="/etc/udev/rules.d"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$SCRIPT_DIR/audio"
-GENERATED_DIR="$SRC/setup/generated"
+# --- Release source ---------------------------------------------------------
+# Binaries are built by GitHub Actions and downloaded from the Release here, so
+# this script needs no Go toolchain and works piped from curl. Override REPO or
+# pin RELEASE_TAG via the environment if you fork or want a specific version.
+REPO="${REPO:-JiPaix/reinstall}"
+RELEASE_TAG="${RELEASE_TAG:-latest}"
+
+# Temp workspace for the downloaded binaries + staged config. Auto-removed.
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+GENERATED_DIR="$WORK/generated"
 SERVER_PORT=7921   # must match Environment=PORT= in soundbar-status-server.service
+
+# fetch <asset> <dest> — download one asset from the GitHub Release.
+fetch() {
+  local asset="$1" dest="$2" url
+  if [ "$RELEASE_TAG" = latest ]; then
+    url="https://github.com/$REPO/releases/latest/download/$asset"
+  else
+    url="https://github.com/$REPO/releases/download/$RELEASE_TAG/$asset"
+  fi
+  curl -fSL --proto '=https' --tlsv1.2 "$url" -o "$dest"
+}
 
 print_header() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 print_ok()     { echo -e "${GREEN}✓${NC} $1"; }
@@ -133,35 +153,21 @@ fi
 print_ok "mbeq plugin present"
 
 # =============================================================================
-# STEP 3 — Go toolchain
+# STEP 3 — Download prebuilt binaries from the GitHub Release
 # =============================================================================
-print_header "Checking Go Toolchain"
+print_header "Downloading Binaries"
 
-if ! command -v go &>/dev/null; then
-  print_warn "go not installed — installing with: $PKG_MANAGER"
-  $PKG_MANAGER go
-fi
-if ! command -v go &>/dev/null; then
-  print_error "go still not found after install — aborting"
-  exit 1
-fi
-print_ok "go available: $(go version)"
-
-if [ ! -d "$SRC" ]; then
-  print_error "audio/ source folder not found next to audio.sh — aborting"
-  exit 1
+if ! command -v curl &>/dev/null; then
+  print_warn "curl not installed — installing with: $PKG_MANAGER"
+  $PKG_MANAGER curl
 fi
 
-# =============================================================================
-# STEP 4 — Build the setup CLI and the status server
-# =============================================================================
-print_header "Building Go Binaries"
-
-# vendor/ makes these builds offline.
-( cd "$SRC" && go build -o soundbar-setup ./setup )
-print_ok "Built soundbar-setup"
-( cd "$SRC" && go build -o soundbar-status-server . )
-print_ok "Built soundbar-status-server"
+print_info "Fetching from $REPO ($RELEASE_TAG)"
+fetch soundbar-setup                   "$WORK/soundbar-setup"
+fetch soundbar-status-server           "$WORK/soundbar-status-server"
+fetch soundbar-status-server.service   "$WORK/soundbar-status-server.service"
+chmod +x "$WORK/soundbar-setup" "$WORK/soundbar-status-server"
+print_ok "Downloaded soundbar-setup, soundbar-status-server, and unit file"
 
 # =============================================================================
 # STEP 5 — Interactive setup (renders all configs from templates)
@@ -171,7 +177,7 @@ print_header "Interactive Audio Setup"
 print_info "Make sure all your devices are connected/paired before continuing."
 print_warn "This needs pipewire-pulse running (it is) and an interactive terminal."
 
-( cd "$SRC" && ./soundbar-setup )
+( cd "$WORK" && ./soundbar-setup -staging "$GENERATED_DIR" )
 
 if [ ! -f "$GENERATED_DIR/vars.sh" ]; then
   print_error "setup did not produce $GENERATED_DIR/vars.sh — aborting"
@@ -222,11 +228,11 @@ print_ok "PipeWire reloaded"
 # =============================================================================
 print_header "Soundbar Status HTTP Server"
 
-cp "$SRC/soundbar-status-server" "$SCRIPTS_DIR/soundbar-status-server"
+cp "$WORK/soundbar-status-server" "$SCRIPTS_DIR/soundbar-status-server"
 chmod +x "$SCRIPTS_DIR/soundbar-status-server"
 print_ok "Installed $SCRIPTS_DIR/soundbar-status-server"
 
-cp "$SRC/soundbar-status-server.service" "$SYSTEMD_USER_DIR/soundbar-status-server.service"
+cp "$WORK/soundbar-status-server.service" "$SYSTEMD_USER_DIR/soundbar-status-server.service"
 print_ok "Installed $SYSTEMD_USER_DIR/soundbar-status-server.service"
 
 systemctl --user daemon-reload
