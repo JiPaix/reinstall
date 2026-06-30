@@ -58,6 +58,20 @@ print_error()  { echo -e "${RED}✗${NC} $1"; }
 ask()          { echo -e "${BOLD}$1${NC}"; }
 
 # =============================================================================
+# Prerequisite — PipeWire
+# =============================================================================
+# This configures an existing PipeWire setup; it does not install PipeWire.
+# Packaging varies by distribution (pre-installed, split packages, …), so that
+# is left to you. Check up front since even the cleanup below drives pactl.
+for cmd in pipewire pactl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    print_error "$cmd not found — PipeWire (with pipewire-pulse) must be installed and running."
+    print_info  "Install the PipeWire stack for your distribution, then retry."
+    exit 1
+  fi
+done
+
+# =============================================================================
 # STEP 0 — Cleanup previous install if any
 # =============================================================================
 print_header "Cleaning Up Previous Config"
@@ -123,9 +137,11 @@ print_ok "Using: $PKG_MANAGER"
 # =============================================================================
 # STEP 2 — Check and install packages
 # =============================================================================
+# Only the EQ/processing helpers — the PipeWire stack itself is your
+# responsibility (checked at the top of this script).
 print_header "Checking Required Packages"
 
-REQUIRED_PACKAGES=(pipewire wireplumber pipewire-pulse ladspa swh-plugins ffmpeg)
+REQUIRED_PACKAGES=(ladspa swh-plugins ffmpeg)
 MISSING=()
 
 for pkg in "${REQUIRED_PACKAGES[@]}"; do

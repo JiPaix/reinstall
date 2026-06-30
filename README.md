@@ -9,6 +9,9 @@ setup, and installs a small background service. No toolchain required.
 
 ## Screen
 
+> **GNOME only.** Switching relies on `gdctl`, which ships with GNOME's
+> compositor (the `mutter` package). It won't work on other desktops.
+
 Lets you flip your display setup between layouts on demand — for example your
 desktop monitors versus the TV — instead of fiddling with display settings each
 time. The setup detects your monitors and builds the layouts; a small service
@@ -20,6 +23,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen
 ```
 
 ## Audio
+
+> **PipeWire required.** This configures a PipeWire setup; it does not install
+> PipeWire for you. Make sure PipeWire (with `pipewire-pulse` and WirePlumber)
+> is installed and running first — how varies by distribution.
 
 Sets up the audio path for a soundbar: applies an equalizer, keeps a Bluetooth
 soundbar from dozing off mid-silence, and runs a small service that reports the

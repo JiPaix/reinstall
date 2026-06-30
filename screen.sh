@@ -72,6 +72,18 @@ fetch() {
 }
 
 # =============================================================================
+# Prerequisite — GNOME (gdctl)
+# =============================================================================
+# swapscreen drives the display through gdctl, which ships with GNOME's
+# compositor (the `mutter` package) and only exists in a GNOME session. Check
+# before touching anything so a non-GNOME machine fails cleanly up front.
+if ! command -v gdctl &>/dev/null; then
+  print_error "gdctl not found — swapscreen requires GNOME."
+  print_info  "gdctl ships with GNOME (the 'mutter' package). Use a GNOME session, then retry."
+  exit 1
+fi
+
+# =============================================================================
 # STEP 0 — Cleanup previous install if any
 # =============================================================================
 print_header "Cleaning Up Previous Install"
