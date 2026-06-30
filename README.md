@@ -9,8 +9,8 @@ setup, and installs a small background service. No toolchain required.
 
 ## Screen
 
-> **Requirements:** GNOME only — switching relies on `gdctl`, which ships with
-> GNOME's compositor (the `mutter` package). Optionally syncs with
+> [!NOTE]
+> GNOME only. Optionally syncs with
 > [Sunshine](https://github.com/LizardByte/Sunshine) for game streaming if it's
 > installed; works fine without it.
 
@@ -26,9 +26,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen
 
 ## Audio
 
-> **Requirements:** a running PipeWire stack (`pipewire-pulse` + WirePlumber) —
-> you install this, since it varies by distribution. The script installs the
-> audio helpers it needs (`ladspa`, `swh-plugins`, `ffmpeg`).
+> [!IMPORTANT]
+> Install these yourself first (package names may vary by distribution):
+> `pipewire`, `pipewire-pulse`, `wireplumber`, `ladspa`, `swh-plugins`, `ffmpeg`.
 
 Sets up the audio path for a soundbar: applies an equalizer, keeps a Bluetooth
 soundbar from dozing off mid-silence, and runs a small service that reports the

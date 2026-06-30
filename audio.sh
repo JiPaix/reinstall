@@ -63,10 +63,10 @@ ask()          { echo -e "${BOLD}$1${NC}"; }
 # This configures an existing PipeWire setup; it does not install PipeWire.
 # Packaging varies by distribution (pre-installed, split packages, …), so that
 # is left to you. Check up front since even the cleanup below drives pactl.
-for cmd in pipewire pactl; do
+for cmd in pipewire pactl wireplumber; do
   if ! command -v "$cmd" &>/dev/null; then
-    print_error "$cmd not found — PipeWire (with pipewire-pulse) must be installed and running."
-    print_info  "Install the PipeWire stack for your distribution, then retry."
+    print_error "$cmd not found — the PipeWire stack must be installed and running."
+    print_info  "Install pipewire, pipewire-pulse and wireplumber for your distro, then retry."
     exit 1
   fi
 done
@@ -135,38 +135,25 @@ esac
 print_ok "Using: $PKG_MANAGER"
 
 # =============================================================================
-# STEP 2 — Check and install packages
+# STEP 2 — Verify the audio helpers (you install these; we only check)
 # =============================================================================
-# Only the EQ/processing helpers — the PipeWire stack itself is your
-# responsibility (checked at the top of this script).
-print_header "Checking Required Packages"
+# Like the PipeWire stack, the EQ/processing helpers are your responsibility —
+# packaging varies by distro. We just confirm they're present and stop with a
+# clear message if not.
+print_header "Verifying Audio Helpers"
 
-REQUIRED_PACKAGES=(ladspa swh-plugins ffmpeg)
-MISSING=()
+missing=()
+command -v ffmpeg &>/dev/null || missing+=("ffmpeg")
+# mbeq_1197.so comes from swh-plugins and needs the ladspa runtime. find exits 0
+# even with no match, so test that it actually printed a path.
+[ -n "$(find /usr/lib/ladspa -name 'mbeq_1197.so' 2>/dev/null)" ] || missing+=("ladspa + swh-plugins")
 
-for pkg in "${REQUIRED_PACKAGES[@]}"; do
-  if pacman -Q "$pkg" &>/dev/null; then
-    print_ok "$pkg already installed"
-  else
-    print_warn "$pkg missing"
-    MISSING+=("$pkg")
-  fi
-done
-
-if [ ${#MISSING[@]} -gt 0 ]; then
-  print_info "Installing: ${MISSING[*]}"
-  $PKG_MANAGER "${MISSING[@]}"
-  print_ok "Packages installed"
-else
-  print_ok "All packages present"
-fi
-
-# Verify mbeq plugin (the Go setup also checks, but fail early with a clear msg)
-if ! find /usr/lib/ladspa -name "mbeq_1197.so" &>/dev/null; then
-  print_error "mbeq_1197.so not found even after install — check swh-plugins"
+if [ ${#missing[@]} -gt 0 ]; then
+  print_error "Missing audio helpers: ${missing[*]}"
+  print_info  "Install ladspa, swh-plugins and ffmpeg for your distro, then retry."
   exit 1
 fi
-print_ok "mbeq plugin present"
+print_ok "Audio helpers present (ffmpeg, mbeq plugin)"
 
 # =============================================================================
 # STEP 3 — Download prebuilt binaries from the GitHub Release
