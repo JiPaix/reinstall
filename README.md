@@ -9,8 +9,10 @@ setup, and installs a small background service. No toolchain required.
 
 ## Screen
 
-> **GNOME only.** Switching relies on `gdctl`, which ships with GNOME's
-> compositor (the `mutter` package). It won't work on other desktops.
+> **Requirements:** GNOME only — switching relies on `gdctl`, which ships with
+> GNOME's compositor (the `mutter` package). Optionally syncs with
+> [Sunshine](https://github.com/LizardByte/Sunshine) for game streaming if it's
+> installed; works fine without it.
 
 Lets you flip your display setup between layouts on demand — for example your
 desktop monitors versus the TV — instead of fiddling with display settings each
@@ -24,9 +26,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen
 
 ## Audio
 
-> **PipeWire required.** This configures a PipeWire setup; it does not install
-> PipeWire for you. Make sure PipeWire (with `pipewire-pulse` and WirePlumber)
-> is installed and running first — how varies by distribution.
+> **Requirements:** a running PipeWire stack (`pipewire-pulse` + WirePlumber) —
+> you install this, since it varies by distribution. The script installs the
+> audio helpers it needs (`ladspa`, `swh-plugins`, `ffmpeg`).
 
 Sets up the audio path for a soundbar: applies an equalizer, keeps a Bluetooth
 soundbar from dozing off mid-silence, and runs a small service that reports the
