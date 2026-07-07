@@ -24,6 +24,7 @@ var colorOptions = []string{"default", "bt2100", "sdr-native"}
 func main() {
 	profilesOut := flag.String("profiles", "setup/profiles.conf", "path to write the captured profile arrays")
 	scriptOut := flag.String("out", "swapscreen.sh", "path to write the generated engine script")
+	gdmOut := flag.String("gdm", "gdm-monitors.xml", "path to write the generated GDM greeter layout")
 	dump := flag.Bool("dump", false, "print detected connectors and exit (no prompts)")
 	flag.Parse()
 
@@ -51,10 +52,10 @@ func main() {
 	tv := buildProfile("tv", conns)
 	taikoExtra := buildTaikoExtra(conns, monitor)
 
-	if err := Generate(*profilesOut, *scriptOut, monitor, tv, taikoExtra); err != nil {
+	if err := Generate(*profilesOut, *scriptOut, *gdmOut, conns, monitor, tv, taikoExtra); err != nil {
 		fatalf("generating files: %v", err)
 	}
-	fmt.Printf("\n✓ Wrote %s and %s\n", *profilesOut, *scriptOut)
+	fmt.Printf("\n✓ Wrote %s, %s, and %s\n", *profilesOut, *scriptOut, *gdmOut)
 }
 
 // buildProfile drives the full grid flow for a standalone mode and assigns a

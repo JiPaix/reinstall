@@ -1,0 +1,14 @@
+[Unit]
+Description=Force swapscreen into monitor mode on login
+# Runs once per graphical session start, right alongside swapscreen-server.
+# gdctl needs the session D-Bus and display up, hence the same gating.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/swapscreen --monitor
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=graphical-session.target

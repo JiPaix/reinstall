@@ -29,9 +29,12 @@ func (m Mode) Resolution() string { return fmt.Sprintf("%dx%d", m.W, m.H) }
 
 // Connector is a physical output (DP-1, HDMI-1, …) and its modes.
 type Connector struct {
-	Name  string // "DP-1"
-	Desc  string // "LG Electronics 27\""
-	Modes []Mode
+	Name    string // "DP-1"
+	Desc    string // "LG Electronics 27\""
+	Vendor  string // EDID vendor code, e.g. "IVM"
+	Product string // EDID product name, e.g. "PL2788H"
+	Serial  string // EDID serial, e.g. "0" or a real serial number
+	Modes   []Mode
 }
 
 // Label is a human-friendly one-liner for pickers.
@@ -101,6 +104,9 @@ var (
 	reMode         = regexp.MustCompile(`^(\d+)x(\d+)@([\d.]+)(\+vrr)?$`)
 	reScales       = regexp.MustCompile(`^Supported scales:\s*\[(.*)\]$`)
 	rePrefScale    = regexp.MustCompile(`^Preferred scale:\s*([\d.]+)$`)
+	reVendor       = regexp.MustCompile(`^Vendor:\s*(.*)$`)
+	reProduct      = regexp.MustCompile(`^Product:\s*(.*)$`)
+	reSerial       = regexp.MustCompile(`^Serial:\s*(.*)$`)
 	boxDrawingTrim = "│├└─ \t"
 )
 
@@ -128,6 +134,22 @@ func parseGdctlShow(s string) []Connector {
 			continue
 		}
 		if curConn == nil {
+			continue
+		}
+
+		// Vendor/Product/Serial sit right under the Monitor header, before the
+		// Modes (N) section — never re-checked once mode parsing has started
+		// since those keys don't recur inside a mode block.
+		if m := reVendor.FindStringSubmatch(content); m != nil {
+			curConn.Vendor = m[1]
+			continue
+		}
+		if m := reProduct.FindStringSubmatch(content); m != nil {
+			curConn.Product = m[1]
+			continue
+		}
+		if m := reSerial.FindStringSubmatch(content); m != nil {
+			curConn.Serial = m[1]
 			continue
 		}
 

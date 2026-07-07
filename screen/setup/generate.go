@@ -2,6 +2,7 @@ package main
 
 import (
 	_ "embed"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,9 +61,11 @@ func buildProfilesBlock(monitor, tv Profile, taikoExtra [][]Cell) string {
 	return b.String()
 }
 
-// Generate writes profiles.conf (the captured arrays) and the rendered
-// swapscreen.sh (the engine template with the arrays injected).
-func Generate(profilesPath, scriptPath string, monitor, tv Profile, taikoExtra [][]Cell) error {
+// Generate writes profiles.conf (the captured arrays), the rendered
+// swapscreen.sh (the engine template with the arrays injected), and
+// gdm-monitors.xml (the GDM greeter layout: monitor profile's primary screen
+// only, everything else explicitly disabled).
+func Generate(profilesPath, scriptPath, gdmPath string, conns []Connector, monitor, tv Profile, taikoExtra [][]Cell) error {
 	block := strings.TrimRight(buildProfilesBlock(monitor, tv, taikoExtra), "\n")
 
 	header := "# Généré par swapscreen-setup — ne pas éditer à la main.\n" +
@@ -76,7 +79,82 @@ func Generate(profilesPath, scriptPath string, monitor, tv Profile, taikoExtra [
 	}
 	script := strings.Replace(engineTemplate, profilesMarker, block, 1)
 	script = injectGeneratedHeader(script)
-	return writeFile(scriptPath, script)
+	if err := writeFile(scriptPath, script); err != nil {
+		return err
+	}
+
+	return writeFile(gdmPath, buildGDMMonitorsXML(conns, monitor))
+}
+
+// buildGDMMonitorsXML renders a mutter schema-v2 monitors.xml for the GDM
+// greeter. The greeter only ever needs to show the single monitor the user
+// picked as primary for the "monitor" profile — not the full desk grid — so
+// that one logical monitor is forced to (0,0) and every other detected
+// connector (2nd desk monitor, TV, taiko extra) is listed as disabled.
+func buildGDMMonitorsXML(conns []Connector, monitor Profile) string {
+	byName := make(map[string]Connector, len(conns))
+	for _, c := range conns {
+		byName[c.Name] = c
+	}
+
+	placed := monitor.AutoAlign()
+	var primary Placed
+	if len(placed) > 0 {
+		primary = placed[0]
+	}
+	for _, p := range placed {
+		if p.Primary {
+			primary = p
+			break
+		}
+	}
+	pc := byName[primary.Connector]
+
+	var b strings.Builder
+	b.WriteString("<monitors version=\"2\">\n  <configuration>\n")
+	b.WriteString("    <logicalmonitor>\n")
+	b.WriteString("      <x>0</x>\n      <y>0</y>\n")
+	fmt.Fprintf(&b, "      <scale>%s</scale>\n", formatScale(primary.Scale))
+	b.WriteString("      <primary>yes</primary>\n")
+	b.WriteString("      <monitor>\n        <monitorspec>\n")
+	writeMonitorSpec(&b, "          ", primary.Connector, pc)
+	b.WriteString("        </monitorspec>\n        <mode>\n")
+	fmt.Fprintf(&b, "          <width>%d</width>\n          <height>%d</height>\n          <rate>%s</rate>\n",
+		primary.W, primary.H, modeRate(primary.ModeSpec))
+	b.WriteString("        </mode>\n      </monitor>\n    </logicalmonitor>\n")
+
+	for _, c := range conns {
+		if c.Name == primary.Connector {
+			continue
+		}
+		b.WriteString("    <disabled>\n      <monitorspec>\n")
+		writeMonitorSpec(&b, "        ", c.Name, c)
+		b.WriteString("      </monitorspec>\n    </disabled>\n")
+	}
+
+	b.WriteString("  </configuration>\n</monitors>\n")
+	return b.String()
+}
+
+func writeMonitorSpec(b *strings.Builder, indent, connector string, c Connector) {
+	fmt.Fprintf(b, "%s<connector>%s</connector>\n", indent, xmlEscape(connector))
+	fmt.Fprintf(b, "%s<vendor>%s</vendor>\n", indent, xmlEscape(c.Vendor))
+	fmt.Fprintf(b, "%s<product>%s</product>\n", indent, xmlEscape(c.Product))
+	fmt.Fprintf(b, "%s<serial>%s</serial>\n", indent, xmlEscape(c.Serial))
+}
+
+// modeRate returns the refresh-rate portion of a "WxH@rate" mode spec.
+func modeRate(spec string) string {
+	if i := strings.IndexByte(spec, '@'); i >= 0 {
+		return spec[i+1:]
+	}
+	return spec
+}
+
+func xmlEscape(s string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
 }
 
 // injectGeneratedHeader inserts a "do not edit" banner just after the shebang.

@@ -1,7 +1,7 @@
 name: Release
 
 # Build the four Go binaries (server + interactive setup, for each of screen
-# and audio) and attach them — plus the two static systemd unit files — to a
+# and audio) and attach them — plus the three static systemd unit files — to a
 # GitHub Release. The install scripts (screen.sh / audio.sh) download these
 # assets, so no Go toolchain is needed on the target machine.
 #
@@ -43,6 +43,7 @@ jobs:
       - name: Stage static systemd units
         run: |
           cp screen/swapscreen-server.service dist/
+          cp screen/swapscreen-login.service dist/
           cp audio/soundbar-status-server.service dist/
 
       - name: Publish release

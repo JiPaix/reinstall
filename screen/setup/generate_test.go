@@ -22,11 +22,18 @@ func TestGenerateReproducesLegacyConfig(t *testing.T) {
 	taikoExtra := [][]Cell{{
 		{Connector: "DP-3", W: 1920, H: 1080, ModeSpec: "1920x1080@143.981", Scale: 1, Color: "bt2100", VRR: true},
 	}}
+	conns := []Connector{
+		{Name: "DP-1", Vendor: "GSM", Product: "LG ULTRAGEAR", Serial: "0x001"},
+		{Name: "DP-2", Vendor: "IVM", Product: "PL2788H", Serial: "0"},
+		{Name: "DP-3", Vendor: "GSM", Product: "LG ULTRAGEAR", Serial: "0x002"},
+		{Name: "HDMI-1", Vendor: "VES", Product: "65UHD_LCD_TV", Serial: "0"},
+	}
 
 	dir := t.TempDir()
 	profilesPath := filepath.Join(dir, "profiles.conf")
 	scriptPath := filepath.Join(dir, "swapscreen.sh")
-	if err := Generate(profilesPath, scriptPath, monitor, tv, taikoExtra); err != nil {
+	gdmPath := filepath.Join(dir, "gdm-monitors.xml")
+	if err := Generate(profilesPath, scriptPath, gdmPath, conns, monitor, tv, taikoExtra); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
 
@@ -60,6 +67,22 @@ func TestGenerateReproducesLegacyConfig(t *testing.T) {
 	}
 	if !strings.Contains(script, "TAIKO_PROFILE=(") || !strings.Contains(script, "MONITOR_PROFILE=(") {
 		t.Error("generated script missing injected profile arrays")
+	}
+
+	gdmXML := readFile(t, gdmPath)
+	if strings.Count(gdmXML, "<logicalmonitor>") != 1 {
+		t.Errorf("gdm-monitors.xml should have exactly one enabled logicalmonitor (the primary only):\n%s", gdmXML)
+	}
+	if !strings.Contains(gdmXML, "<connector>DP-1</connector>") || !strings.Contains(gdmXML, "<vendor>GSM</vendor>") {
+		t.Errorf("gdm-monitors.xml should enable DP-1 (the monitor profile's primary) with its EDID:\n%s", gdmXML)
+	}
+	for _, disabled := range []string{"DP-2", "DP-3", "HDMI-1"} {
+		if !strings.Contains(gdmXML, "<connector>"+disabled+"</connector>") {
+			t.Errorf("gdm-monitors.xml missing a <disabled> entry for %s:\n%s", disabled, gdmXML)
+		}
+	}
+	if strings.Count(gdmXML, "<disabled>") != 3 {
+		t.Errorf("gdm-monitors.xml should disable every non-primary connector (3), got:\n%s", gdmXML)
 	}
 }
 

@@ -357,6 +357,45 @@ active_monitors() {
     done <<< "$gdctl_output"
 }
 
+# Modes disponibles pour un connecteur donné (un par ligne, ex. "2560x1440@164.958",
+# "2560x1440@164.958+vrr", …), lus dans gdctl show -v.
+connector_modes() {  # $1 = connecteur (ex. DP-1)
+    local gdctl_output cur="" want="$1"
+    gdctl_output=$(gdctl show -v 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        if [[ "$line" =~ Monitor\ (DP-[0-9]+|HDMI-[0-9]+) ]]; then
+            cur="${BASH_REMATCH[1]}"
+            continue
+        fi
+        [[ "$cur" == "$want" ]] || continue
+        [[ "$line" =~ ([0-9]+x[0-9]+@[0-9.]+(\+vrr)?)[[:space:]]*$ ]] && echo "${BASH_REMATCH[1]}"
+    done <<< "$gdctl_output"
+}
+
+# Garde-fou : vérifie qu'un profil est applicable au matériel actuellement
+# détecté (chaque connecteur existe et propose exactement le mode demandé).
+# Sans ça, un profil obsolète (câblage changé, script restauré d'une ancienne
+# machine) échoue avec le message cryptique de gdctl ("Failed to create
+# configuration") au lieu de dire clairement quoi régénérer.
+validate_profile() {  # $1 = nom du tableau de profil
+    local -n SPECS="$1"
+    local rec
+    for rec in "${SPECS[@]}"; do
+        local -A f; parse_spec "$rec" f
+        local conn="${f[connector]}" mode="${f[mode]}"
+        [[ "${f[vrr]}" == true ]] && mode="${mode}+vrr"
+        local modes; modes="$(connector_modes "$conn")"
+        if [[ -z "$modes" ]]; then
+            out_error "connecteur '$conn' introuvable — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
+            return 1
+        fi
+        if ! grep -qxF "$mode" <<< "$modes"; then
+            out_error "'$conn' ne propose pas le mode '$mode' — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
+            return 1
+        fi
+    done
+}
+
 # Connecteurs propres au profil taiko : présents dans TAIKO_PROFILE mais pas
 # dans MONITOR_PROFILE. Sert de marqueur pour rapporter taiko comme « tv ».
 taiko_extra() {
@@ -486,6 +525,7 @@ active_set() {
 # ────────────────────────────────────────────────
 set_monitor_mode() {
     local previous="$1"
+    validate_profile MONITOR_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode monitor ($(profile_connectors MONITOR_PROFILE | tr '\n' ' '))…"
     apply_profile MONITOR_PROFILE
     $JSON_MODE || echo "✓ Mode monitor activé."
@@ -496,6 +536,7 @@ set_monitor_mode() {
 
 set_tv_mode() {
     local previous="$1"
+    validate_profile TV_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode tv ($(profile_connectors TV_PROFILE | tr '\n' ' '))…"
     apply_profile TV_PROFILE
     $JSON_MODE || echo "✓ Mode tv activé."
@@ -506,6 +547,7 @@ set_tv_mode() {
 
 set_taiko_mode() {
     local previous="$1"
+    validate_profile TAIKO_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode taiko ($(profile_connectors TAIKO_PROFILE | tr '\n' ' '))…"
     apply_profile TAIKO_PROFILE
     $JSON_MODE || echo "✓ Mode taiko activé."

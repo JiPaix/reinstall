@@ -3,8 +3,11 @@
 # swapscreen Setup Script
 # - Downloads the prebuilt HTTP server + interactive setup CLI from the Release
 # - Runs the interactive setup (detect monitors → build monitor/tv/taiko grids),
-#   which generates screen/swapscreen.sh from the engine template
-# - Installs swapscreen + swapscreen-server to ~/.local/bin and the systemd unit
+#   which generates screen/swapscreen.sh from the engine template, plus a
+#   gdm-monitors.xml for the GDM greeter (primary monitor only, rest disabled)
+# - Installs swapscreen + swapscreen-server to ~/.local/bin and the systemd
+#   units (server + a oneshot that forces monitor mode on every login)
+# - Installs the GDM greeter layout (needs sudo)
 # - Opens the server port in the firewall (ufw)
 # =============================================================================
 
@@ -53,6 +56,7 @@ RELEASE_TAG="${RELEASE_TAG:-latest}"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 SERVICE="swapscreen-server.service"
+LOGIN_SERVICE="swapscreen-login.service"
 SERVER_PORT=7920   # must match Environment=PORT= in $SERVICE
 SUNSHINE_KMS_CACHE="$HOME/.config/sunshine/kms_index_cache"
 
@@ -90,10 +94,12 @@ print_header "Cleaning Up Previous Install"
 
 systemctl --user stop    "$SERVICE" 2>/dev/null && print_ok "Stopped $SERVICE"    || true
 systemctl --user disable "$SERVICE" 2>/dev/null && print_ok "Disabled $SERVICE"   || true
+systemctl --user disable "$LOGIN_SERVICE" 2>/dev/null && print_ok "Disabled $LOGIN_SERVICE" || true
 
 [ -f "$BIN_DIR/swapscreen-server" ] && rm -f "$BIN_DIR/swapscreen-server" && print_ok "Removed previous server binary"
 [ -f "$BIN_DIR/swapscreen" ]        && rm -f "$BIN_DIR/swapscreen"        && print_ok "Removed previous swapscreen script"
 [ -f "$UNIT_DIR/$SERVICE" ]         && rm -f "$UNIT_DIR/$SERVICE"         && print_ok "Removed previous service unit"
+[ -f "$UNIT_DIR/$LOGIN_SERVICE" ]   && rm -f "$UNIT_DIR/$LOGIN_SERVICE"   && print_ok "Removed previous login unit"
 
 # Remove the firewall rule (re-added in STEP 7) so it never stacks/goes stale.
 if command -v ufw &>/dev/null; then
@@ -134,24 +140,32 @@ print_info "Fetching from $REPO ($RELEASE_TAG)"
 fetch swapscreen-server          "$WORK/swapscreen-server"
 fetch swapscreen-setup           "$WORK/swapscreen-setup"
 fetch swapscreen-server.service  "$WORK/swapscreen-server.service"
+fetch swapscreen-login.service   "$WORK/swapscreen-login.service"
 chmod +x "$WORK/swapscreen-server" "$WORK/swapscreen-setup"
-print_ok "Downloaded swapscreen-server, swapscreen-setup, and unit file"
+print_ok "Downloaded swapscreen-server, swapscreen-setup, and unit files"
 
 # =============================================================================
-# STEP 3 — Interactive setup (generates swapscreen.sh)
+# STEP 3 — Interactive setup (generates swapscreen.sh + gdm-monitors.xml)
 # =============================================================================
 print_header "Interactive Display Setup"
 
 print_info "Detecting monitors and building the monitor/tv/taiko layouts."
 print_warn "This needs a graphical session (gdctl) and an interactive terminal."
 
-( cd "$WORK" && ./swapscreen-setup -profiles "$WORK/profiles.conf" -out "$WORK/swapscreen.sh" )
+( cd "$WORK" && ./swapscreen-setup \
+    -profiles "$WORK/profiles.conf" \
+    -out      "$WORK/swapscreen.sh" \
+    -gdm      "$WORK/gdm-monitors.xml" )
 
 if [ ! -f "$WORK/swapscreen.sh" ]; then
   print_error "setup did not produce swapscreen.sh — aborting"
   exit 1
 fi
-print_ok "Generated swapscreen.sh"
+if [ ! -f "$WORK/gdm-monitors.xml" ]; then
+  print_error "setup did not produce gdm-monitors.xml — aborting"
+  exit 1
+fi
+print_ok "Generated swapscreen.sh and gdm-monitors.xml"
 
 # =============================================================================
 # STEP 4 — Install directories
@@ -176,13 +190,16 @@ print_ok "Installed $BIN_DIR/swapscreen"
 cp "$WORK/$SERVICE" "$UNIT_DIR/$SERVICE"
 print_ok "Installed $UNIT_DIR/$SERVICE"
 
-# =============================================================================
-# STEP 6 — Enable and (re)start the service
-# =============================================================================
-print_header "Enabling Service"
+cp "$WORK/$LOGIN_SERVICE" "$UNIT_DIR/$LOGIN_SERVICE"
+print_ok "Installed $UNIT_DIR/$LOGIN_SERVICE"
 
-# Order matters: daemon-reload so systemd sees the new unit, then enable to
-# create the graphical-session.target.wants symlink, then restart so an
+# =============================================================================
+# STEP 6 — Enable and (re)start the services
+# =============================================================================
+print_header "Enabling Services"
+
+# Order matters: daemon-reload so systemd sees the new units, then enable to
+# create the graphical-session.target.wants symlinks, then restart so an
 # already-running instance picks up the freshly built binary.
 systemctl --user daemon-reload
 print_ok "Reloaded systemd user units"
@@ -193,11 +210,33 @@ print_ok "Enabled $SERVICE"
 systemctl --user restart "$SERVICE"
 print_ok "(Re)started $SERVICE"
 
-print_info "Note: the unit is WantedBy=graphical-session.target, so it only"
-print_info "auto-starts inside a graphical login session (not over plain SSH)."
+systemctl --user enable --now "$LOGIN_SERVICE"
+print_ok "Enabled $LOGIN_SERVICE (and applied monitor mode now)"
+
+print_info "Note: both units are WantedBy=graphical-session.target, so they only"
+print_info "auto-start inside a graphical login session (not over plain SSH)."
 
 # =============================================================================
-# STEP 7 — Firewall (open the server port)
+# STEP 7 — GDM greeter layout (needs sudo; primary monitor only, rest disabled)
+# =============================================================================
+print_header "GDM Greeter Layout"
+
+GDM_DIR=""
+for d in /var/lib/gdm/seat0/config /var/lib/gdm/.config; do
+  [ -d "$d" ] && { GDM_DIR="$d"; break; }
+done
+
+if [ -z "$GDM_DIR" ]; then
+  print_warn "GDM greeter config dir not found — log in via GDM at least once, then re-run ./screen.sh"
+else
+  OWNER="$(sudo stat -c '%u:%g' "$GDM_DIR")"
+  sudo install -m 0600 -o "${OWNER%%:*}" -g "${OWNER##*:}" "$WORK/gdm-monitors.xml" "$GDM_DIR/monitors.xml"
+  print_ok "Installed GDM greeter layout → $GDM_DIR/monitors.xml"
+  print_info "Roll back anytime with: sudo rm $GDM_DIR/monitors.xml"
+fi
+
+# =============================================================================
+# STEP 8 — Firewall (open the server port)
 # =============================================================================
 print_header "Firewall"
 
