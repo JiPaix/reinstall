@@ -59,6 +59,8 @@ SERVICE="swapscreen-server.service"
 LOGIN_SERVICE="swapscreen-login.service"
 SERVER_PORT=7920   # must match Environment=PORT= in $SERVICE
 SUNSHINE_KMS_CACHE="$HOME/.config/sunshine/kms_index_cache"
+SUNSHINE_CONFIG="$HOME/.config/sunshine/sunshine.conf"
+SUNSHINE_APPS="$HOME/.config/sunshine/apps.json"
 
 # Temp workspace for the downloaded binaries + generated script. Auto-removed.
 WORK="$(mktemp -d)"
@@ -245,6 +247,174 @@ if command -v ufw &>/dev/null; then
   print_ok "Allowed $SERVER_PORT/tcp in ufw"
 else
   print_warn "ufw not installed — skipping firewall rule for $SERVER_PORT/tcp"
+fi
+
+# =============================================================================
+# STEP 9 — Sunshine integration (global_prep_cmd + apps.json)
+# =============================================================================
+# Sunshine's sunshine.conf has a `global_prep_cmd` setting: a JSON array of
+# {do, undo} commands run before/after every streamed app (unless that app
+# sets "exclude-global-prep-cmd": true). We use it to bump the TV connector's
+# scaling and push the client's HDR capability to both connectors on stream
+# start, and revert both on stream end — driven by this run's monitor/tv
+# profiles, via the external `displayconfig-mutter` helper (not part of this
+# repo; assumed on PATH). apps.json just needs the two baseline app entries
+# to exist so Sunshine has something to stream.
+print_header "Sunshine Integration"
+
+sunshine_installed() {
+  systemctl --user cat sunshine.service &>/dev/null \
+    || systemctl --user cat app-dev.lizardbyte.app.Sunshine.service &>/dev/null
+}
+
+if ! sunshine_installed; then
+  print_warn "Sunshine not installed — skipping apps.json/global_prep_cmd setup"
+else
+  if ! command -v jq &>/dev/null; then
+    print_warn "jq is not installed"
+    ask "Which package manager do you use?"
+    echo "  1) pacman"
+    echo "  2) paru"
+    echo "  3) yay"
+    read -rp "Choice [1-3]: " pm_choice
+
+    case $pm_choice in
+      1) PKG_MANAGER="sudo pacman -S --noconfirm" ;;
+      2) PKG_MANAGER="paru -S --noconfirm" ;;
+      3) PKG_MANAGER="yay -S --noconfirm" ;;
+      *) print_error "Invalid choice"; exit 1 ;;
+    esac
+
+    print_info "Installing jq with: $PKG_MANAGER"
+    $PKG_MANAGER jq
+  fi
+
+  sunshine_service_name() {
+    if systemctl --user cat sunshine.service &>/dev/null; then
+      echo "sunshine.service"
+    else
+      echo "app-dev.lizardbyte.app.Sunshine.service"
+    fi
+  }
+
+  # This run's profiles, produced by swapscreen-setup in STEP 3.
+  # shellcheck disable=SC1091
+  source "$WORK/profiles.conf"
+
+  # Primary connector of a profile: first record marked primary=true, else
+  # the first record's connector. Mirrors profile_primary() in the engine.
+  profile_primary_connector() {  # $1 = array name -> echoes connector
+    local -n arr="$1"
+    local rec tok conn is_primary first=""
+    for rec in "${arr[@]}"; do
+      conn=""; is_primary=false
+      for tok in $rec; do
+        case "$tok" in
+          connector=*)  conn="${tok#connector=}" ;;
+          primary=true) is_primary=true ;;
+        esac
+      done
+      [ -z "$first" ] && first="$conn"
+      $is_primary && { echo "$conn"; return; }
+    done
+    echo "$first"
+  }
+
+  # Color mode of a specific connector within a profile (default: "default").
+  profile_connector_color() {  # $1 = array name, $2 = connector -> echoes color
+    local -n arr="$1"
+    local rec tok conn color
+    for rec in "${arr[@]}"; do
+      conn=""; color="default"
+      for tok in $rec; do
+        case "$tok" in
+          connector=*) conn="${tok#connector=}" ;;
+          color=*)     color="${tok#color=}" ;;
+        esac
+      done
+      [ "$conn" = "$2" ] && { echo "$color"; return; }
+    done
+    echo "default"
+  }
+
+  TV_PRIMARY="$(profile_primary_connector TV_PROFILE)"
+  MON_PRIMARY="$(profile_primary_connector MONITOR_PROFILE)"
+  TV_HDR_UNDO=false
+  [ "$(profile_connector_color TV_PROFILE "$TV_PRIMARY")" = bt2100 ] && TV_HDR_UNDO=true
+  MON_HDR_UNDO=false
+  [ "$(profile_connector_color MONITOR_PROFILE "$MON_PRIMARY")" = bt2100 ] && MON_HDR_UNDO=true
+
+  # ${SUNSHINE_CLIENT_HDR} is Sunshine's own env var, evaluated by the `sh -c`
+  # below at stream time — kept literal here via a single-quoted printf
+  # format so this script's own expansion never touches it. Scaling literals
+  # (300/200) are intentionally left untouched.
+  DO_CMD=$(printf 'sh -c "displayconfig-mutter set --connector %s --scaling 300 --hdr ${SUNSHINE_CLIENT_HDR:-false} || true; displayconfig-mutter set --connector %s --hdr ${SUNSHINE_CLIENT_HDR:-false} || true"' \
+    "$TV_PRIMARY" "$MON_PRIMARY")
+  UNDO_CMD=$(printf 'sh -c "displayconfig-mutter set --connector %s --scaling 200 --hdr %s || true; displayconfig-mutter set --connector %s --hdr %s || true"' \
+    "$TV_PRIMARY" "$TV_HDR_UNDO" "$MON_PRIMARY" "$MON_HDR_UNDO")
+
+  PREP_ITEM=$(jq -n --arg do "$DO_CMD" --arg undo "$UNDO_CMD" '{do: $do, undo: $undo}')
+  print_ok "Computed global prep-cmd (tv=$TV_PRIMARY, monitor=$MON_PRIMARY)"
+
+  # -- sunshine.conf: upsert the global_prep_cmd line --------------------------
+  # sunshine.conf is a flat key = value file, not JSON, so we can't jq the
+  # whole file — only this key's value is inline JSON. sed is avoided because
+  # the value contains $, {, and " which are unsafe as a sed replacement.
+  set_conf_kv() {  # $1=file $2=key $3=value (single line, no newlines)
+    local file="$1" key="$2" value="$3" tmp
+    mkdir -p "$(dirname "$file")"
+    touch "$file"
+    tmp="$(mktemp)"
+    awk -v k="$key" '$0 !~ ("^[[:space:]]*" k "[[:space:]]*=")' "$file" > "$tmp"
+    printf '%s = %s\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$file"
+  }
+  set_conf_kv "$SUNSHINE_CONFIG" global_prep_cmd "$(jq -c -n --argjson item "$PREP_ITEM" '[$item]')"
+  print_ok "Updated $SUNSHINE_CONFIG (global_prep_cmd)"
+
+  # -- apps.json: bootstrap Desktop + Steam Big Picture if missing -------------
+  # No prep-cmd on Desktop — that logic now lives in global_prep_cmd above.
+  CANONICAL_APPS=$(jq -n '[
+    {
+      "auto-detach": true,
+      "exclude-global-prep-cmd": false,
+      "exit-timeout": 5,
+      "image-path": "desktop.png",
+      "name": "Desktop",
+      "wait-all": true
+    },
+    {
+      "detached": ["setsid steam steam://open/bigpicture"],
+      "image-path": "steam.png",
+      "name": "Steam Big Picture",
+      "prep-cmd": [
+        { "do": "", "undo": "setsid steam steam://close/bigpicture" }
+      ]
+    }
+  ]')
+
+  mkdir -p "$(dirname "$SUNSHINE_APPS")"
+  if [ ! -f "$SUNSHINE_APPS" ]; then
+    jq -n --argjson apps "$CANONICAL_APPS" \
+      '{apps: $apps, env: {"PATH": "$(PATH):$(HOME)/.local/bin"}}' \
+      > "$SUNSHINE_APPS"
+    print_ok "Created $SUNSHINE_APPS"
+  else
+    APPS_JSON_TMP="$(mktemp)"
+    jq --argjson newapps "$CANONICAL_APPS" '
+      (.apps // []) as $existing
+      | .apps = ($existing + [
+          $newapps[] | select(.name as $n | ($existing | any(.name == $n)) | not)
+        ])
+    ' "$SUNSHINE_APPS" > "$APPS_JSON_TMP" && mv "$APPS_JSON_TMP" "$SUNSHINE_APPS"
+    print_ok "Updated $SUNSHINE_APPS (added any missing apps by name; existing apps/env untouched)"
+  fi
+
+  if systemctl --user try-restart "$(sunshine_service_name)" 2>/dev/null; then
+    print_ok "Restarted Sunshine"
+  else
+    print_warn "Could not restart Sunshine — restart it manually to apply global_prep_cmd"
+  fi
 fi
 
 echo
