@@ -183,6 +183,54 @@ _in_list() {  # $1 = aiguille, $2.. = meule
     return 1
 }
 
+# ── Contournement de la boucle de détection TV sous KDE ──────────────────────
+# Quand une TV est éteinte mais son câble HDMI branché, KWin boucle
+# détection→retrait→détection. Le correctif force le statut DRM du connecteur
+# (/sys/class/drm/card*-<conn>/status) autour de l'activation kscreen-doctor.
+# L'écriture dans /sys exige root ; screen.sh installe (KDE only) un helper root
+# + une règle sudoers NOPASSWD pour qu'il marche même hors terminal (service de
+# login, bascule déclenchée par Sunshine).
+DRM_HELPER=/usr/local/bin/swapscreen-drm
+KDE_TV_SAFE_MODE="1280x720@60"   # mode bas « sûr » posé avant le mode réel
+
+drm_status() {  # $1 = connecteur, $2 = detect|off|on
+    if ! sudo -n "$DRM_HELPER" "$1" "$2" 2>/dev/null; then
+        $JSON_MODE || echo "⚠ $DRM_HELPER indisponible (sudoers ?) — statut DRM '$2' non appliqué pour $1" >&2
+    fi
+    return 0
+}
+
+# Réveille la TV : force la redétection DRM puis pose un mode bas avant le mode
+# réel, pour laisser l'EDID se négocier sans relancer la boucle.
+tv_wake_kde() {  # $1 = connecteur primaire TV
+    local tv="$1"
+    [[ -z "$tv" ]] && return 0
+    drm_status "$tv" detect
+    sleep 1
+    kscreen-doctor "output.${tv}.enable" "output.${tv}.mode.${KDE_TV_SAFE_MODE}" 2>/dev/null || true
+    sleep 1
+}
+
+# Endort la TV : désactive la sortie puis coupe son statut DRM pour stopper la
+# boucle tant qu'on n'est pas en mode tv.
+tv_sleep_kde() {  # $1 = connecteur primaire TV
+    local tv="$1"
+    [[ -z "$tv" ]] && return 0
+    kscreen-doctor "output.${tv}.disable" 2>/dev/null || true
+    drm_status "$tv" off
+}
+
+# Endort la TV UNIQUEMENT si son connecteur primaire n'appartient pas au profil
+# cible (jamais couper un écran effectivement utilisé par le profil).
+tv_sleep_if_absent() {  # $1 = nom du profil cible
+    local tv c; tv="$(profile_primary TV_PROFILE)"
+    [[ -z "$tv" ]] && return 0
+    while IFS= read -r c; do
+        [[ "$c" == "$tv" ]] && return 0
+    done < <(profile_connectors "$1")
+    tv_sleep_kde "$tv"
+}
+
 # ────────────────────────────────────────────────
 # Sunshine
 # ────────────────────────────────────────────────
@@ -611,7 +659,8 @@ active_unexpected_monitors() {  # $@ = connecteurs autorisés
 # mode tv, à cause d'une course au hotplug). On ré-applique le profil tant qu'un
 # moniteur hors-profil est actif, en exigeant 2 sondages propres consécutifs.
 reconcile_profile() {  # $1 = nom du tableau de profil ; positionne _RECONCILE_DIRTY
-    # Garde-fou propre à mutter (course au hotplug) : sans objet sous KDE.
+    # Sous KDE le correctif DRM (drm_status) remplace ce garde-fou anti-hotplug
+    # propre à mutter : no-op.
     if is_kde; then _RECONCILE_DIRTY=false; return 0; fi
     _RECONCILE_DIRTY=false
     local allowed
@@ -646,6 +695,8 @@ set_monitor_mode() {
     validate_profile MONITOR_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode monitor ($(profile_connectors MONITOR_PROFILE | tr '\n' ' '))…"
     apply_profile MONITOR_PROFILE
+    # KDE : endormir la TV (statut DRM off) si elle ne sert pas dans ce profil.
+    is_kde && tv_sleep_if_absent MONITOR_PROFILE
     $JSON_MODE || echo "✓ Mode monitor activé."
     reconcile_profile MONITOR_PROFILE
     sunshine_update_output MONITOR_PROFILE
@@ -656,6 +707,8 @@ set_tv_mode() {
     local previous="$1"
     validate_profile TV_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode tv ($(profile_connectors TV_PROFILE | tr '\n' ' '))…"
+    # KDE : réveiller la TV (redétection DRM + mode bas) avant le mode réel.
+    is_kde && tv_wake_kde "$(profile_primary TV_PROFILE)"
     apply_profile TV_PROFILE
     $JSON_MODE || echo "✓ Mode tv activé."
     reconcile_profile TV_PROFILE
@@ -668,6 +721,8 @@ set_taiko_mode() {
     validate_profile TAIKO_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode taiko ($(profile_connectors TAIKO_PROFILE | tr '\n' ' '))…"
     apply_profile TAIKO_PROFILE
+    # KDE : endormir la TV (statut DRM off) si elle ne sert pas dans ce profil.
+    is_kde && tv_sleep_if_absent TAIKO_PROFILE
     $JSON_MODE || echo "✓ Mode taiko activé."
     reconcile_profile TAIKO_PROFILE
     sunshine_update_output TAIKO_PROFILE
