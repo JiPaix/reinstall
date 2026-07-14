@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -25,15 +26,18 @@ func main() {
 	profilesOut := flag.String("profiles", "setup/profiles.conf", "path to write the captured profile arrays")
 	scriptOut := flag.String("out", "swapscreen.sh", "path to write the generated engine script")
 	gdmOut := flag.String("gdm", "gdm-monitors.xml", "path to write the generated GDM greeter layout")
+	deFlag := flag.String("de", "", "desktop backend: gnome (gdctl) | kde (kscreen-doctor) — default: autodetect")
 	dump := flag.Bool("dump", false, "print detected connectors and exit (no prompts)")
 	flag.Parse()
 
-	conns, err := DetectConnectors()
+	backend := resolveBackend(*deFlag)
+
+	conns, err := DetectConnectors(backend)
 	if err != nil {
-		fatalf("%v\n(swapscreen-setup needs a running GNOME session — gdctl)", err)
+		fatalf("%v\n(swapscreen-setup needs a running %s session — %s)", err, backend, backendTool(backend))
 	}
 	if len(conns) == 0 {
-		fatalf("no monitors detected via 'gdctl show -m'")
+		fatalf("no monitors detected via %s", backendTool(backend))
 	}
 
 	if *dump {
@@ -52,10 +56,46 @@ func main() {
 	tv := buildProfile("tv", conns)
 	taikoExtra := buildTaikoExtra(conns, monitor)
 
-	if err := Generate(*profilesOut, *scriptOut, *gdmOut, conns, monitor, tv, taikoExtra); err != nil {
+	if err := Generate(*profilesOut, *scriptOut, *gdmOut, backend, conns, monitor, tv, taikoExtra); err != nil {
 		fatalf("generating files: %v", err)
 	}
-	fmt.Printf("\n✓ Wrote %s, %s, and %s\n", *profilesOut, *scriptOut, *gdmOut)
+	if backend == "kde" {
+		fmt.Printf("\n✓ Wrote %s and %s (KDE backend — no GDM greeter layout)\n", *profilesOut, *scriptOut)
+	} else {
+		fmt.Printf("\n✓ Wrote %s, %s, and %s\n", *profilesOut, *scriptOut, *gdmOut)
+	}
+}
+
+// resolveBackend picks the display backend: an explicit -de flag wins, else
+// $XDG_CURRENT_DESKTOP, else whichever of gdctl/kscreen-doctor is on PATH,
+// defaulting to gnome.
+func resolveBackend(flagVal string) string {
+	switch strings.ToLower(flagVal) {
+	case "gnome", "kde":
+		return strings.ToLower(flagVal)
+	}
+	de := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP"))
+	switch {
+	case strings.Contains(de, "kde"), strings.Contains(de, "plasma"):
+		return "kde"
+	case strings.Contains(de, "gnome"):
+		return "gnome"
+	}
+	if _, err := exec.LookPath("gdctl"); err == nil {
+		return "gnome"
+	}
+	if _, err := exec.LookPath("kscreen-doctor"); err == nil {
+		return "kde"
+	}
+	return "gnome"
+}
+
+// backendTool names the detection binary for a backend (for error messages).
+func backendTool(backend string) string {
+	if backend == "kde" {
+		return "kscreen-doctor"
+	}
+	return "gdctl"
 }
 
 // buildProfile drives the full grid flow for a standalone mode and assigns a

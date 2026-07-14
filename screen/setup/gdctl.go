@@ -88,10 +88,19 @@ func (c Connector) DefaultMode() Mode {
 	return Mode{}
 }
 
-// DetectConnectors runs `gdctl show -v` and parses its output. The verbose form
+// DetectConnectors dispatches monitor detection to the chosen desktop backend:
+// gdctl for GNOME, kscreen-doctor for KDE. Both produce the same Connector model.
+func DetectConnectors(backend string) ([]Connector, error) {
+	if backend == "kde" {
+		return detectKscreen()
+	}
+	return detectGdctl()
+}
+
+// detectGdctl runs `gdctl show -v` and parses its output. The verbose form
 // (not -m, which is headers-only) lists every mode together with its supported
 // scales and is-current/is-preferred properties.
-func DetectConnectors() ([]Connector, error) {
+func detectGdctl() ([]Connector, error) {
 	out, err := exec.Command("gdctl", "show", "-v").Output()
 	if err != nil {
 		return nil, fmt.Errorf("running 'gdctl show -v': %w", err)

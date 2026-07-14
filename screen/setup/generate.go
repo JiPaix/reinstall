@@ -51,22 +51,26 @@ func arrayLiteral(name string, placed []Placed) string {
 // extra) is auto-aligned and normalized as one grid, so its cells are emitted
 // explicitly (it can't reuse MONITOR_PROFILE — the monitor rows shift down to
 // make room above).
-func buildProfilesBlock(monitor, tv Profile, taikoExtra [][]Cell) string {
+func buildProfilesBlock(backend string, monitor, tv Profile, taikoExtra [][]Cell) string {
 	taiko := Profile{Rows: append(append([][]Cell{}, monitor.Rows...), taikoExtra...)}
 
 	var b strings.Builder
+	// BACKEND drives the engine's apply/query dispatch (gnome=gdctl, kde=
+	// kscreen-doctor) and is also read by screen.sh when it sources this block.
+	fmt.Fprintf(&b, "BACKEND=%s\n\n", backend)
 	b.WriteString(arrayLiteral("MONITOR_PROFILE", monitor.AutoAlign()))
 	b.WriteString(arrayLiteral("TV_PROFILE", tv.AutoAlign()))
 	b.WriteString(arrayLiteral("TAIKO_PROFILE", taiko.AutoAlign()))
 	return b.String()
 }
 
-// Generate writes profiles.conf (the captured arrays), the rendered
-// swapscreen.sh (the engine template with the arrays injected), and
-// gdm-monitors.xml (the GDM greeter layout: monitor profile's primary screen
-// only, everything else explicitly disabled).
-func Generate(profilesPath, scriptPath, gdmPath string, conns []Connector, monitor, tv Profile, taikoExtra [][]Cell) error {
-	block := strings.TrimRight(buildProfilesBlock(monitor, tv, taikoExtra), "\n")
+// Generate writes profiles.conf (the captured arrays, prefixed with BACKEND=)
+// and the rendered swapscreen.sh (the engine template with that block injected).
+// For the GNOME backend it also writes gdm-monitors.xml (the GDM greeter layout:
+// monitor profile's primary screen only, everything else explicitly disabled);
+// KDE uses SDDM, which has no equivalent, so that file is skipped there.
+func Generate(profilesPath, scriptPath, gdmPath, backend string, conns []Connector, monitor, tv Profile, taikoExtra [][]Cell) error {
+	block := strings.TrimRight(buildProfilesBlock(backend, monitor, tv, taikoExtra), "\n")
 
 	header := "# Généré par swapscreen-setup — ne pas éditer à la main.\n" +
 		"# Reconfigurer : relancer ./screen.sh\n\n"
@@ -83,7 +87,10 @@ func Generate(profilesPath, scriptPath, gdmPath string, conns []Connector, monit
 		return err
 	}
 
-	return writeFile(gdmPath, buildGDMMonitorsXML(conns, monitor))
+	if backend == "gnome" {
+		return writeFile(gdmPath, buildGDMMonitorsXML(conns, monitor))
+	}
+	return nil
 }
 
 // buildGDMMonitorsXML renders a mutter schema-v2 monitors.xml for the GDM
