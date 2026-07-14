@@ -59,7 +59,8 @@ EXEMPLES
   $(basename "$0") --json            # bascule + sortie JSON
 
 DÉPENDANCES
-  gdctl  — outil de contrôle GNOME Display Config
+  gdctl          — GNOME Display Config (backend gnome)
+  kscreen-doctor — KScreen (backend kde)
 
 EOF
 }
@@ -126,6 +127,9 @@ Succès.
 Argument inconnu ou erreur d'exécution de gdctl.
 .SH DÉPENDANCES
 .BR gdctl (1)
+(backend gnome) ou
+.BR kscreen-doctor (1)
+(backend kde)
 .SH AUTEUR
 Configuration personnelle — usage interne.
 MANPAGE
@@ -162,6 +166,21 @@ out_error() {      # $1 = message
     else
         echo "Erreur : $1" >&2
     fi
+}
+
+# ────────────────────────────────────────────────
+# Backend (gnome=gdctl, kde=kscreen-doctor)
+# ────────────────────────────────────────────────
+# BACKEND est injecté par swapscreen-setup en tête du bloc de profils ci-dessus.
+# Les fonctions de détection/application ci-dessous aiguillent dessus.
+is_kde() { [[ "${BACKEND:-gnome}" == kde ]]; }
+
+# Vrai si $1 figure dans la liste $2… (comparaison exacte).
+_in_list() {  # $1 = aiguille, $2.. = meule
+    local needle="$1"; shift
+    local x
+    for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done
+    return 1
 }
 
 # ────────────────────────────────────────────────
@@ -342,6 +361,10 @@ sunshine_update_output() {  # $1 = nom du profil (MONITOR_PROFILE, TV_PROFILE, �
 # ────────────────────────────────────────────────
 # Liste les connecteurs actuellement actifs (ayant un « Current mode »).
 active_monitors() {
+    if is_kde; then active_monitors_kde; else active_monitors_gnome; fi
+}
+
+active_monitors_gnome() {
     local gdctl_output cur=""
     gdctl_output=$(gdctl show 2>/dev/null) || {
         out_error "impossible d'exécuter gdctl show"
@@ -357,9 +380,28 @@ active_monitors() {
     done <<< "$gdctl_output"
 }
 
+# `kscreen-doctor -o` en texte, dépouillé d'éventuels codes ANSI (au cas où la
+# couleur ne serait pas désactivée quand la sortie n'est pas un terminal).
+kscreen_show() { kscreen-doctor -o 2>/dev/null | sed -r 's/\x1b\[[0-9;]*[mK]//g'; }
+
+# Connecteurs actifs sous KDE : chaque bloc « Output: <id> <name> » suivi d'une
+# ligne « enabled ». Accepte tout nom DRM (HDMI-A-1, eDP-1, DP-1-1, …).
+active_monitors_kde() {
+    local out
+    out=$(kscreen_show) || { out_error "impossible d'exécuter kscreen-doctor -o"; exit 1; }
+    awk '
+        /^Output:/ { name=$3; next }
+        /^[[:space:]]*enabled[[:space:]]*$/ { if (name != "") { print name; name="" } }
+    ' <<< "$out"
+}
+
 # Modes disponibles pour un connecteur donné (un par ligne, ex. "2560x1440@164.958",
-# "2560x1440@164.958+vrr", …), lus dans gdctl show -v.
+# "2560x1440@164.958+vrr", …).
 connector_modes() {  # $1 = connecteur (ex. DP-1)
+    if is_kde; then connector_modes_kde "$1"; else connector_modes_gnome "$1"; fi
+}
+
+connector_modes_gnome() {  # $1 = connecteur (ex. DP-1)
     local gdctl_output cur="" want="$1"
     gdctl_output=$(gdctl show -v 2>/dev/null) || return 1
     while IFS= read -r line; do
@@ -370,6 +412,31 @@ connector_modes() {  # $1 = connecteur (ex. DP-1)
         [[ "$cur" == "$want" ]] || continue
         [[ "$line" =~ ([0-9]+x[0-9]+@[0-9.]+(\+vrr)?)[[:space:]]*$ ]] && echo "${BASH_REMATCH[1]}"
     done <<< "$gdctl_output"
+}
+
+# Modes d'un connecteur sous KDE, extraits de la ligne « Modes: » (tokens
+# « id:LxH@RR[*!] ») dépouillés de l'id et des marqueurs courant/préféré.
+#
+# `-o` imprime la fréquence à 2 décimales (164.96) alors que le mode stocké dans
+# le profil est le NOM kscreen, dont la fréquence est arrondie à l'entier (165,
+# cf. `-j`). On arrondit donc ici pour que validate_profile puisse comparer les
+# deux à l'identique. Plusieurs modes peuvent retomber sur le même nom (60.00 et
+# 59.94 → « @60 ») : kscreen fait exactement pareil, les doublons sont sans effet.
+connector_modes_kde() {  # $1 = connecteur
+    local out; out=$(kscreen_show) || return 1
+    awk -v want="$1" '
+        /^Output:/ { cur=$3; next }
+        cur == want && /Modes:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /[0-9]+x[0-9]+@[0-9.]+/) {
+                    s = $i
+                    sub(/^[0-9]+:/, "", s)   # retire "id:"
+                    sub(/[*!]+$/, "", s)     # retire les marqueurs courant/préféré
+                    if (split(s, p, "@") == 2) printf "%s@%d\n", p[1], (p[2] + 0.5)
+                }
+            }
+        }
+    ' <<< "$out"
 }
 
 # Garde-fou : vérifie qu'un profil est applicable au matériel actuellement
@@ -383,7 +450,9 @@ validate_profile() {  # $1 = nom du tableau de profil
     for rec in "${SPECS[@]}"; do
         local -A f; parse_spec "$rec" f
         local conn="${f[connector]}" mode="${f[mode]}"
-        [[ "${f[vrr]}" == true ]] && mode="${mode}+vrr"
+        # Sous GNOME, VRR est une variante du mode (+vrr) ; sous KDE c'est une
+        # propriété à part (vrrpolicy), le nom du mode reste nu.
+        ! is_kde && [[ "${f[vrr]}" == true ]] && mode="${mode}+vrr"
         local modes; modes="$(connector_modes "$conn")"
         if [[ -z "$modes" ]]; then
             out_error "connecteur '$conn' introuvable — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
@@ -447,14 +516,61 @@ spec_to_args() {  # $1=record, $2=nom du tableau GDCTL (nameref)
     OUT+=( --color-mode "${_spec[color]}" --x "${_spec[x]}" --y "${_spec[y]}" )
 }
 
-# Applique un profil complet via gdctl set.
+# Applique un profil complet (aiguillage backend).
 apply_profile() {  # $1 = nom du tableau de profil
+    if is_kde; then apply_profile_kde "$1"; else apply_profile_gnome "$1"; fi
+}
+
+apply_profile_gnome() {  # $1 = nom du tableau de profil
     local -n SPECS="$1"
     local args=( set --layout-mode physical ) rec
     for rec in "${SPECS[@]}"; do
         spec_to_args "$rec" args
     done
     gdctl "${args[@]}"
+}
+
+# Applique un profil sous KDE via kscreen-doctor. La géométrie (enable + mode +
+# scale + position + primaire) doit réussir, donc elle part dans un seul appel ;
+# VRR/HDR/WCG suivent en best-effort séparé pour ne pas casser la géométrie si un
+# écran ne supporte pas l'une de ces propriétés.
+apply_profile_kde() {  # $1 = nom du tableau de profil
+    local -n SPECS="$1"
+    local -A s
+    local core=() rec conn c allowed=()
+    mapfile -t allowed < <(profile_connectors "$1")
+
+    # 1. Désactiver les connecteurs actifs absents du profil.
+    while IFS= read -r conn; do
+        [[ -z "$conn" ]] && continue
+        _in_list "$conn" "${allowed[@]}" || core+=( "output.${conn}.disable" )
+    done < <(active_monitors_kde)
+
+    # 2. Géométrie (doit réussir).
+    for rec in "${SPECS[@]}"; do
+        parse_spec "$rec" s
+        c="${s[connector]}"
+        core+=( "output.${c}.enable" \
+                "output.${c}.mode.${s[mode]}" \
+                "output.${c}.scale.${s[scale]}" \
+                "output.${c}.position.${s[x]},${s[y]}" )
+        # KDE (Plasma 6) : la sortie de plus haute priorité (1) est la primaire.
+        [[ "${s[primary]}" == true ]] && core+=( "output.${c}.priority.1" )
+    done
+    kscreen-doctor "${core[@]}"
+
+    # 3. VRR / HDR / WCG (best-effort, par écran).
+    for rec in "${SPECS[@]}"; do
+        parse_spec "$rec" s
+        c="${s[connector]}"
+        local extra=()
+        [[ "${s[vrr]}" == true ]] && extra+=( "output.${c}.vrrpolicy.automatic" )
+        case "${s[color]}" in
+            bt2100) extra+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
+            *)      extra+=( "output.${c}.hdr.disable" ) ;;
+        esac
+        (( ${#extra[@]} )) && { kscreen-doctor "${extra[@]}" 2>/dev/null || true; }
+    done
 }
 
 # Énumère les connecteurs d'un profil.
@@ -495,6 +611,8 @@ active_unexpected_monitors() {  # $@ = connecteurs autorisés
 # mode tv, à cause d'une course au hotplug). On ré-applique le profil tant qu'un
 # moniteur hors-profil est actif, en exigeant 2 sondages propres consécutifs.
 reconcile_profile() {  # $1 = nom du tableau de profil ; positionne _RECONCILE_DIRTY
+    # Garde-fou propre à mutter (course au hotplug) : sans objet sous KDE.
+    if is_kde; then _RECONCILE_DIRTY=false; return 0; fi
     _RECONCILE_DIRTY=false
     local allowed
     mapfile -t allowed < <(profile_connectors "$1")
