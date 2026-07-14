@@ -34,6 +34,9 @@ credentials.*
 /screen/setup/profiles.conf
 /audio/setup/generated/
 
+# --- Local-only Claude Code notes (machine-specific; CLAUDE.md is the shared one) ---
+.claude.local.md
+
 # --- OS / editor cruft ---
 .DS_Store
 Thumbs.db
