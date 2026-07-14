@@ -10,7 +10,11 @@ setup, and installs a small background service. No toolchain required.
 ## Screen
 
 > [!NOTE]
-> GNOME only. Optionally syncs with
+> Works on GNOME (via `gdctl`) and KDE Plasma (via `kscreen-doctor`) —
+> auto-detected at setup, or force it with `BACKEND=gnome`/`BACKEND=kde`. On KDE
+> it also works around the TV HDMI detect-loop (TV off but cable plugged) by
+> toggling the connector's DRM status, installing a small root helper + sudoers
+> rule for that. Optionally syncs with
 > [Sunshine](https://github.com/LizardByte/Sunshine) for game streaming if it's
 > installed; works fine without it.
 
