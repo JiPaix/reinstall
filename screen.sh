@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 # swapscreen Setup Script
+# - Picks a display backend: GNOME (gdctl) or KDE (kscreen-doctor), auto-detected
 # - Downloads the prebuilt HTTP server + interactive setup CLI from the Release
 # - Runs the interactive setup (detect monitors → build monitor/tv/taiko grids),
-#   which generates screen/swapscreen.sh from the engine template, plus a
-#   gdm-monitors.xml for the GDM greeter (primary monitor only, rest disabled)
+#   which generates screen/swapscreen.sh from the engine template; on GNOME it
+#   also emits a gdm-monitors.xml for the GDM greeter (primary monitor only)
 # - Installs swapscreen + swapscreen-server to ~/.local/bin and the systemd
 #   units (server + a oneshot that forces monitor mode on every login)
-# - Installs the GDM greeter layout (needs sudo)
+# - GNOME: installs the GDM greeter layout (needs sudo). KDE: installs a root
+#   helper + sudoers rule for the TV DRM loop workaround (needs sudo)
 # - Opens the server port in the firewall (ufw)
 # =============================================================================
 
@@ -46,6 +48,43 @@ ask() {
   echo -e "${BOLD}$1${NC}"
 }
 
+# Prompt for the package manager and install one or more packages. Reused by the
+# curl / jq / kscreen-doctor prerequisite checks.
+install_with_pkg_manager() {  # $@ = packages
+  ask "Which package manager do you use?"
+  echo "  1) pacman"
+  echo "  2) paru"
+  echo "  3) yay"
+  read -rp "Choice [1-3]: " pm_choice
+
+  local pm
+  case $pm_choice in
+    1) pm="sudo pacman -S --noconfirm" ;;
+    2) pm="paru -S --noconfirm" ;;
+    3) pm="yay -S --noconfirm" ;;
+    *) print_error "Invalid choice"; exit 1 ;;
+  esac
+
+  print_info "Installing $* with: $pm"
+  $pm "$@"
+}
+
+# Pick the desktop backend: BACKEND env override wins, then $XDG_CURRENT_DESKTOP,
+# then whichever control tool is on PATH. Echoes gnome|kde|"" (unknown).
+detect_backend() {
+  local de="${XDG_CURRENT_DESKTOP:-}"
+  de="${de,,}"
+  case "$de" in
+    *kde*|*plasma*) echo kde ;;
+    *gnome*)        echo gnome ;;
+    *)
+      if command -v gdctl &>/dev/null; then echo gnome
+      elif command -v kscreen-doctor &>/dev/null; then echo kde
+      fi
+      ;;
+  esac
+}
+
 # --- Release source ---------------------------------------------------------
 # Binaries are built by GitHub Actions and downloaded from the Release here, so
 # this script needs no Go toolchain and works piped from curl. Override REPO or
@@ -78,16 +117,42 @@ fetch() {
 }
 
 # =============================================================================
-# Prerequisite — GNOME (gdctl)
+# Prerequisite — display backend (GNOME/gdctl or KDE/kscreen-doctor)
 # =============================================================================
-# swapscreen drives the display through gdctl, which ships with GNOME's
-# compositor (the `mutter` package) and only exists in a GNOME session. Check
-# before touching anything so a non-GNOME machine fails cleanly up front.
-if ! command -v gdctl &>/dev/null; then
-  print_error "gdctl not found — swapscreen requires GNOME."
-  print_info  "gdctl ships with GNOME (the 'mutter' package). Use a GNOME session, then retry."
-  exit 1
+# swapscreen drives the display through gdctl (GNOME, ships with `mutter`) or
+# kscreen-doctor (KDE, ships with `libkscreen`). Pick the backend up front so a
+# machine without the right tool fails cleanly, and so the rest of the install
+# (setup CLI, greeter, Sunshine) can branch on it.
+BACKEND="${BACKEND:-$(detect_backend)}"
+if [ -z "$BACKEND" ]; then
+  print_warn "Could not auto-detect the desktop (no gdctl or kscreen-doctor, and \$XDG_CURRENT_DESKTOP unset)."
+  ask "Which desktop are you setting up?"
+  echo "  1) GNOME (gdctl)"
+  echo "  2) KDE (kscreen-doctor)"
+  read -rp "Choice [1-2]: " de_choice
+  case $de_choice in
+    1) BACKEND=gnome ;;
+    2) BACKEND=kde ;;
+    *) print_error "Invalid choice"; exit 1 ;;
+  esac
 fi
+print_ok "Display backend: $BACKEND"
+
+case "$BACKEND" in
+  gnome)
+    if ! command -v gdctl &>/dev/null; then
+      print_error "gdctl not found — the GNOME backend requires it."
+      print_info  "gdctl ships with GNOME (the 'mutter' package). Use a GNOME session, then retry."
+      exit 1
+    fi ;;
+  kde)
+    if ! command -v kscreen-doctor &>/dev/null; then
+      print_warn "kscreen-doctor not found — the KDE backend requires it (Arch package: libkscreen)"
+      install_with_pkg_manager libkscreen
+    fi ;;
+  *)
+    print_error "Unknown backend '$BACKEND' (expected gnome or kde)"; exit 1 ;;
+esac
 
 # =============================================================================
 # STEP 0 — Cleanup previous install if any
@@ -102,6 +167,12 @@ systemctl --user disable "$LOGIN_SERVICE" 2>/dev/null && print_ok "Disabled $LOG
 [ -f "$BIN_DIR/swapscreen" ]        && rm -f "$BIN_DIR/swapscreen"        && print_ok "Removed previous swapscreen script"
 [ -f "$UNIT_DIR/$SERVICE" ]         && rm -f "$UNIT_DIR/$SERVICE"         && print_ok "Removed previous service unit"
 [ -f "$UNIT_DIR/$LOGIN_SERVICE" ]   && rm -f "$UNIT_DIR/$LOGIN_SERVICE"   && print_ok "Removed previous login unit"
+
+# Remove the KDE DRM helper + sudoers rule if present (also clears them when a
+# machine is re-provisioned under GNOME). Only touches sudo if a file exists.
+if [ -f /etc/sudoers.d/swapscreen-drm ] || [ -f /usr/local/bin/swapscreen-drm ]; then
+  sudo rm -f /etc/sudoers.d/swapscreen-drm /usr/local/bin/swapscreen-drm && print_ok "Removed KDE DRM helper + sudoers rule"
+fi
 
 # Remove the firewall rule (re-added in STEP 7) so it never stacks/goes stale.
 if command -v ufw &>/dev/null; then
@@ -121,21 +192,7 @@ print_header "Downloading Binaries"
 
 if ! command -v curl &>/dev/null; then
   print_warn "curl is not installed"
-  ask "Which package manager do you use?"
-  echo "  1) pacman"
-  echo "  2) paru"
-  echo "  3) yay"
-  read -rp "Choice [1-3]: " pm_choice
-
-  case $pm_choice in
-    1) PKG_MANAGER="sudo pacman -S --noconfirm" ;;
-    2) PKG_MANAGER="paru -S --noconfirm" ;;
-    3) PKG_MANAGER="yay -S --noconfirm" ;;
-    *) print_error "Invalid choice"; exit 1 ;;
-  esac
-
-  print_info "Installing curl with: $PKG_MANAGER"
-  $PKG_MANAGER curl
+  install_with_pkg_manager curl
 fi
 
 print_info "Fetching from $REPO ($RELEASE_TAG)"
@@ -152,9 +209,10 @@ print_ok "Downloaded swapscreen-server, swapscreen-setup, and unit files"
 print_header "Interactive Display Setup"
 
 print_info "Detecting monitors and building the monitor/tv/taiko layouts."
-print_warn "This needs a graphical session (gdctl) and an interactive terminal."
+print_warn "This needs a graphical session ($(case "$BACKEND" in kde) echo kscreen-doctor;; *) echo gdctl;; esac)) and an interactive terminal."
 
 ( cd "$WORK" && ./swapscreen-setup \
+    -de       "$BACKEND" \
     -profiles "$WORK/profiles.conf" \
     -out      "$WORK/swapscreen.sh" \
     -gdm      "$WORK/gdm-monitors.xml" )
@@ -163,11 +221,12 @@ if [ ! -f "$WORK/swapscreen.sh" ]; then
   print_error "setup did not produce swapscreen.sh — aborting"
   exit 1
 fi
-if [ ! -f "$WORK/gdm-monitors.xml" ]; then
+# The GDM greeter layout is a mutter-only file; the KDE backend doesn't emit it.
+if [ "$BACKEND" = gnome ] && [ ! -f "$WORK/gdm-monitors.xml" ]; then
   print_error "setup did not produce gdm-monitors.xml — aborting"
   exit 1
 fi
-print_ok "Generated swapscreen.sh and gdm-monitors.xml"
+print_ok "Generated swapscreen.sh"
 
 # =============================================================================
 # STEP 4 — Install directories
@@ -196,6 +255,52 @@ cp "$WORK/$LOGIN_SERVICE" "$UNIT_DIR/$LOGIN_SERVICE"
 print_ok "Installed $UNIT_DIR/$LOGIN_SERVICE"
 
 # =============================================================================
+# STEP 5b — KDE TV DRM helper (needs sudo; KDE only)
+# =============================================================================
+# The KDE TV loop workaround writes /sys/class/drm/card*-<conn>/status, which is
+# root-owned. Install a tiny root helper + a scoped NOPASSWD sudoers rule so the
+# generated swapscreen can toggle it even when triggered non-interactively (the
+# login unit's `swapscreen --monitor`, or a Sunshine/Moonlight-driven --tv).
+if [ "$BACKEND" = kde ]; then
+  print_header "KDE TV DRM Helper"
+
+  DRM_HELPER=/usr/local/bin/swapscreen-drm
+  SUDOERS_FILE=/etc/sudoers.d/swapscreen-drm
+
+  sudo tee "$DRM_HELPER" >/dev/null <<'DRMEOF'
+#!/usr/bin/env bash
+# swapscreen-drm <connector> <detect|off|on>
+# Writes the DRM connector status to break KDE's TV detect loop (TV off but HDMI
+# plugged). Installed by screen.sh; invoked as: sudo swapscreen-drm HDMI-A-1 off
+set -euo pipefail
+conn="${1:-}"; status="${2:-}"
+[[ "$conn" =~ ^[A-Za-z0-9-]+$ ]] || { echo "invalid connector: $conn" >&2; exit 1; }
+case "$status" in detect|off|on) ;; *) echo "invalid status: $status" >&2; exit 1 ;; esac
+shopt -s nullglob
+wrote=0
+for f in /sys/class/drm/card*-"$conn"/status; do
+  printf '%s\n' "$status" > "$f" && wrote=1
+done
+[ "$wrote" = 1 ] || { echo "no DRM connector matched: $conn" >&2; exit 1; }
+DRMEOF
+  sudo chmod 0755 "$DRM_HELPER"
+  print_ok "Installed $DRM_HELPER"
+
+  # Scoped NOPASSWD rule. Validate before installing — a malformed sudoers file
+  # can lock you out of sudo entirely.
+  TMP_SUDOERS="$(mktemp)"
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$(id -un)" "$DRM_HELPER" > "$TMP_SUDOERS"
+  if sudo visudo -cf "$TMP_SUDOERS" >/dev/null; then
+    sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
+    print_ok "Installed $SUDOERS_FILE (passwordless $DRM_HELPER for $(id -un))"
+  else
+    print_error "Generated sudoers rule failed validation — skipping."
+    print_warn  "The TV workaround will fall back to a password prompt (and stay silent in services)."
+  fi
+  rm -f "$TMP_SUDOERS"
+fi
+
+# =============================================================================
 # STEP 6 — Enable and (re)start the services
 # =============================================================================
 print_header "Enabling Services"
@@ -219,22 +324,32 @@ print_info "Note: both units are WantedBy=graphical-session.target, so they only
 print_info "auto-start inside a graphical login session (not over plain SSH)."
 
 # =============================================================================
-# STEP 7 — GDM greeter layout (needs sudo; primary monitor only, rest disabled)
+# STEP 7 — Greeter layout
 # =============================================================================
-print_header "GDM Greeter Layout"
+# GNOME: install a mutter monitors.xml so the GDM greeter shows only the primary
+# monitor (rest disabled). KDE (SDDM) has no mutter-style greeter layout, so we
+# skip it: SDDM shows login on all connected screens and swapscreen-login.service
+# switches to monitor mode right after login.
+print_header "Greeter Layout"
 
-GDM_DIR=""
-for d in /var/lib/gdm/seat0/config /var/lib/gdm/.config; do
-  [ -d "$d" ] && { GDM_DIR="$d"; break; }
-done
-
-if [ -z "$GDM_DIR" ]; then
-  print_warn "GDM greeter config dir not found — log in via GDM at least once, then re-run ./screen.sh"
+if [ "$BACKEND" != gnome ]; then
+  print_info "KDE backend — skipping GDM greeter layout."
+  print_info "SDDM will show the login prompt on all connected screens; $LOGIN_SERVICE"
+  print_info "then forces monitor mode once you're logged in."
 else
-  OWNER="$(sudo stat -c '%u:%g' "$GDM_DIR")"
-  sudo install -m 0600 -o "${OWNER%%:*}" -g "${OWNER##*:}" "$WORK/gdm-monitors.xml" "$GDM_DIR/monitors.xml"
-  print_ok "Installed GDM greeter layout → $GDM_DIR/monitors.xml"
-  print_info "Roll back anytime with: sudo rm $GDM_DIR/monitors.xml"
+  GDM_DIR=""
+  for d in /var/lib/gdm/seat0/config /var/lib/gdm/.config; do
+    [ -d "$d" ] && { GDM_DIR="$d"; break; }
+  done
+
+  if [ -z "$GDM_DIR" ]; then
+    print_warn "GDM greeter config dir not found — log in via GDM at least once, then re-run ./screen.sh"
+  else
+    OWNER="$(sudo stat -c '%u:%g' "$GDM_DIR")"
+    sudo install -m 0600 -o "${OWNER%%:*}" -g "${OWNER##*:}" "$WORK/gdm-monitors.xml" "$GDM_DIR/monitors.xml"
+    print_ok "Installed GDM greeter layout → $GDM_DIR/monitors.xml"
+    print_info "Roll back anytime with: sudo rm $GDM_DIR/monitors.xml"
+  fi
 fi
 
 # =============================================================================
@@ -257,9 +372,10 @@ fi
 # sets "exclude-global-prep-cmd": true). We use it to bump the TV connector's
 # scaling and push the client's HDR capability to both connectors on stream
 # start, and revert both on stream end — driven by this run's monitor/tv
-# profiles, via the external `displayconfig-mutter` helper (not part of this
-# repo; assumed on PATH). apps.json just needs the two baseline app entries
-# to exist so Sunshine has something to stream.
+# profiles. The commands are backend-specific: GNOME uses the external
+# `displayconfig-mutter` helper (assumed on PATH); KDE uses `kscreen-doctor`.
+# apps.json just needs the two baseline app entries to exist so Sunshine has
+# something to stream.
 print_header "Sunshine Integration"
 
 sunshine_installed() {
@@ -272,21 +388,7 @@ if ! sunshine_installed; then
 else
   if ! command -v jq &>/dev/null; then
     print_warn "jq is not installed"
-    ask "Which package manager do you use?"
-    echo "  1) pacman"
-    echo "  2) paru"
-    echo "  3) yay"
-    read -rp "Choice [1-3]: " pm_choice
-
-    case $pm_choice in
-      1) PKG_MANAGER="sudo pacman -S --noconfirm" ;;
-      2) PKG_MANAGER="paru -S --noconfirm" ;;
-      3) PKG_MANAGER="yay -S --noconfirm" ;;
-      *) print_error "Invalid choice"; exit 1 ;;
-    esac
-
-    print_info "Installing jq with: $PKG_MANAGER"
-    $PKG_MANAGER jq
+    install_with_pkg_manager jq
   fi
 
   sunshine_service_name() {
@@ -320,41 +422,66 @@ else
     echo "$first"
   }
 
-  # Color mode of a specific connector within a profile (default: "default").
-  profile_connector_color() {  # $1 = array name, $2 = connector -> echoes color
+  # A specific key's value for a connector within a profile (with a default).
+  profile_connector_field() {  # $1=array $2=connector $3=key $4=default
     local -n arr="$1"
-    local rec tok conn color
+    local rec tok conn val
     for rec in "${arr[@]}"; do
-      conn=""; color="default"
+      conn=""; val="$4"
       for tok in $rec; do
         case "$tok" in
-          connector=*) conn="${tok#connector=}" ;;
-          color=*)     color="${tok#color=}" ;;
+          connector=*)   conn="${tok#connector=}" ;;
+          "$3"=*)        val="${tok#"$3"=}" ;;
         esac
       done
-      [ "$conn" = "$2" ] && { echo "$color"; return; }
+      [ "$conn" = "$2" ] && { echo "$val"; return; }
     done
-    echo "default"
+    echo "$4"
+  }
+
+  # kscreen-doctor HDR/WCG ops for a connector given its target HDR state.
+  kde_hdr_fragment() {  # $1=connector $2=true|false
+    if [ "$2" = true ]; then
+      printf 'output.%s.hdr.enable output.%s.wcg.enable' "$1" "$1"
+    else
+      printf 'output.%s.hdr.disable' "$1"
+    fi
   }
 
   TV_PRIMARY="$(profile_primary_connector TV_PROFILE)"
   MON_PRIMARY="$(profile_primary_connector MONITOR_PROFILE)"
   TV_HDR_UNDO=false
-  [ "$(profile_connector_color TV_PROFILE "$TV_PRIMARY")" = bt2100 ] && TV_HDR_UNDO=true
+  [ "$(profile_connector_field TV_PROFILE "$TV_PRIMARY" color default)" = bt2100 ] && TV_HDR_UNDO=true
   MON_HDR_UNDO=false
-  [ "$(profile_connector_color MONITOR_PROFILE "$MON_PRIMARY")" = bt2100 ] && MON_HDR_UNDO=true
+  [ "$(profile_connector_field MONITOR_PROFILE "$MON_PRIMARY" color default)" = bt2100 ] && MON_HDR_UNDO=true
 
   # ${SUNSHINE_CLIENT_HDR} is Sunshine's own env var, evaluated by the `sh -c`
-  # below at stream time — kept literal here via a single-quoted printf
-  # format so this script's own expansion never touches it. Scaling literals
-  # (300/200) are intentionally left untouched.
-  DO_CMD=$(printf 'sh -c "displayconfig-mutter set --connector %s --scaling 300 --hdr ${SUNSHINE_CLIENT_HDR:-false} || true; displayconfig-mutter set --connector %s --hdr ${SUNSHINE_CLIENT_HDR:-false} || true"' \
-    "$TV_PRIMARY" "$MON_PRIMARY")
-  UNDO_CMD=$(printf 'sh -c "displayconfig-mutter set --connector %s --scaling 200 --hdr %s || true; displayconfig-mutter set --connector %s --hdr %s || true"' \
-    "$TV_PRIMARY" "$TV_HDR_UNDO" "$MON_PRIMARY" "$MON_HDR_UNDO")
+  # below at stream time — kept literal here via a single-quoted printf format
+  # so this script's own expansion never touches it.
+  if [ "$BACKEND" = kde ]; then
+    # KDE: kscreen-doctor. Bump the TV scale during a stream and follow the
+    # client's HDR capability on both connectors, restoring the profile's scale
+    # and HDR state on stream end. HDR/WCG ops are best-effort (|| true) so an
+    # SDR-only display can't break the stream.
+    TV_SCALE="$(profile_connector_field TV_PROFILE "$TV_PRIMARY" scale 1)"
+    DO_CMD=$(printf 'sh -c "kscreen-doctor output.%s.scale.3 || true; if [ ${SUNSHINE_CLIENT_HDR:-false} = true ]; then kscreen-doctor %s %s || true; else kscreen-doctor %s %s || true; fi"' \
+      "$TV_PRIMARY" \
+      "$(kde_hdr_fragment "$TV_PRIMARY" true)"  "$(kde_hdr_fragment "$MON_PRIMARY" true)" \
+      "$(kde_hdr_fragment "$TV_PRIMARY" false)" "$(kde_hdr_fragment "$MON_PRIMARY" false)")
+    UNDO_CMD=$(printf 'sh -c "kscreen-doctor output.%s.scale.%s || true; kscreen-doctor %s || true; kscreen-doctor %s || true"' \
+      "$TV_PRIMARY" "$TV_SCALE" \
+      "$(kde_hdr_fragment "$TV_PRIMARY" "$TV_HDR_UNDO")" \
+      "$(kde_hdr_fragment "$MON_PRIMARY" "$MON_HDR_UNDO")")
+  else
+    # GNOME: displayconfig-mutter. Scaling literals (300/200) left untouched.
+    DO_CMD=$(printf 'sh -c "displayconfig-mutter set --connector %s --scaling 300 --hdr ${SUNSHINE_CLIENT_HDR:-false} || true; displayconfig-mutter set --connector %s --hdr ${SUNSHINE_CLIENT_HDR:-false} || true"' \
+      "$TV_PRIMARY" "$MON_PRIMARY")
+    UNDO_CMD=$(printf 'sh -c "displayconfig-mutter set --connector %s --scaling 200 --hdr %s || true; displayconfig-mutter set --connector %s --hdr %s || true"' \
+      "$TV_PRIMARY" "$TV_HDR_UNDO" "$MON_PRIMARY" "$MON_HDR_UNDO")
+  fi
 
   PREP_ITEM=$(jq -n --arg do "$DO_CMD" --arg undo "$UNDO_CMD" '{do: $do, undo: $undo}')
-  print_ok "Computed global prep-cmd (tv=$TV_PRIMARY, monitor=$MON_PRIMARY)"
+  print_ok "Computed global prep-cmd ($BACKEND; tv=$TV_PRIMARY, monitor=$MON_PRIMARY)"
 
   # -- sunshine.conf: upsert the global_prep_cmd line --------------------------
   # sunshine.conf is a flat key = value file, not JSON, so we can't jq the
