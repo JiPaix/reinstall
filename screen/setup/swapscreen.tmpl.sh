@@ -257,7 +257,8 @@ tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
     [[ -z "$tv" ]] && return 0
     # 45 s : certaines TV (Vestel…) mettent 20-30 s après power-on avant de
     # servir un EDID stable ; il faut encore 3 s de stabilité derrière.
-    local deadline=$(( $(date +%s) + 45 )) sub stable=0
+    local start; start=$(date +%s)
+    local deadline=$(( start + 45 )) sub stable=0 ready=false
     if ! kde_connector_known "$tv"; then
         while :; do
             drm_status "$tv" detect
@@ -274,14 +275,31 @@ tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
     fi
     while (( $(date +%s) < deadline )); do
         if kde_connector_stable "$tv" && kde_connector_known "$tv"; then
-            (( ++stable >= 3 )) && return 0
+            if (( ++stable >= 3 )); then
+                ready=true
+                break
+            fi
         else
             stable=0
         fi
         sleep 1
     done
-    $JSON_MODE || echo "⚠ $tv détecté mais instable (HPD/EDID clignotant) — bascule refusée" >&2
-    return 1
+    if ! $ready; then
+        $JSON_MODE || echo "⚠ $tv détecté mais instable (HPD/EDID clignotant) — bascule refusée" >&2
+        return 1
+    fi
+    # Détection éclair (≤ 8 s) = la TV était déjà chaude : rien à attendre.
+    # Sinon elle vient d'être allumée, et son étage HDMI sert un EDID stable
+    # BIEN AVANT de savoir verrouiller un lien 4K@60 : un commit à ~20 s du
+    # power-on part dans le vide — kernel OK, chemin audio actif, mais panneau
+    # « no signal » définitif, la TV ne réessaie jamais d'elle-même (vérifié).
+    # Tous les commits réussis observés avaient la TV allumée depuis ≥ 40 s :
+    # on laisse donc la TV finir de démarrer avant de lui envoyer le signal.
+    if (( $(date +%s) - start > 8 )); then
+        $JSON_MODE || echo "… TV fraîchement allumée — attente de fin de démarrage (20 s)" >&2
+        sleep 20
+    fi
+    return 0
 }
 
 # Endort la TV : désactive la sortie puis coupe son statut DRM pour stopper la
