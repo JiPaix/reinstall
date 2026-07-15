@@ -3,6 +3,8 @@
 # swapscreen Setup Script
 # - Picks a display backend: GNOME (gdctl) or KDE (kscreen-doctor), auto-detected
 # - Downloads the prebuilt HTTP server + interactive setup CLI from the Release
+#   (or builds them from this checkout with `--local`, for testing engine
+#   changes before they're tagged/released)
 # - Runs the interactive setup (detect monitors → build monitor/tv/taiko grids),
 #   which generates screen/swapscreen.sh from the engine template; on GNOME it
 #   also emits a gdm-monitors.xml for the GDM greeter (primary monitor only)
@@ -14,6 +16,19 @@
 # =============================================================================
 
 set -euo pipefail
+
+# --local: build swapscreen-server/swapscreen-setup from this checkout with the
+# Go toolchain instead of downloading the Release assets. For testing engine
+# changes before they're tagged/released — see .github/workflows/release.yml
+# for the exact build this mirrors.
+LOCAL=false
+for arg in "$@"; do
+  case "$arg" in
+    --local) LOCAL=true ;;
+    *) echo "Unknown option: $arg (supported: --local)" >&2; exit 1 ;;
+  esac
+done
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors
 RED='\033[0;31m'
@@ -168,9 +183,12 @@ systemctl --user disable "$LOGIN_SERVICE" 2>/dev/null && print_ok "Disabled $LOG
 [ -f "$UNIT_DIR/$SERVICE" ]         && rm -f "$UNIT_DIR/$SERVICE"         && print_ok "Removed previous service unit"
 [ -f "$UNIT_DIR/$LOGIN_SERVICE" ]   && rm -f "$UNIT_DIR/$LOGIN_SERVICE"   && print_ok "Removed previous login unit"
 
-# Remove the KDE DRM helper + sudoers rule if present (also clears them when a
-# machine is re-provisioned under GNOME). Only touches sudo if a file exists.
-if [ -f /etc/sudoers.d/swapscreen-drm ] || [ -f /usr/local/bin/swapscreen-drm ]; then
+# Remove the KDE DRM helper + sudoers rule only when re-provisioning under a
+# non-KDE backend. Under KDE they are kept (STEP 2 overwrites them) so the TV
+# connector can still be redetected between this cleanup and the interactive
+# setup — removing them here once left a mid-install machine with a forced-off
+# TV and no way to wake it.
+if [ "$BACKEND" != kde ] && { [ -f /etc/sudoers.d/swapscreen-drm ] || [ -f /usr/local/bin/swapscreen-drm ]; }; then
   sudo rm -f /etc/sudoers.d/swapscreen-drm /usr/local/bin/swapscreen-drm && print_ok "Removed KDE DRM helper + sudoers rule"
 fi
 
@@ -186,22 +204,109 @@ systemctl --user daemon-reload
 print_ok "Cleanup done"
 
 # =============================================================================
-# STEP 1 — Download prebuilt binaries from the GitHub Release
+# STEP 1 — Get the binaries: local build (--local) or the GitHub Release
 # =============================================================================
-print_header "Downloading Binaries"
+if $LOCAL; then
+  print_header "Building Binaries Locally"
 
-if ! command -v curl &>/dev/null; then
-  print_warn "curl is not installed"
-  install_with_pkg_manager curl
+  if ! command -v go &>/dev/null; then
+    print_error "go is not installed — --local needs the Go toolchain to build swapscreen-server/swapscreen-setup."
+    exit 1
+  fi
+  if [ ! -f "$SCRIPT_DIR/screen/go.mod" ]; then
+    print_error "$SCRIPT_DIR/screen/go.mod not found — --local must run from a checkout of $REPO."
+    exit 1
+  fi
+
+  print_info "Building from $SCRIPT_DIR/screen (go $(go version | awk '{print $3}'))"
+  ( cd "$SCRIPT_DIR/screen" && go build -o "$WORK/swapscreen-server" . )
+  print_ok "Built swapscreen-server"
+  ( cd "$SCRIPT_DIR/screen" && go build -o "$WORK/swapscreen-setup" ./setup )
+  print_ok "Built swapscreen-setup"
+
+  cp "$SCRIPT_DIR/screen/swapscreen-server.service" "$WORK/swapscreen-server.service"
+  cp "$SCRIPT_DIR/screen/swapscreen-login.service"  "$WORK/swapscreen-login.service"
+  chmod +x "$WORK/swapscreen-server" "$WORK/swapscreen-setup"
+  print_ok "Copied unit files from $SCRIPT_DIR/screen"
+else
+  print_header "Downloading Binaries"
+
+  if ! command -v curl &>/dev/null; then
+    print_warn "curl is not installed"
+    install_with_pkg_manager curl
+  fi
+
+  print_info "Fetching from $REPO ($RELEASE_TAG)"
+  fetch swapscreen-server          "$WORK/swapscreen-server"
+  fetch swapscreen-setup           "$WORK/swapscreen-setup"
+  fetch swapscreen-server.service  "$WORK/swapscreen-server.service"
+  fetch swapscreen-login.service   "$WORK/swapscreen-login.service"
+  chmod +x "$WORK/swapscreen-server" "$WORK/swapscreen-setup"
+  print_ok "Downloaded swapscreen-server, swapscreen-setup, and unit files"
 fi
 
-print_info "Fetching from $REPO ($RELEASE_TAG)"
-fetch swapscreen-server          "$WORK/swapscreen-server"
-fetch swapscreen-setup           "$WORK/swapscreen-setup"
-fetch swapscreen-server.service  "$WORK/swapscreen-server.service"
-fetch swapscreen-login.service   "$WORK/swapscreen-login.service"
-chmod +x "$WORK/swapscreen-server" "$WORK/swapscreen-setup"
-print_ok "Downloaded swapscreen-server, swapscreen-setup, and unit files"
+# =============================================================================
+# STEP 2 — KDE TV DRM helper (needs sudo; KDE only)
+# =============================================================================
+# The KDE TV loop workaround writes /sys/class/drm/card*-<conn>/status, which is
+# root-owned. Install a tiny root helper + a scoped NOPASSWD sudoers rule so the
+# generated swapscreen can toggle it even when triggered non-interactively (the
+# login unit's `swapscreen --monitor`, or a Sunshine/Moonlight-driven --tv).
+# Installed BEFORE the interactive setup: if a previous install left the TV's
+# connector forced off (or KWin dropped it after a power-cycle), the setup can't
+# see the TV until it's redetected — which needs this helper.
+if [ "$BACKEND" = kde ]; then
+  print_header "KDE TV DRM Helper"
+
+  DRM_HELPER=/usr/local/bin/swapscreen-drm
+  SUDOERS_FILE=/etc/sudoers.d/swapscreen-drm
+
+  sudo tee "$DRM_HELPER" >/dev/null <<'DRMEOF'
+#!/usr/bin/env bash
+# swapscreen-drm <connector> <detect|off|on>
+# Writes the DRM connector status to break KDE's TV detect loop (TV off but HDMI
+# plugged), then emits a synthetic hotplug uevent on the connector's card.
+# The uevent is the load-bearing half: a sysfs status write alone fires no
+# hotplug event, and KWin only re-probes connectors on hotplug — without it, a
+# connector KWin dropped (TV power-cycled while its status was forced off)
+# stays invisible until the session restarts.
+# Installed by screen.sh; invoked as: sudo swapscreen-drm HDMI-A-1 off
+set -euo pipefail
+conn="${1:-}"; status="${2:-}"
+[[ "$conn" =~ ^[A-Za-z0-9-]+$ ]] || { echo "invalid connector: $conn" >&2; exit 1; }
+case "$status" in detect|off|on) ;; *) echo "invalid status: $status" >&2; exit 1 ;; esac
+shopt -s nullglob
+wrote=0
+for f in /sys/class/drm/card*-"$conn"/status; do
+  printf '%s\n' "$status" > "$f" && wrote=1
+  card="${f#/sys/class/drm/}"; card="${card%%-*}"   # card1-HDMI-A-1 -> card1
+  # Extended synthetic-uevent syntax (kernel >= 4.13) forwards HOTPLUG=1 just
+  # like a real hotplug event; older kernels only accept the bare action word.
+  echo "change 53776170-5363-7265-656e-000000000001 HOTPLUG=1" > "/sys/class/drm/$card/uevent" 2>/dev/null \
+    || echo change > "/sys/class/drm/$card/uevent" || true
+done
+[ "$wrote" = 1 ] || { echo "no DRM connector matched: $conn" >&2; exit 1; }
+DRMEOF
+  sudo chmod 0755 "$DRM_HELPER"
+  print_ok "Installed $DRM_HELPER"
+
+  # Scoped NOPASSWD rule. Validate before installing — a malformed sudoers file
+  # can lock you out of sudo entirely.
+  TMP_SUDOERS="$(mktemp)"
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$(id -un)" "$DRM_HELPER" > "$TMP_SUDOERS"
+  if sudo visudo -cf "$TMP_SUDOERS" >/dev/null; then
+    sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
+    print_ok "Installed $SUDOERS_FILE (passwordless $DRM_HELPER for $(id -un))"
+  else
+    print_error "Generated sudoers rule failed validation — skipping."
+    print_warn  "The TV workaround will fall back to a password prompt (and stay silent in services)."
+  fi
+  rm -f "$TMP_SUDOERS"
+
+  print_info "If a TV is missing from the detection below: turn it on, then run"
+  print_info "  sudo $DRM_HELPER <connector> detect    (e.g. HDMI-A-1)"
+  print_info "wait ~3 seconds, and re-run this script."
+fi
 
 # =============================================================================
 # STEP 3 — Interactive setup (generates swapscreen.sh + gdm-monitors.xml)
@@ -253,52 +358,6 @@ print_ok "Installed $UNIT_DIR/$SERVICE"
 
 cp "$WORK/$LOGIN_SERVICE" "$UNIT_DIR/$LOGIN_SERVICE"
 print_ok "Installed $UNIT_DIR/$LOGIN_SERVICE"
-
-# =============================================================================
-# STEP 5b — KDE TV DRM helper (needs sudo; KDE only)
-# =============================================================================
-# The KDE TV loop workaround writes /sys/class/drm/card*-<conn>/status, which is
-# root-owned. Install a tiny root helper + a scoped NOPASSWD sudoers rule so the
-# generated swapscreen can toggle it even when triggered non-interactively (the
-# login unit's `swapscreen --monitor`, or a Sunshine/Moonlight-driven --tv).
-if [ "$BACKEND" = kde ]; then
-  print_header "KDE TV DRM Helper"
-
-  DRM_HELPER=/usr/local/bin/swapscreen-drm
-  SUDOERS_FILE=/etc/sudoers.d/swapscreen-drm
-
-  sudo tee "$DRM_HELPER" >/dev/null <<'DRMEOF'
-#!/usr/bin/env bash
-# swapscreen-drm <connector> <detect|off|on>
-# Writes the DRM connector status to break KDE's TV detect loop (TV off but HDMI
-# plugged). Installed by screen.sh; invoked as: sudo swapscreen-drm HDMI-A-1 off
-set -euo pipefail
-conn="${1:-}"; status="${2:-}"
-[[ "$conn" =~ ^[A-Za-z0-9-]+$ ]] || { echo "invalid connector: $conn" >&2; exit 1; }
-case "$status" in detect|off|on) ;; *) echo "invalid status: $status" >&2; exit 1 ;; esac
-shopt -s nullglob
-wrote=0
-for f in /sys/class/drm/card*-"$conn"/status; do
-  printf '%s\n' "$status" > "$f" && wrote=1
-done
-[ "$wrote" = 1 ] || { echo "no DRM connector matched: $conn" >&2; exit 1; }
-DRMEOF
-  sudo chmod 0755 "$DRM_HELPER"
-  print_ok "Installed $DRM_HELPER"
-
-  # Scoped NOPASSWD rule. Validate before installing — a malformed sudoers file
-  # can lock you out of sudo entirely.
-  TMP_SUDOERS="$(mktemp)"
-  printf '%s ALL=(root) NOPASSWD: %s\n' "$(id -un)" "$DRM_HELPER" > "$TMP_SUDOERS"
-  if sudo visudo -cf "$TMP_SUDOERS" >/dev/null; then
-    sudo install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
-    print_ok "Installed $SUDOERS_FILE (passwordless $DRM_HELPER for $(id -un))"
-  else
-    print_error "Generated sudoers rule failed validation — skipping."
-    print_warn  "The TV workaround will fall back to a password prompt (and stay silent in services)."
-  fi
-  rm -f "$TMP_SUDOERS"
-fi
 
 # =============================================================================
 # STEP 6 — Enable and (re)start the services

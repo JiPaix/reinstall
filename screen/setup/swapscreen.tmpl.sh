@@ -190,8 +190,11 @@ _in_list() {  # $1 = aiguille, $2.. = meule
 # L'écriture dans /sys exige root ; screen.sh installe (KDE only) un helper root
 # + une règle sudoers NOPASSWD pour qu'il marche même hors terminal (service de
 # login, bascule déclenchée par Sunshine).
+# Le helper émet aussi un uevent hotplug synthétique après chaque écriture :
+# une écriture sysfs seule ne génère AUCUN événement, or KWin est purement
+# événementiel — un connecteur qu'il a retiré (TV power-cyclée pendant que son
+# statut était forcé off) resterait invisible jusqu'au redémarrage de session.
 DRM_HELPER=/usr/local/bin/swapscreen-drm
-KDE_TV_SAFE_MODE="1280x720@60"   # mode bas « sûr » posé avant le mode réel
 
 drm_status() {  # $1 = connecteur, $2 = detect|off|on
     if ! sudo -n "$DRM_HELPER" "$1" "$2" 2>/dev/null; then
@@ -200,15 +203,85 @@ drm_status() {  # $1 = connecteur, $2 = detect|off|on
     return 0
 }
 
-# Réveille la TV : force la redétection DRM puis pose un mode bas avant le mode
-# réel, pour laisser l'EDID se négocier sans relancer la boucle.
-tv_wake_kde() {  # $1 = connecteur primaire TV
+# Vrai si kscreen liste le connecteur, quel que soit son état enabled/disabled.
+# (KWin peut avoir retiré la sortie de sa liste : dans ce cas kscreen-doctor
+# répond « Output ... not found » à toute commande la visant.)
+# PAS de `grep -q` en bout de pipe ici : -q quitte au premier match et ferme le
+# tube, kscreen-doctor/sed meurent en SIGPIPE (141) et, sous `pipefail`, ce 141
+# l'emporte sur le 0 de grep — la fonction renvoyait TOUJOURS faux. grep sans
+# -q consomme tout le flux, pas de SIGPIPE.
+kde_connector_known() {  # $1 = connecteur
+    kscreen_show | grep -E "^Output: [0-9]+ ${1}( |$)" >/dev/null
+}
+
+# Vrai si le connecteur est stable côté kernel : statut « connected » ET EDID
+# effectivement lisible. (Le fichier sysfs `edid` affiche une taille nulle en
+# stat même plein — il faut le lire pour savoir.)
+kde_connector_stable() {  # $1 = connecteur
+    local d
+    for d in /sys/class/drm/card*-"$1"; do
+        [[ "$(cat "$d/status" 2>/dev/null)" == connected ]] || continue
+        (( $(wc -c < "$d/edid" 2>/dev/null || echo 0) > 0 )) && return 0
+    done
+    return 1
+}
+
+# Vrai si le kernel pilote RÉELLEMENT le connecteur (CRTC actif, sysfs
+# `enabled`). Seul signal fiable qu'un écran est allumé : kscreen-doctor
+# répond « succès » dès que KWin accepte la config, même si le commit DRM
+# échoue ensuite en silence.
+kde_connector_lit() {  # $1 = connecteur
+    local f
+    for f in /sys/class/drm/card*-"$1"/enabled; do
+        [[ "$(cat "$f" 2>/dev/null)" == enabled ]] && return 0
+    done
+    return 1
+}
+
+# Réveille la TV si nécessaire et attend qu'elle soit STABLE. Retourne 1 si le
+# connecteur n'apparaît pas ou reste instable — il ne faut alors PAS basculer.
+#
+# Deux phases :
+#   1. apparition : si KWin ne liste pas le connecteur (forcé off, ou retiré
+#      après un power-cycle), forcer la redétection DRM (uevent inclus via le
+#      helper) et attendre. Re-poke toutes les ~6 s seulement : chaque poke
+#      force un re-probe qui peut interrompre une négociation EDID en cours.
+#   2. stabilité : exiger 3 contrôles consécutifs (1 s d'écart) avec statut
+#      kernel « connected » + EDID lisible + connecteur listé par kscreen.
+#      Une TV qui vient d'être allumée fait clignoter HPD/EDID pendant
+#      plusieurs secondes, et activer la sortie PENDANT ce clignotement fait
+#      sombrer KWin dans un état « zéro sortie » (placeholder screen) dont
+#      seule une nouvelle session sort — vu en pratique, d'où ce garde-fou.
+tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
     local tv="$1"
     [[ -z "$tv" ]] && return 0
-    drm_status "$tv" detect
-    sleep 1
-    kscreen-doctor "output.${tv}.enable" "output.${tv}.mode.${KDE_TV_SAFE_MODE}" 2>/dev/null || true
-    sleep 1
+    # 45 s : certaines TV (Vestel…) mettent 20-30 s après power-on avant de
+    # servir un EDID stable ; il faut encore 3 s de stabilité derrière.
+    local deadline=$(( $(date +%s) + 45 )) sub stable=0
+    if ! kde_connector_known "$tv"; then
+        while :; do
+            drm_status "$tv" detect
+            sub=$(( $(date +%s) + 6 ))
+            while (( $(date +%s) < sub )); do
+                sleep 1
+                if kde_connector_known "$tv"; then break 2; fi
+            done
+            if (( $(date +%s) >= deadline )); then
+                $JSON_MODE || echo "⚠ $tv toujours absent de kscreen après redétection — TV éteinte ?" >&2
+                return 1
+            fi
+        done
+    fi
+    while (( $(date +%s) < deadline )); do
+        if kde_connector_stable "$tv" && kde_connector_known "$tv"; then
+            (( ++stable >= 3 )) && return 0
+        else
+            stable=0
+        fi
+        sleep 1
+    done
+    $JSON_MODE || echo "⚠ $tv détecté mais instable (HPD/EDID clignotant) — bascule refusée" >&2
+    return 1
 }
 
 # Endort la TV : désactive la sortie puis coupe son statut DRM pour stopper la
@@ -347,8 +420,11 @@ sunshine_update_output() {  # $1 = nom du profil (MONITOR_PROFILE, TV_PROFILE, �
         reconcile_profile "$profile"
         settled="$(active_set)"
 
-        # 2. Restart : force Sunshine à énumérer la topologie ACTUELLE
+        # 2. Restart : force Sunshine à énumérer la topologie ACTUELLE.
+        # Des bascules rapprochées enchaînent les restarts et peuvent déclencher
+        # le start-limit systemd — le purger d'abord, sinon le restart échoue.
         since="$(date '+%Y-%m-%d %H:%M:%S')"
+        systemctl --user reset-failed "$(sunshine_service_name)" 2>/dev/null || true
         if ! systemctl --user restart "$(sunshine_service_name)"; then
             $JSON_MODE || echo "⚠ Échec du restart de Sunshine — config non mise à jour" >&2
             reconcile_profile "$profile"   # laisser l'affichage propre
@@ -578,47 +654,115 @@ apply_profile_gnome() {  # $1 = nom du tableau de profil
     gdctl "${args[@]}"
 }
 
-# Applique un profil sous KDE via kscreen-doctor. La géométrie (enable + mode +
-# scale + position + primaire) doit réussir, donc elle part dans un seul appel ;
-# VRR/HDR/WCG suivent en best-effort séparé pour ne pas casser la géométrie si un
-# écran ne supporte pas l'une de ces propriétés.
+# Applique un profil sous KDE via kscreen-doctor, en DEUX temps :
+#   1. activer + configurer les écrans du profil (les anciens restent allumés) ;
+#   2. désactiver les écrans hors profil, dans un appel séparé.
+# L'ordre est crucial : la config atomique « activer X + désactiver le reste »
+# échoue silencieusement dans KWin quand X vient d'être ré-ajouté (TV
+# ressuscitée par la redétection DRM) — KWin éteint les anciens écrans sans
+# jamais piloter le nouveau, laissant la session sans AUCUNE sortie active
+# (« There are no outputs - creating placeholder screen » en boucle, kscreen ne
+# répond plus que des listes vides). Activer d'abord garantit ≥ 1 sortie
+# réellement allumée à chaque instant. Le chevauchement transitoire de
+# positions entre phases (TV et moniteur tous deux en 0,0) est toléré par KWin
+# (vérifié empiriquement). VRR/HDR/WCG partent dans le MÊME commit que la
+# géométrie (une seule transition de signal, comme gdctl) ; en cas de refus,
+# fallback géométrie seule + propriétés différées en best-effort (étape 3).
 apply_profile_kde() {  # $1 = nom du tableau de profil
     local -n SPECS="$1"
     local -A s
-    local core=() rec conn c allowed=()
+    local ops=() rec conn c allowed=()
     mapfile -t allowed < <(profile_connectors "$1")
 
-    # 1. Désactiver les connecteurs actifs absents du profil.
+    # 1. Activer + géométrie + propriétés (VRR/HDR/WCG) des écrans du profil,
+    # en UN SEUL commit — comme gdctl sous GNOME. Un commit HDR séparé quelques
+    # secondes après le changement de mode frappe la TV en pleine
+    # synchronisation du lien HDMI et la laisse en « no signal » définitif
+    # (vérifié : à 10 s d'écart les deux commits passent, à 3 s la TV meurt).
+    # Si l'appel combiné échoue (propriété refusée par un écran), fallback :
+    # géométrie seule, puis propriétés différées en best-effort (étape 3).
+    local props=() split=false
+    for rec in "${SPECS[@]}"; do
+        parse_spec "$rec" s
+        c="${s[connector]}"
+        ops+=( "output.${c}.enable" \
+               "output.${c}.mode.${s[mode]}" \
+               "output.${c}.scale.${s[scale]}" \
+               "output.${c}.position.${s[x]},${s[y]}" )
+        # KDE (Plasma 6) : la sortie de plus haute priorité (1) est la primaire.
+        [[ "${s[primary]}" == true ]] && ops+=( "output.${c}.priority.1" )
+        [[ "${s[vrr]}" == true ]] && props+=( "output.${c}.vrrpolicy.automatic" )
+        case "${s[color]}" in
+            bt2100) props+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
+            *)      props+=( "output.${c}.hdr.disable" ) ;;
+        esac
+    done
+    if ! kscreen-doctor "${ops[@]}" "${props[@]}" 2>/dev/null; then
+        split=true
+        kscreen-doctor "${ops[@]}"
+    fi
+
+    # Garde-fou double avant la phase 2 :
+    #  a) le kernel pilote réellement chaque écran du profil (sysfs `enabled`) ;
+    #  b) la config KWin a PROPAGÉ : `kscreen-doctor -o` (client frais) liste
+    #     ces écrans comme actifs. Indispensable : chaque invocation
+    #     kscreen-doctor récupère un instantané de la config, y applique ses
+    #     ops et soumet le TOUT (état complet, pas un delta). Si la phase 2
+    #     part avant propagation, son instantané PÉRIMÉ (écrans du profil
+    #     encore « disabled ») est resoumis tel quel : la phase 1 est annulée
+    #     → zéro sortie (placeholder screen) ou rejet « désactivation de
+    #     toutes les sorties non autorisée ». Vu en pratique dans les deux
+    #     variantes.
+    # Si un écran ne s'allume/propage pas dans les 15 s, on abandonne en
+    # laissant l'affichage actuel intact — mieux vaut une bascule ratée et
+    # signalée qu'une session sans aucune sortie active.
+    local gate=$(( $(date +%s) + 15 )) lit act
+    while :; do
+        lit=true
+        mapfile -t act < <(active_monitors_kde)
+        for c in "${allowed[@]}"; do
+            if ! kde_connector_lit "$c" || ! _in_list "$c" "${act[@]}"; then
+                lit=false
+                break
+            fi
+        done
+        $lit && break
+        if (( $(date +%s) >= gate )); then
+            out_error "écran(s) du profil non allumé(s)/propagé(s) après 15 s — bascule abandonnée, affichage actuel conservé"
+            return 1
+        fi
+        sleep 0.5
+    done
+
+    # 2. Désactiver les connecteurs actifs absents du profil. (Un `(( )) &&`
+    # nu ferait sortir le script via set -e quand la liste est vide — cas
+    # normal quand le profil est déjà appliqué, ex. le service de login.)
+    ops=()
     while IFS= read -r conn; do
         [[ -z "$conn" ]] && continue
-        _in_list "$conn" "${allowed[@]}" || core+=( "output.${conn}.disable" )
+        _in_list "$conn" "${allowed[@]}" || ops+=( "output.${conn}.disable" )
     done < <(active_monitors_kde)
+    if (( ${#ops[@]} )); then
+        kscreen-doctor "${ops[@]}"
+    fi
 
-    # 2. Géométrie (doit réussir).
-    for rec in "${SPECS[@]}"; do
-        parse_spec "$rec" s
-        c="${s[connector]}"
-        core+=( "output.${c}.enable" \
-                "output.${c}.mode.${s[mode]}" \
-                "output.${c}.scale.${s[scale]}" \
-                "output.${c}.position.${s[x]},${s[y]}" )
-        # KDE (Plasma 6) : la sortie de plus haute priorité (1) est la primaire.
-        [[ "${s[primary]}" == true ]] && core+=( "output.${c}.priority.1" )
-    done
-    kscreen-doctor "${core[@]}"
-
-    # 3. VRR / HDR / WCG (best-effort, par écran).
-    for rec in "${SPECS[@]}"; do
-        parse_spec "$rec" s
-        c="${s[connector]}"
-        local extra=()
-        [[ "${s[vrr]}" == true ]] && extra+=( "output.${c}.vrrpolicy.automatic" )
-        case "${s[color]}" in
-            bt2100) extra+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
-            *)      extra+=( "output.${c}.hdr.disable" ) ;;
-        esac
-        (( ${#extra[@]} )) && { kscreen-doctor "${extra[@]}" 2>/dev/null || true; }
-    done
+    # 3. Fallback uniquement : propriétés différées, par écran, en best-effort.
+    # 10 s de settle d'abord — le lock d'un lien 4K@60 peut prendre plusieurs
+    # secondes et un commit HDR pendant le lock laisse la TV en « no signal ».
+    if $split; then
+        sleep 10
+        for rec in "${SPECS[@]}"; do
+            parse_spec "$rec" s
+            c="${s[connector]}"
+            local extra=()
+            [[ "${s[vrr]}" == true ]] && extra+=( "output.${c}.vrrpolicy.automatic" )
+            case "${s[color]}" in
+                bt2100) extra+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
+                *)      extra+=( "output.${c}.hdr.disable" ) ;;
+            esac
+            (( ${#extra[@]} )) && { kscreen-doctor "${extra[@]}" 2>/dev/null || true; }
+        done
+    fi
 }
 
 # Énumère les connecteurs d'un profil.
@@ -659,9 +803,11 @@ active_unexpected_monitors() {  # $@ = connecteurs autorisés
 # mode tv, à cause d'une course au hotplug). On ré-applique le profil tant qu'un
 # moniteur hors-profil est actif, en exigeant 2 sondages propres consécutifs.
 reconcile_profile() {  # $1 = nom du tableau de profil ; positionne _RECONCILE_DIRTY
-    # Sous KDE le correctif DRM (drm_status) remplace ce garde-fou anti-hotplug
-    # propre à mutter : no-op.
-    if is_kde; then _RECONCILE_DIRTY=false; return 0; fi
+    # Sous KDE, drm_status règle la boucle de détection propre à la TV, mais pas
+    # les effets de bord d'un uevent DRM global (forcer le statut d'un connecteur
+    # peut faire clignoter le bus DDC d'un AUTRE écran, que KWin réactive alors
+    # tout seul — vu en pratique avec un DP inutilisé rallumé pendant une
+    # bascule --tv → --monitor). Ce garde-fou tourne donc aussi sous KDE.
     _RECONCILE_DIRTY=false
     local allowed
     mapfile -t allowed < <(profile_connectors "$1")
@@ -670,8 +816,10 @@ reconcile_profile() {  # $1 = nom du tableau de profil ; positionne _RECONCILE_D
     while (( $(date +%s) < deadline )); do
         extras=$(active_unexpected_monitors "${allowed[@]}")
         if [[ -n "$extras" ]]; then
-            $JSON_MODE || echo "↻ $(echo "$extras" | tr '\n' ' ')— réactivé(s) par GNOME, réapplication du profil…" >&2
-            apply_profile "$1"
+            $JSON_MODE || echo "↻ $(echo "$extras" | tr '\n' ' ')— réactivé(s) de façon inattendue, réapplication du profil…" >&2
+            # || true : un échec du garde-fou d'apply_profile_kde ne doit pas
+            # tuer le script via set -e — on retentera au tour suivant.
+            apply_profile "$1" || true
             _RECONCILE_DIRTY=true
             clean=0
         else
@@ -699,20 +847,30 @@ set_monitor_mode() {
     is_kde && tv_sleep_if_absent MONITOR_PROFILE
     $JSON_MODE || echo "✓ Mode monitor activé."
     reconcile_profile MONITOR_PROFILE
-    sunshine_update_output MONITOR_PROFILE
+    # || true : l'affichage a déjà basculé — un souci Sunshine (restart refusé,
+    # start-limit…) ne doit pas faire sortir le script en erreur via set -e.
+    sunshine_update_output MONITOR_PROFILE || true
     out_switch "$previous" "monitor"
 }
 
 set_tv_mode() {
     local previous="$1"
+    # KDE : réveiller la TV (redétection DRM) AVANT de valider le profil.
+    # Après un passage en mode monitor, le connecteur TV est forcé à l'état
+    # "off" (tv_sleep_kde) ; sans ce réveil préalable, validate_profile ne le
+    # trouve pas dans `kscreen-doctor -o` et échoue à tort avec « profil
+    # obsolète » — alors que le câblage n'a pas bougé, il fallait juste réveiller
+    # le connecteur.
+    if is_kde && ! tv_wake_kde "$(profile_primary TV_PROFILE)"; then
+        out_error "la TV n'est pas prête (connecteur absent ou instable) — bascule annulée, réessayez dans quelques secondes"
+        exit 1
+    fi
     validate_profile TV_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode tv ($(profile_connectors TV_PROFILE | tr '\n' ' '))…"
-    # KDE : réveiller la TV (redétection DRM + mode bas) avant le mode réel.
-    is_kde && tv_wake_kde "$(profile_primary TV_PROFILE)"
     apply_profile TV_PROFILE
     $JSON_MODE || echo "✓ Mode tv activé."
     reconcile_profile TV_PROFILE
-    sunshine_update_output TV_PROFILE
+    sunshine_update_output TV_PROFILE || true
     out_switch "$previous" "tv"
 }
 
@@ -725,7 +883,7 @@ set_taiko_mode() {
     is_kde && tv_sleep_if_absent TAIKO_PROFILE
     $JSON_MODE || echo "✓ Mode taiko activé."
     reconcile_profile TAIKO_PROFILE
-    sunshine_update_output TAIKO_PROFILE
+    sunshine_update_output TAIKO_PROFILE || true
     # taiko est rapporté comme « tv » par get_current_mode : on reste cohérent.
     out_switch "$previous" "tv"
 }

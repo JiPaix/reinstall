@@ -92,8 +92,14 @@ func handleSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only one switch at a time.
-	switchMu.Lock()
+	// Only one switch at a time — and reject rather than queue: a queued
+	// opposite switch, sent while a slow switch is still running (the TV wake
+	// path can take 30s+), would revert the fresh state the second it
+	// completes. Callers get an explicit 409 and can retry once idle.
+	if !switchMu.TryLock() {
+		writeError(w, http.StatusConflict, "a mode switch is already in progress, retry later")
+		return
+	}
 	defer switchMu.Unlock()
 
 	// Detach from the request context on purpose. A switch restarts Sunshine,
