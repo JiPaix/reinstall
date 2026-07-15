@@ -29,6 +29,15 @@ a final shell script + systemd units from templates, and installs everything to 
   installs a root `swapscreen-drm` helper + sudoers rule for the TV DRM loop workaround. Backend
   quirks are documented at their call sites (`screen/setup/kscreen.go`) — read them before
   touching detection.
+- The KDE install also PINS the TV connector: `screen.sh` captures the TV's EDID at setup and
+  `swapscreen-pin-tv.service` re-applies it at every boot via amdgpu debugfs (`edid_override` +
+  `force=on`), so the connector is always "connected" and `swapscreen --tv` works with the TV
+  off (the TV must boot INTO a stable signal — a mode change hitting it mid-boot wedges it at
+  "no signal"). Never write the connector's sysfs `status` (swapscreen-drm off/detect) on a
+  pinned system: it overwrites the pin until reboot — the engine gates this on `tv_pinned`.
+  The engine's KDE apply is deliberately two kscreen-doctor calls with a propagation gate
+  between them (kscreen submits full-state configs from possibly-stale snapshots); don't merge
+  them back into one call and don't re-order — the why is commented at each step.
 - `*.sh` installers can't run end-to-end outside a real graphical session (need `gdctl` or
   `kscreen-doctor`) and a GitHub Release fetch. To test engine logic, render the template by
   replacing the `#__PROFILES__` line with a `BACKEND=` + profile-array block (exactly what
