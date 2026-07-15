@@ -665,23 +665,22 @@ apply_profile_gnome() {  # $1 = nom du tableau de profil
 # répond plus que des listes vides). Activer d'abord garantit ≥ 1 sortie
 # réellement allumée à chaque instant. Le chevauchement transitoire de
 # positions entre phases (TV et moniteur tous deux en 0,0) est toléré par KWin
-# (vérifié empiriquement). VRR/HDR/WCG partent dans le MÊME commit que la
-# géométrie (une seule transition de signal, comme gdctl) ; en cas de refus,
-# fallback géométrie seule + propriétés différées en best-effort (étape 3).
+# (vérifié empiriquement). VRR/HDR/WCG sont différés ~10 s après la géométrie
+# (étape 3) : « SDR d'abord, HDR une fois le lien verrouillé » — le seul
+# enchaînement qui allume une TV fraîchement sortie de veille.
 apply_profile_kde() {  # $1 = nom du tableau de profil
     local -n SPECS="$1"
     local -A s
     local ops=() rec conn c allowed=()
     mapfile -t allowed < <(profile_connectors "$1")
 
-    # 1. Activer + géométrie + propriétés (VRR/HDR/WCG) des écrans du profil,
-    # en UN SEUL commit — comme gdctl sous GNOME. Un commit HDR séparé quelques
-    # secondes après le changement de mode frappe la TV en pleine
-    # synchronisation du lien HDMI et la laisse en « no signal » définitif
-    # (vérifié : à 10 s d'écart les deux commits passent, à 3 s la TV meurt).
-    # Si l'appel combiné échoue (propriété refusée par un écran), fallback :
-    # géométrie seule, puis propriétés différées en best-effort (étape 3).
-    local props=() split=false
+    # 1. Activer + géométrie des écrans du profil, en SDR — les propriétés
+    # (VRR/HDR/WCG) suivent à l'étape 3, ~10 s après. Séquence « SDR d'abord,
+    # HDR une fois le lien verrouillé » : une TV fraîchement allumée synchronise
+    # un signal SDR simple (vérifié à froid), et un commit HDR sur lien déjà
+    # verrouillé survit (vérifié à 10 s d'écart) — alors que le commit combiné
+    # mode+HDR n'a jamais produit d'image sur TV froide (sync HDMI coincée,
+    # seule une coupure secteur de la TV la débloque).
     for rec in "${SPECS[@]}"; do
         parse_spec "$rec" s
         c="${s[connector]}"
@@ -691,16 +690,8 @@ apply_profile_kde() {  # $1 = nom du tableau de profil
                "output.${c}.position.${s[x]},${s[y]}" )
         # KDE (Plasma 6) : la sortie de plus haute priorité (1) est la primaire.
         [[ "${s[primary]}" == true ]] && ops+=( "output.${c}.priority.1" )
-        [[ "${s[vrr]}" == true ]] && props+=( "output.${c}.vrrpolicy.automatic" )
-        case "${s[color]}" in
-            bt2100) props+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
-            *)      props+=( "output.${c}.hdr.disable" ) ;;
-        esac
     done
-    if ! kscreen-doctor "${ops[@]}" "${props[@]}" 2>/dev/null; then
-        split=true
-        kscreen-doctor "${ops[@]}"
-    fi
+    kscreen-doctor "${ops[@]}"
 
     # Garde-fou double avant la phase 2 :
     #  a) le kernel pilote réellement chaque écran du profil (sysfs `enabled`) ;
@@ -746,23 +737,21 @@ apply_profile_kde() {  # $1 = nom du tableau de profil
         kscreen-doctor "${ops[@]}"
     fi
 
-    # 3. Fallback uniquement : propriétés différées, par écran, en best-effort.
+    # 3. Propriétés différées (VRR/HDR/WCG), par écran, en best-effort.
     # 10 s de settle d'abord — le lock d'un lien 4K@60 peut prendre plusieurs
     # secondes et un commit HDR pendant le lock laisse la TV en « no signal ».
-    if $split; then
-        sleep 10
-        for rec in "${SPECS[@]}"; do
-            parse_spec "$rec" s
-            c="${s[connector]}"
-            local extra=()
-            [[ "${s[vrr]}" == true ]] && extra+=( "output.${c}.vrrpolicy.automatic" )
-            case "${s[color]}" in
-                bt2100) extra+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
-                *)      extra+=( "output.${c}.hdr.disable" ) ;;
-            esac
-            (( ${#extra[@]} )) && { kscreen-doctor "${extra[@]}" 2>/dev/null || true; }
-        done
-    fi
+    sleep 10
+    for rec in "${SPECS[@]}"; do
+        parse_spec "$rec" s
+        c="${s[connector]}"
+        local extra=()
+        [[ "${s[vrr]}" == true ]] && extra+=( "output.${c}.vrrpolicy.automatic" )
+        case "${s[color]}" in
+            bt2100) extra+=( "output.${c}.hdr.enable" "output.${c}.wcg.enable" ) ;;
+            *)      extra+=( "output.${c}.hdr.disable" ) ;;
+        esac
+        (( ${#extra[@]} )) && { kscreen-doctor "${extra[@]}" 2>/dev/null || true; }
+    done
 }
 
 # Énumère les connecteurs d'un profil.
