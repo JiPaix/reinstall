@@ -191,6 +191,13 @@ systemctl --user disable "$LOGIN_SERVICE" 2>/dev/null && print_ok "Disabled $LOG
 if [ "$BACKEND" != kde ] && { [ -f /etc/sudoers.d/swapscreen-drm ] || [ -f /usr/local/bin/swapscreen-drm ]; }; then
   sudo rm -f /etc/sudoers.d/swapscreen-drm /usr/local/bin/swapscreen-drm && print_ok "Removed KDE DRM helper + sudoers rule"
 fi
+# Same for the KDE TV pin (service + helper + captured EDID).
+if [ "$BACKEND" != kde ] && [ -f /etc/systemd/system/swapscreen-pin-tv.service ]; then
+  sudo systemctl disable --now swapscreen-pin-tv.service 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/swapscreen-pin-tv.service /usr/local/bin/swapscreen-pin-tv /var/lib/swapscreen/tv-edid.bin
+  sudo systemctl daemon-reload
+  print_ok "Removed KDE TV pin service + helper + captured EDID"
+fi
 
 # Remove the firewall rule (re-added in STEP 7) so it never stacks/goes stale.
 if command -v ufw &>/dev/null; then
@@ -332,6 +339,102 @@ if [ "$BACKEND" = gnome ] && [ ! -f "$WORK/gdm-monitors.xml" ]; then
   exit 1
 fi
 print_ok "Generated swapscreen.sh"
+
+# =============================================================================
+# STEP 3b — Pin the TV connector (needs sudo; KDE only)
+# =============================================================================
+# Capture the TV's EDID now (the setup just required the TV to be detected)
+# and pin the connector at every boot: EDID override + forced "connected" via
+# amdgpu debugfs. The connector then behaves like a permanently-on TV — no
+# detect loop, no wake dance, and `swapscreen --tv` works even with the TV
+# off: the signal starts flowing immediately and the TV later boots INTO an
+# already-stable signal, the only sequence this class of TV syncs reliably
+# (a mode change hitting the TV mid-boot leaves it at "no signal" forever).
+if [ "$BACKEND" = kde ]; then
+  print_header "TV Connector Pin"
+
+  # Primary connector of TV_PROFILE from this run's profiles.
+  # shellcheck disable=SC1091
+  source "$WORK/profiles.conf"
+  TV_CONN=""
+  for rec in "${TV_PROFILE[@]}"; do
+    conn=""; prim=false
+    for tok in $rec; do
+      case "$tok" in
+        connector=*)  conn="${tok#connector=}" ;;
+        primary=true) prim=true ;;
+      esac
+    done
+    [ -z "$TV_CONN" ] && TV_CONN="$conn"
+    if $prim; then TV_CONN="$conn"; break; fi
+  done
+
+  EDID_SRC=""
+  for f in /sys/class/drm/card*-"$TV_CONN"/edid; do
+    [ -e "$f" ] && [ "$(wc -c < "$f")" -gt 0 ] && { EDID_SRC="$f"; break; }
+  done
+
+  if [ -z "$TV_CONN" ]; then
+    print_warn "No TV connector in TV_PROFILE — skipping pin."
+  elif [ -z "$EDID_SRC" ]; then
+    print_warn "No readable EDID for $TV_CONN (TV off?) — skipping pin."
+    print_warn "The engine falls back to DRM wake/detect; re-run with the TV on to enable the pin."
+  else
+    PIN_HELPER=/usr/local/bin/swapscreen-pin-tv
+    PIN_SERVICE=/etc/systemd/system/swapscreen-pin-tv.service
+    PIN_EDID=/var/lib/swapscreen/tv-edid.bin
+
+    sudo install -d -m 0755 /var/lib/swapscreen
+    sudo install -m 0644 "$EDID_SRC" "$PIN_EDID"
+    print_ok "Captured $TV_CONN EDID → $PIN_EDID ($(wc -c < "$EDID_SRC") bytes)"
+
+    sudo tee "$PIN_HELPER" >/dev/null <<'PINEOF'
+#!/usr/bin/env bash
+# swapscreen-pin-tv <connector>
+# Pin the TV connector: serve the captured EDID from the kernel and force the
+# status to "connected" (amdgpu debugfs), then fire a hotplug so the session
+# picks it up. Installed by screen.sh; run at boot by swapscreen-pin-tv.service.
+set -euo pipefail
+shopt -s nullglob
+conn="${1:?usage: swapscreen-pin-tv <connector>}"
+edid=/var/lib/swapscreen/tv-edid.bin
+[ -s "$edid" ] || { echo "missing or empty $edid" >&2; exit 1; }
+# debugfs shows up a moment after amdgpu loads — wait for it at early boot.
+for _ in $(seq 1 30); do
+  dirs=( /sys/kernel/debug/dri/*/"$conn" )
+  [ "${#dirs[@]}" -gt 0 ] && break
+  sleep 1
+done
+ok=0
+for d in /sys/kernel/debug/dri/*/"$conn"; do
+  [ -d "$d" ] || continue
+  cat "$edid" > "$d/edid_override"
+  echo on > "$d/force"
+  if [ -w "$d/trigger_hotplug" ]; then echo 1 > "$d/trigger_hotplug"; fi
+  ok=1
+done
+[ "$ok" = 1 ] || { echo "no debugfs dir for connector $conn" >&2; exit 1; }
+PINEOF
+    sudo chmod 0755 "$PIN_HELPER"
+    print_ok "Installed $PIN_HELPER"
+
+    sudo tee "$PIN_SERVICE" >/dev/null <<PINSVC
+[Unit]
+Description=Pin the swapscreen TV connector ($TV_CONN) with its captured EDID
+ConditionPathExists=/var/lib/swapscreen/tv-edid.bin
+
+[Service]
+Type=oneshot
+ExecStart=$PIN_HELPER $TV_CONN
+
+[Install]
+WantedBy=multi-user.target
+PINSVC
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now swapscreen-pin-tv.service
+    print_ok "Enabled swapscreen-pin-tv.service (pin applied now and at every boot)"
+  fi
+fi
 
 # =============================================================================
 # STEP 4 — Install directories

@@ -196,6 +196,16 @@ _in_list() {  # $1 = aiguille, $2.. = meule
 # statut était forcé off) resterait invisible jusqu'au redémarrage de session.
 DRM_HELPER=/usr/local/bin/swapscreen-drm
 
+# Fichier déposé par screen.sh quand le connecteur TV est ÉPINGLÉ : EDID
+# capturé à l'installation + statut forcé « connected » à chaque boot
+# (swapscreen-pin-tv.service). Le connecteur devient alors indistinguable
+# d'une TV allumée en permanence : plus de boucle de détection, plus de
+# réveil — et une bascule --tv marche même TV éteinte, la TV démarrant
+# ensuite DANS un signal déjà stable (seul enchaînement qui synchronise à
+# tous les coups cette TV).
+TV_PIN_EDID=/var/lib/swapscreen/tv-edid.bin
+tv_pinned() { [[ -f "$TV_PIN_EDID" ]]; }
+
 drm_status() {  # $1 = connecteur, $2 = detect|off|on
     if ! sudo -n "$DRM_HELPER" "$1" "$2" 2>/dev/null; then
         $JSON_MODE || echo "⚠ $DRM_HELPER indisponible (sudoers ?) — statut DRM '$2' non appliqué pour $1" >&2
@@ -255,6 +265,14 @@ kde_connector_lit() {  # $1 = connecteur
 tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
     local tv="$1"
     [[ -z "$tv" ]] && return 0
+    # Connecteur épinglé : l'EDID est servi par le kernel lui-même, il est
+    # stable par construction — présence côté kscreen = prêt, zéro attente.
+    # (Si le pin est actif mais le connecteur absent, on retombe sur le réveil
+    # classique : le poke « detect » écrase le pin jusqu'au prochain boot,
+    # mais c'est le bon fallback si le service de pin a échoué.)
+    if tv_pinned && kde_connector_known "$tv"; then
+        return 0
+    fi
     # 45 s : certaines TV (Vestel…) mettent 20-30 s après power-on avant de
     # servir un EDID stable ; il faut encore 3 s de stabilité derrière.
     local start; start=$(date +%s)
@@ -288,27 +306,19 @@ tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
         $JSON_MODE || echo "⚠ $tv détecté mais instable (HPD/EDID clignotant) — bascule refusée" >&2
         return 1
     fi
-    # Détection éclair (≤ 8 s) = la TV était déjà chaude : rien à attendre.
-    # Sinon elle vient d'être allumée, et son étage HDMI sert un EDID stable
-    # BIEN AVANT de savoir verrouiller un lien 4K@60 : un commit à ~20 s du
-    # power-on part dans le vide — kernel OK, chemin audio actif, mais panneau
-    # « no signal » définitif, la TV ne réessaie jamais d'elle-même (vérifié).
-    # Tous les commits réussis observés avaient la TV allumée depuis ≥ 40 s :
-    # on laisse donc la TV finir de démarrer avant de lui envoyer le signal.
-    if (( $(date +%s) - start > 8 )); then
-        $JSON_MODE || echo "… TV fraîchement allumée — attente de fin de démarrage (20 s)" >&2
-        sleep 20
-    fi
     return 0
 }
 
-# Endort la TV : désactive la sortie puis coupe son statut DRM pour stopper la
-# boucle tant qu'on n'est pas en mode tv.
+# Endort la TV : désactive la sortie. Sans épinglage, force aussi le statut
+# DRM à off pour stopper la boucle de détection (TV en veille qui pulse son
+# HPD). AVEC épinglage, ne surtout PAS toucher au statut : l'écriture sysfs
+# écraserait le force=on du pin (même variable kernel côté connecteur) et le
+# connecteur retomberait dans le régime instable jusqu'au prochain boot.
 tv_sleep_kde() {  # $1 = connecteur primaire TV
     local tv="$1"
     [[ -z "$tv" ]] && return 0
     kscreen-doctor "output.${tv}.disable" 2>/dev/null || true
-    drm_status "$tv" off
+    tv_pinned || drm_status "$tv" off
 }
 
 # Endort la TV UNIQUEMENT si son connecteur primaire n'appartient pas au profil
