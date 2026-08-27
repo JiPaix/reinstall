@@ -14,6 +14,10 @@ ExecStart=%h/.local/bin/swapscreen-server
 # system bin dirs. The binary inherits this PATH when it shells out.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PORT=7920
+# Optional access control (ALLOWED_IPS, AUTH_TOKEN) — written by screen.sh into
+# this file, chmod 600. Leading "-" makes it optional so the unit still starts
+# on a checkout that never generated one (fully open, as before either existed).
+EnvironmentFile=-%h/.config/swapscreen-server/server.env
 Restart=on-failure
 RestartSec=2
 

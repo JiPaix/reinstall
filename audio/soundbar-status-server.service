@@ -13,6 +13,10 @@ ExecStart=%h/.local/bin/soundbar-status-server
 # The binary inherits this PATH when it shells out.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PORT=7921
+# Optional access control (ALLOWED_IPS, AUTH_TOKEN) — written by audio.sh into
+# this file, chmod 600. Leading "-" makes it optional so the unit still starts
+# on a checkout that never generated one (fully open, as before either existed).
+EnvironmentFile=-%h/.config/soundbar-status-server/server.env
 Restart=on-failure
 RestartSec=2
 

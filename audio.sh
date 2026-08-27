@@ -227,6 +227,38 @@ done
 print_ok "PipeWire reloaded"
 
 # =============================================================================
+# STEP 7b — HTTP server access control (optional)
+# =============================================================================
+# Neither check is required: an empty ALLOWED_IPS means no IP restriction, and
+# the token is always generated but only enforced because the server checks it
+# unconditionally once present in server.env. Written before the (re)start
+# below so the fresh binary picks it up immediately via EnvironmentFile=.
+print_header "HTTP Server Access Control"
+
+SERVER_CONFIG_DIR="$HOME/.config/soundbar-status-server"
+mkdir -p "$SERVER_CONFIG_DIR"
+chmod 700 "$SERVER_CONFIG_DIR"
+
+ask "Restrict soundbar-status-server access by IP?"
+print_info "Comma-separated IPs and/or CIDRs, mixed freely (e.g. 192.168.1.3,10.0.0.0/24)."
+read -rp "Allowed IPs (blank = no restriction): " ALLOWED_IPS
+
+AUTH_TOKEN="$(head -c 32 /dev/urandom | base64)"
+
+{
+  echo "ALLOWED_IPS=$ALLOWED_IPS"
+  echo "AUTH_TOKEN=$AUTH_TOKEN"
+} > "$SERVER_CONFIG_DIR/server.env"
+chmod 600 "$SERVER_CONFIG_DIR/server.env"
+
+if [ -n "$ALLOWED_IPS" ]; then
+  print_ok "Restricting access to: $ALLOWED_IPS"
+else
+  print_warn "No IP restriction set — reachable from any host that can route to it"
+fi
+print_ok "Generated auth token (send it as 'Authorization: Bearer <token>')"
+
+# =============================================================================
 # STEP 8 — Install and (re)start the status HTTP server
 # =============================================================================
 print_header "Soundbar Status HTTP Server"
@@ -263,6 +295,8 @@ echo -e "${GREEN}${BOLD}All done!${NC}"
 echo ""
 echo -e "  Primary device: ${CYAN}${PRIMARY_DESC}${NC} (${PRIMARY_SINK})"
 echo -e "  Status server:  ${CYAN}http://localhost:$SERVER_PORT/status${NC}"
+echo -e "  Access token:   ${CYAN}$AUTH_TOKEN${NC}"
+echo -e "  Token file:     ${CYAN}$SERVER_CONFIG_DIR/server.env${NC}"
 if [ "${IS_BT:-false}" = true ]; then
   echo ""
   echo -e "${YELLOW}Connect your primary BT device to activate the EQ and keepalive.${NC}"
