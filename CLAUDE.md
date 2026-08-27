@@ -44,3 +44,13 @@ a final shell script + systemd units from templates, and installs everything to 
   `generate.go` does), `bash -n` it, then stub `gdctl`/`kscreen-doctor`/`sudo`/`systemctl` on
   `PATH` and assert the emitted command order. For installers, extract the block with `sed`/`awk`
   and stub `print_*`/`systemctl`.
+- Both HTTP servers (`swapscreen-server` :7920, `soundbar-status-server` :7921) bind all
+  interfaces with no auth by default. `screen.sh`/`audio.sh` optionally lock this down: an
+  `ALLOWED_IPS`/`AUTH_TOKEN` pair generated at install time, written to
+  `~/.config/<service-name>/server.env` (chmod 600, outside the repo — not gitignored, just not
+  tracked), loaded via each unit's `EnvironmentFile=-%h/.config/.../server.env`. The middleware
+  lives in each `main.go` (duplicated, not shared — see the per-module gotcha above) and gates
+  every route including `/healthz`. **Re-running the installer always generates a brand-new
+  token**, silently invalidating the old one — any external caller (e.g. a Home Assistant
+  automation hitting `/mode/{tv,monitor}`) needs its stored token updated after every reinstall,
+  or it'll get a 401 with no other symptom.
