@@ -1,0 +1,23 @@
+[Unit]
+Description=poweroff-server HTTP server (remote shutdown trigger)
+# System unit, not a --user one: must be reachable with nobody logged in, so
+# it starts at boot under root rather than a user session (see swapscreen-drm/
+# swapscreen-pin-tv for the repo's other root-owned system units).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/poweroff-server
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PORT=7922
+# Optional access control (ALLOWED_IPS, AUTH_TOKEN) — written by power.sh into
+# this file, root:root chmod 600. Leading "-" makes it optional so the unit
+# still starts on a checkout that never generated one (fully open, as before
+# either existed).
+EnvironmentFile=-/etc/poweroff-server/server.env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

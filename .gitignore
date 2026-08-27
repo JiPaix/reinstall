@@ -26,6 +26,7 @@ credentials.*
 /screen/swapscreen-setup
 /audio/soundbar-status-server
 /audio/soundbar-setup
+/power/poweroff-server
 *.exe
 *.out
 

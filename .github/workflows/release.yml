@@ -1,9 +1,10 @@
 name: Release
 
-# Build the four Go binaries (server + interactive setup, for each of screen
-# and audio) and attach them — plus the three static systemd unit files — to a
-# GitHub Release. The install scripts (screen.sh / audio.sh) download these
-# assets, so no Go toolchain is needed on the target machine.
+# Build the Go binaries (server + interactive setup, for each of screen and
+# audio; a single server for power) and attach them — plus the static systemd
+# unit files — to a GitHub Release. The install scripts (screen.sh / audio.sh /
+# power.sh) download these assets, so no Go toolchain is needed on the target
+# machine.
 #
 # Trigger: push a version tag, e.g.
 #     git tag v1.0.0 && git push origin v1.0.0
@@ -40,11 +41,16 @@ jobs:
           go build -trimpath -ldflags='-s -w' -o ../dist/soundbar-status-server .
           go build -trimpath -ldflags='-s -w' -o ../dist/soundbar-setup ./setup
 
+      - name: Build power binary
+        working-directory: power
+        run: go build -trimpath -ldflags='-s -w' -o ../dist/poweroff-server .
+
       - name: Stage static systemd units
         run: |
           cp screen/swapscreen-server.service dist/
           cp screen/swapscreen-login.service dist/
           cp audio/soundbar-status-server.service dist/
+          cp power/poweroff-server.service dist/
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

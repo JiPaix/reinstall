@@ -3,7 +3,7 @@
 Personal dotfiles-style toolkit. Each top-level `*.sh` (`screen.sh`, `audio.sh`) downloads
 prebuilt Go binaries from the latest GitHub Release, runs an interactive TUI setup, generates
 a final shell script + systemd units from templates, and installs everything to `~/.local/bin`
-/ `~/.config/systemd/user`.
+/ `~/.config/systemd/user`. `power.sh` is the exception — see its own gotcha below.
 
 ## Gotchas
 
@@ -19,10 +19,12 @@ a final shell script + systemd units from templates, and installs everything to 
   marker (no templating) plus hand-built string/XML builders. `jq` is fine for new bash-side JSON
   in a top-level installer; gate it with `command -v` + the `install_with_pkg_manager` helper in
   `screen.sh` (don't re-inline the pacman/paru/yay prompt).
-- Go modules are per-tool (`screen/go.mod`, `audio/go.mod`), never at the repo root — build/test
-  from inside: `cd screen && go vet ./setup/ && go test ./setup/`. From the root these silently
-  fail (no module). `go build ./setup/` also fails (output name collides with the `setup/` dir) —
-  use `go build -o <path> ./setup/`.
+- Go modules are per-tool (`screen/go.mod`, `audio/go.mod`, `power/go.mod`), never at the repo
+  root — build/test from inside: `cd screen && go vet ./setup/ && go test ./setup/`. From the
+  root these silently fail (no module). `go build ./setup/` also fails (output name collides with
+  the `setup/` dir) — use `go build -o <path> ./setup/`. `power` has no `setup/` subpackage and no
+  third-party deps (stdlib-only `main.go`) — there's nothing to configure interactively, so unlike
+  screen/audio it skips the TUI-wizard half of the pattern entirely.
 - `screen` has two display backends. `swapscreen-setup -de gnome|kde` (auto: `$XDG_CURRENT_DESKTOP`,
   else which tool is on PATH) emits `BACKEND=` atop the profile block; the engine and `screen.sh`
   both dispatch on it (gnome=`gdctl`, kde=`kscreen-doctor`). GDM greeter layout is GNOME-only; KDE
@@ -44,13 +46,22 @@ a final shell script + systemd units from templates, and installs everything to 
   `generate.go` does), `bash -n` it, then stub `gdctl`/`kscreen-doctor`/`sudo`/`systemctl` on
   `PATH` and assert the emitted command order. For installers, extract the block with `sed`/`awk`
   and stub `print_*`/`systemctl`.
-- Both HTTP servers (`swapscreen-server` :7920, `soundbar-status-server` :7921) bind all
-  interfaces with no auth by default. `screen.sh`/`audio.sh` optionally lock this down: an
-  `ALLOWED_IPS`/`AUTH_TOKEN` pair generated at install time, written to
-  `~/.config/<service-name>/server.env` (chmod 600, outside the repo — not gitignored, just not
-  tracked), loaded via each unit's `EnvironmentFile=-%h/.config/.../server.env`. The middleware
-  lives in each `main.go` (duplicated, not shared — see the per-module gotcha above) and gates
-  every route including `/healthz`. **Re-running the installer always generates a brand-new
-  token**, silently invalidating the old one — any external caller (e.g. a Home Assistant
-  automation hitting `/mode/{tv,monitor}`) needs its stored token updated after every reinstall,
-  or it'll get a 401 with no other symptom.
+- All three HTTP servers (`swapscreen-server` :7920, `soundbar-status-server` :7921,
+  `poweroff-server` :7922) bind all interfaces with no auth by default. `screen.sh`/`audio.sh`/
+  `power.sh` optionally (`power.sh`: always asked, not left blank-is-fine) lock this down: an
+  `ALLOWED_IPS`/`AUTH_TOKEN` pair generated at install time, written to a `server.env` (chmod
+  600), loaded via each unit's `EnvironmentFile=-.../server.env`. The middleware lives in each
+  `main.go` (duplicated, not shared — see the per-module gotcha above) and gates every route
+  including `/healthz`. **Re-running an installer always generates a brand-new token**, silently
+  invalidating the old one — any external caller (e.g. a Home Assistant automation hitting
+  `/mode/{tv,monitor}` or `/shutdown`) needs its stored token updated after every reinstall, or
+  it'll get a 401 with no other symptom.
+- `poweroff-server` breaks the screen/audio pattern on purpose: it's a **root system service**
+  (`/etc/systemd/system/poweroff-server.service`, `WantedBy=multi-user.target`, binary in
+  `/usr/local/bin`, config in `/etc/poweroff-server/server.env`), not a `--user` unit under
+  `$HOME`. It must answer `POST /shutdown` (→ `systemctl poweroff`) even with nobody logged in,
+  which a `--user` unit can't do without `loginctl enable-linger` — and linger was rejected here
+  because it would also change `soundbar-status-server.service`'s boot behavior (it's
+  `WantedBy=default.target`, so linger starts it at boot too, not just after first login) as an
+  unrelated side effect. `power.sh` therefore needs `sudo` throughout and installs system-wide,
+  unlike `screen.sh`/`audio.sh`.
