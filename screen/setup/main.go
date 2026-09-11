@@ -169,7 +169,8 @@ func buildRows(label string, available []Connector) [][]Cell {
 	return rows
 }
 
-// configureCell prompts for resolution → refresh → scale → color → VRR.
+// configureCell prompts for resolution → refresh → scale → color → VRR (color
+// only when the backend can't detect it — see autoColor).
 func configureCell(c Connector) Cell {
 	def := c.DefaultMode()
 
@@ -185,7 +186,10 @@ func configureCell(c Connector) Cell {
 	mode := modes[atoi(selectKV(res+": refresh rate", labels, values, "0"))]
 
 	scale := chooseScale(c.Label(), mode)
-	color := selectOpts(c.Label()+": color mode", colorOptions, "default")
+	color := autoColor(c)
+	if color == "" {
+		color = selectOpts(c.Label()+": color mode", colorOptions, "default")
+	}
 
 	vrr := false
 	if mode.HasVRR {
@@ -201,6 +205,19 @@ func configureCell(c Connector) Cell {
 		Color:     color,
 		VRR:       vrr,
 	}
+}
+
+// autoColor picks the color mode from the output's real capabilities when the
+// backend reports them (KDE): HDR whenever available, SDR otherwise. Returns ""
+// when unknown (gdctl), so the caller asks instead.
+func autoColor(c Connector) string {
+	if c.HDR == nil {
+		return ""
+	}
+	if *c.HDR {
+		return "bt2100"
+	}
+	return "default"
 }
 
 func chooseScale(label string, m Mode) float64 {
@@ -352,6 +369,9 @@ func dumpConnectors(conns []Connector) {
 		}
 		if len(c.Modes) > 0 {
 			fmt.Printf("  scales: %v\n", c.Modes[0].Scales)
+		}
+		if color := autoColor(c); color != "" {
+			fmt.Printf("  color: %s\n", color)
 		}
 	}
 }

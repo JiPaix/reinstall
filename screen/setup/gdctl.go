@@ -35,6 +35,7 @@ type Connector struct {
 	Product string // EDID product name, e.g. "PL2788H"
 	Serial  string // EDID serial, e.g. "0" or a real serial number
 	Modes   []Mode
+	HDR     *bool // HDR-capable, when the backend reports it (KDE); nil = unknown (gdctl)
 }
 
 // Label is a human-friendly one-liner for pickers.

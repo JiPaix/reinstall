@@ -54,6 +54,12 @@ type ksOutput struct {
 	// "Vrr: Never" (capable, policy off) vs "Vrr: incapable". There is no
 	// `capabilities` field to consult.
 	VrrPolicy *int `json:"vrrPolicy"`
+
+	// Same convention for HDR/WCG: the keys are absent on incapable outputs
+	// ("HDR: incapable" in `-o`) and false on capable ones that are just off,
+	// so non-nil means capable.
+	HDR *bool `json:"hdr"`
+	WCG *bool `json:"wcg"`
 }
 
 type ksConfig struct {
@@ -80,7 +86,9 @@ func detectKscreen() ([]Connector, error) {
 			continue
 		}
 		scales := kdeScalesFor(o.Scale)
-		c := Connector{Name: o.Name}
+		// bt2100 enables both HDR and WCG, so it needs both capabilities.
+		hdr := o.HDR != nil && o.WCG != nil
+		c := Connector{Name: o.Name, HDR: &hdr}
 		for _, m := range o.Modes {
 			w, h, refresh := ksModeFields(m)
 			if w == 0 || h == 0 {
