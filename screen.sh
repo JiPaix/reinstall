@@ -634,11 +634,14 @@ else
   }
 
   # kscreen-doctor HDR/WCG ops for a connector given its target HDR state.
+  # SDR must disable WCG too: KWin keeps them as separate flags, and HDR off
+  # with WCG on still signals BT.2020 colorimetry — the Vestel TV stays in its
+  # HDR picture mode on that alone and shows the SDR content with wrong colors.
   kde_hdr_fragment() {  # $1=connector $2=true|false
     if [ "$2" = true ]; then
       printf 'output.%s.hdr.enable output.%s.wcg.enable' "$1" "$1"
     else
-      printf 'output.%s.hdr.disable' "$1"
+      printf 'output.%s.hdr.disable output.%s.wcg.disable' "$1" "$1"
     fi
   }
 
