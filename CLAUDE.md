@@ -40,6 +40,23 @@ a final shell script + systemd units from templates, and installs everything to 
   The engine's KDE apply is deliberately two kscreen-doctor calls with a propagation gate
   between them (kscreen submits full-state configs from possibly-stale snapshots); don't merge
   them back into one call and don't re-order — the why is commented at each step.
+- The `*.sh` installers run from the checkout, but everything Go-built — including the engine
+  template, which is `//go:embed`ded into `swapscreen-setup` — comes from the latest GitHub
+  Release. A change under `screen/`/`audio/`/`power/` reaches a reinstall only after an annotated
+  `v*` tag (`vX.Y.0: summary`, like the existing ones) is pushed; `release.yml` builds and
+  attaches the assets. Pushing to main alone is not enough.
+- KDE HDR and WCG are separate KWin flags: `hdr.disable` alone keeps BT.2020 colorimetry, which
+  the Vestel TV treats as HDR, so SDR content comes out with the wrong colors. SDR means
+  `hdr.disable wcg.disable` (the Sunshine prep-cmd in `screen.sh` does this). KWin persists both
+  per output in `~/.config/kwinoutputconfig.json`, so an HDR-off whose undo never ran (Sunshine
+  killed mid-stream) survives a reboot. The engine re-applying the profile's color on every
+  switch is the repair path, so keep it. On KDE the setup picks `bt2100` only when
+  `kscreen-doctor -j` reports both `hdr`/`wcg` keys (they're absent on incapable outputs).
+- Sunshine captures via KMS: `output_name` is a KMS index that the engine derives from Sunshine's
+  KMS log lines. The installed Sunshine also supports `capture = kwin`/`portal`, where
+  `output_name` means something else, so switching the capture method needs an engine change.
+  Probe Sunshine through its journal, never `sunshine --version`/`--help`: those launch a second
+  instance that truncates `~/.config/sunshine/sunshine.log`.
 - `*.sh` installers can't run end-to-end outside a real graphical session (need `gdctl` or
   `kscreen-doctor`) and a GitHub Release fetch. To test engine logic, render the template by
   replacing the `#__PROFILES__` line with a `BACKEND=` + profile-array block (exactly what
