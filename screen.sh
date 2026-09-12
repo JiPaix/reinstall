@@ -13,6 +13,9 @@
 # - GNOME: installs the GDM greeter layout (needs sudo). KDE: installs a root
 #   helper + sudoers rule for the TV DRM loop workaround (needs sudo)
 # - Opens the server port in the firewall (ufw)
+# - Enables Sunshine (if installed) so it starts with every graphical session
+# - amdgpu: writes a ddcutilrc that keeps ddcutil's I2C bus scan serial
+#   (ddcutil 3.0.0's parallel scan hangs the GPU at login)
 # =============================================================================
 
 set -euo pipefail
@@ -734,11 +737,77 @@ else
     print_ok "Updated $SUNSHINE_APPS (added any missing apps by name; existing apps/env untouched)"
   fi
 
-  if systemctl --user try-restart "$(sunshine_service_name)" 2>/dev/null; then
-    print_ok "Restarted Sunshine"
+  # The Sunshine package ships its user unit (WantedBy=graphical-session.target)
+  # but doesn't enable it, so on a fresh install Sunshine only runs once started
+  # by hand and is gone after the next reboot. Enable it, then restart (which
+  # also starts it if it wasn't running) so global_prep_cmd applies now.
+  SUNSHINE_SERVICE="$(sunshine_service_name)"
+  if systemctl --user enable "$SUNSHINE_SERVICE" 2>/dev/null; then
+    print_ok "Enabled $SUNSHINE_SERVICE (starts with every graphical session)"
   else
-    print_warn "Could not restart Sunshine — restart it manually to apply global_prep_cmd"
+    print_warn "Could not enable $SUNSHINE_SERVICE — enable it manually"
   fi
+  if systemctl --user restart "$SUNSHINE_SERVICE" 2>/dev/null; then
+    print_ok "(Re)started Sunshine"
+  else
+    print_warn "Could not (re)start Sunshine — start it manually to apply global_prep_cmd"
+  fi
+fi
+
+# =============================================================================
+# STEP 10 — ddcutil parallel bus-scan workaround (amdgpu)
+# =============================================================================
+# ddcutil 3.0.0 lowered --i2c-bus-checks-async-min / --i2c-init-async-min from
+# 99 to 4 (upstream commit 09263068). amdgpu exposes an I2C bus per connector
+# plus one per DisplayPort AUX channel, so most cards reach that threshold and
+# get their buses probed from several threads at once — which hangs the GPU
+# within seconds ("Fence fallback timer expired" -> "device lost from bus").
+# powerdevil runs that scan at every Plasma login, so the session freezes; the
+# ddcutil CLI can trigger it too. 99 restores the serial scan of 2.2.x, where
+# this file is a no-op. Only written when there is no ddcutilrc already, so a
+# hand-made one is never clobbered.
+# https://github.com/rockowitz/ddcutil/issues/629
+print_header "ddcutil Workaround (amdgpu)"
+
+DDCUTIL_RC="$HOME/.config/ddcutil/ddcutilrc"
+
+amdgpu_bound() {
+  local d
+  for d in /sys/bus/pci/drivers/amdgpu/0000:*; do
+    [ -e "$d" ] && return 0
+  done
+  return 1
+}
+
+write_ddcutilrc() {  # $1 = path
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'DDCEOF'
+# Written by reinstall/screen.sh (see its "ddcutil Workaround" step).
+# ddcutil 3.0.0 scans I2C buses in parallel once there are enough of them
+# (threshold 4); on amdgpu that hangs the GPU. 99 keeps the scan serial, as in
+# 2.2.x, where this file is a no-op.
+# https://github.com/rockowitz/ddcutil/issues/629
+
+[libddcutil]
+options = --i2c-bus-checks-async-min 99 --i2c-init-async-min 99
+
+[ddcutil]
+options = --i2c-bus-checks-async-min 99 --i2c-init-async-min 99
+DDCEOF
+}
+
+if ! amdgpu_bound; then
+  print_info "No amdgpu device — skipping."
+elif [ -f "$DDCUTIL_RC" ]; then
+  if grep -q -- '--i2c-bus-checks-async-min' "$DDCUTIL_RC"; then
+    print_ok "$DDCUTIL_RC already sets the bus-scan threshold — left untouched"
+  else
+    print_warn "$DDCUTIL_RC exists — not overwriting it. Add to its [libddcutil] and [ddcutil] sections:"
+    print_info "  options = --i2c-bus-checks-async-min 99 --i2c-init-async-min 99"
+  fi
+else
+  write_ddcutilrc "$DDCUTIL_RC"
+  print_ok "Wrote $DDCUTIL_RC (serial I2C bus scan)"
 fi
 
 echo
