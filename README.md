@@ -1,11 +1,12 @@
 # reinstall
 
 Personal setup scripts to get a freshly installed machine back to my preferred
-display and audio configuration in one command each. Built for Arch-based
+display, audio and session configuration in one command each. Built for Arch-based
 systems (pacman / paru / yay) running PipeWire.
 
-Each command downloads a prebuilt helper, walks you through a short interactive
-setup, and installs a small background service. No toolchain required.
+Each command walks you through a short interactive setup. Screen and audio also
+download a prebuilt helper and install a small background service. No toolchain
+required.
 
 ## Screen
 
@@ -24,6 +25,10 @@ time. The setup detects your monitors and builds the layouts; a small service
 then lets you switch (including remotely over the local network, which pairs
 nicely with game streaming).
 
+If Sunshine is installed, it's also enabled so it starts with every session. On
+AMD graphics cards it writes a small ddcutil config too: ddcutil 3.0 probes
+monitors in parallel, which freezes the GPU right after login.
+
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen.sh)
 ```
@@ -38,9 +43,30 @@ Sets up the audio path for a soundbar: applies an equalizer, keeps a Bluetooth
 soundbar from dozing off mid-silence, and runs a small service that reports the
 soundbar's current state over the local network.
 
+With a Bluetooth soundbar, the keepalive also kicks in at login when the
+soundbar was already connected, and you can have every paired Bluetooth device
+reconnect automatically at boot.
+
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/audio.sh)
 ```
+
+## Session
+
+> [!NOTE]
+> KDE Plasma with Plasma Login Manager only.
+
+Optionally logs you in automatically at boot, so the services above (display
+switching, soundbar status, Sunshine) are back after a reboot without anyone at
+the keyboard.
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/session.sh)
+```
+
+With autologin on, give your wallet an empty password once — KWalletManager →
+kdewallet → Change Password… — or apps that store passwords in it will ask for
+it after every boot.
 
 ## Notes
 

@@ -3,7 +3,8 @@
 Personal dotfiles-style toolkit. Each top-level `*.sh` (`screen.sh`, `audio.sh`) downloads
 prebuilt Go binaries from the latest GitHub Release, runs an interactive TUI setup, generates
 a final shell script + systemd units from templates, and installs everything to `~/.local/bin`
-/ `~/.config/systemd/user`. `power.sh` is the exception — see its own gotcha below.
+/ `~/.config/systemd/user`. `power.sh` and `session.sh` are the exceptions — see their gotchas
+below.
 
 ## Gotchas
 
@@ -82,3 +83,37 @@ a final shell script + systemd units from templates, and installs everything to 
   `WantedBy=default.target`, so linger starts it at boot too, not just after first login) as an
   unrelated side effect. `power.sh` therefore needs `sudo` throughout and installs system-wide,
   unlike `screen.sh`/`audio.sh`.
+- `session.sh` (KDE Plasma Login Manager only) downloads nothing and has no Go side: it edits
+  `[Autologin]` in `/etc/plasmalogin.conf` (`User=`/`Session=`; other sections untouched, an
+  existing `Session=` wins) and, with autologin on, installs `~/.config/systemd/user/ksecretd.service`.
+  Autologin is how the `--user` services come back after an unattended reboot, since linger was
+  rejected (gotcha above). Under autologin `pam_kwallet5` has no password, so it neither unlocks
+  the wallet nor starts `ksecretd`; the unit starts it with `graphical-session.target`. **Never
+  "fix" that with a D-Bus activation file for `org.freedesktop.secrets`**: ksecretd is a Qt GUI
+  app, gets activated headless (e.g. when booted to `multi-user.target`) and crash-loops on
+  "could not connect to display". The one manual step is an empty wallet password
+  (KWalletManager → Change Password…).
+- `soundbar-keepalive`/`soundbar-loopback` are **never enabled**: `99-soundbar-keepalive.rules`
+  starts/stops them when the Bluetooth soundbar's input device appears/disappears. An enabled
+  copy runs at every login with the soundbar off (tone on the fallback sink, default sink pointed
+  at `bt_swap_sink`), so `audio.sh`'s cleanup disables any. The rule can't reach a user manager
+  that doesn't exist yet (soundbar connected at boot, before login), hence the generated
+  `soundbar-keepalive-login.service`: a oneshot whose `ExecCondition` greps
+  `/sys/class/input/input*/name` for the rule's input name — read back from the staged rule,
+  because `vars.sh` doesn't carry it — then starts both units with `--no-block`.
+- `bt-autoconnect` (optional step in `audio.sh`) is a root system unit for the same reason as
+  `poweroff-server`: it has to run before anyone logs in. It keeps no device list (it walks
+  `bluetoothctl devices Paired`) and retries 12×10s; `audio.sh` starts it `--no-block` so the
+  first pass doesn't stall the install. Tunables: `/etc/bt-autoconnect/bt-autoconnect.env`.
+- ddcutil ≥ 3.0.0 scans I2C buses in parallel once there are enough of them (threshold 4,
+  upstream 09263068; 2.2.x used 99). amdgpu has a bus per connector plus one per DP AUX channel,
+  and the concurrent probes hang the GPU ring within seconds of powerdevil starting at login
+  (`Fence fallback timer expired` → `device lost from bus`) — it looks like a hardware or kernel
+  fault, it isn't. `screen.sh` writes `~/.config/ddcutil/ddcutilrc` with
+  `--i2c-bus-checks-async-min 99 --i2c-init-async-min 99` on amdgpu, only when no rc exists.
+  Check it applies with `ddcutil --verbose --version` ("Applying ddcutil options from …");
+  reproduce without Plasma with `ddcutil environment --verbose` (`detect` alone often survives).
+  A boot where powerdevil hits EACCES on `/dev/i2c-*` (logind ACL not in place yet, common with
+  autologin) never probes, so it proves nothing either way. rockowitz/ddcutil#629.
+- The Sunshine package doesn't enable its user unit, so `screen.sh` enables it — then restarts
+  it, which also starts it, so `global_prep_cmd` applies immediately.
