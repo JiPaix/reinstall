@@ -73,7 +73,9 @@ below.
   including `/healthz`. **Re-running an installer always generates a brand-new token**, silently
   invalidating the old one — any external caller (e.g. a Home Assistant automation hitting
   `/mode/{tv,monitor}` or `/shutdown`) needs its stored token updated after every reinstall, or
-  it'll get a 401 with no other symptom.
+  it'll get a 401 with no other symptom. Same for the optional MPD server (`audio.sh` step 8b):
+  every "yes" rewrites `~/.config/mpd/mpd.conf` with a new password, and `default_permissions ""`
+  means clients still using the old one are silently refused everything.
 - `poweroff-server` breaks the screen/audio pattern on purpose: it's a **root system service**
   (`/etc/systemd/system/poweroff-server.service`, `WantedBy=multi-user.target`, binary in
   `/usr/local/bin`, config in `/etc/poweroff-server/server.env`), not a `--user` unit under

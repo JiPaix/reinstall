@@ -47,6 +47,10 @@ With a Bluetooth soundbar, the keepalive also kicks in at login when the
 soundbar was already connected, and you can have every paired Bluetooth device
 reconnect automatically at boot.
 
+It can also install an [MPD](https://www.musicpd.org/) music server that plays
+through PipeWire, reachable from the local network with a generated password
+(shown at the end, and replaced each time you run it again).
+
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/audio.sh)
 ```
