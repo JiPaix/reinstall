@@ -41,6 +41,17 @@ below.
   The engine's KDE apply is deliberately two kscreen-doctor calls with a propagation gate
   between them (kscreen submits full-state configs from possibly-stale snapshots); don't merge
   them back into one call and don't re-order — the why is commented at each step.
+- `swapscreen-login.service` (oneshot, `graphical-session.target`) forces monitor mode at login,
+  and its `ExecStart` MUST keep `--wait=N` — don't "simplify" it back to a bare `--monitor`.
+  The target is reached before the DP connectors are all enumerated, so `validate_profile` can
+  find one missing and abort on « profil obsolète » (the message assumes changed cabling; at
+  boot it's just enumeration lag). The switch never happens, the display stays on the previous
+  profile — typically the TV — and a black monitor reads as a machine that never booted, with
+  the unit still exiting 0. Same class of false negative as `tv_wake_kde`, but on the DP side.
+  `validate_profile` therefore retries `validate_profile_once` until `WAIT_SECS` expires;
+  `_once` returns its message on stdout instead of calling `out_error` so a long wait doesn't
+  emit one error (or one JSON error object) per second. `--wait` defaults to 0 so an interactive
+  failure stays immediate — only the login unit passes a non-zero value.
 - The `*.sh` installers run from the checkout, but everything Go-built — including the engine
   template, which is `//go:embed`ded into `swapscreen-setup` — comes from the latest GitHub
   Release. A change under `screen/`/`audio/`/`power/` reaches a reinstall only after an annotated

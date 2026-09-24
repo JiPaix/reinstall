@@ -41,6 +41,11 @@ OPTIONS
                  empilé au-dessus de DP-1. Activable UNIQUEMENT via cette option ;
                  jamais atteint en bascule automatique. Rapporté comme « tv » par --show.
 
+  --wait=N       Accorde N secondes aux connecteurs du profil pour apparaître
+                 avant de conclure à un profil obsolète. Destiné au démarrage de
+                 session (swapscreen-login.service), où les sorties DP ne sont
+                 pas toutes énumérées. Défaut : 0 (échec immédiat).
+
   -j, --json     Modifie la sortie en JSON. Combinable avec toute autre option.
                    --show --json    → { "mode": "monitor" }
                    --tv --json      → { "previous": "monitor", "mode": "tv" }
@@ -109,6 +114,12 @@ Force le profil taiko (monitor + DP\-3 empilé au\-dessus de DP\-1).
 Activable uniquement de façon explicite ; jamais atteint en bascule
 automatique. Rapporté comme \fItv\fR par \fB\-\-show\fR.
 .TP
+.BI \-\-wait= N
+Retente la validation du profil pendant \fIN\fR secondes tant qu'un connecteur
+manque, au lieu d'échouer aussitôt sur « profil obsolète ». Prévu pour le
+démarrage de session, où les sorties DisplayPort ne sont pas encore toutes
+énumérées. Défaut : 0.
+.TP
 .BR \-j ", " \-\-json
 Formate toutes les sorties (succès et erreurs) en JSON.
 Combinable avec n'importe quelle autre option.
@@ -139,6 +150,10 @@ MANPAGE
 # Sorties (texte ou JSON selon $JSON_MODE)
 # ────────────────────────────────────────────────
 JSON_MODE=false
+
+# Secondes d'attente accordées à validate_profile pour que les connecteurs du
+# profil apparaissent (cf. --wait). 0 = échec immédiat, le défaut interactif.
+WAIT_SECS=0
 
 # Positionné par reconcile_profile : true s'il a dû réappliquer le profil (un
 # écran hors-profil avait été réactivé par GNOME). Sert à la boucle Sunshine pour
@@ -596,7 +611,12 @@ connector_modes_kde() {  # $1 = connecteur
 # Sans ça, un profil obsolète (câblage changé, script restauré d'une ancienne
 # machine) échoue avec le message cryptique de gdctl ("Failed to create
 # configuration") au lieu de dire clairement quoi régénérer.
-validate_profile() {  # $1 = nom du tableau de profil
+#
+# Une passe unique. N'émet RIEN : le message d'erreur part sur stdout, à charge
+# de validate_profile de le transformer en out_error une fois la dernière
+# tentative épuisée (sinon une attente au démarrage cracherait un JSON d'erreur
+# par seconde).
+validate_profile_once() {  # $1 = nom du tableau de profil
     local -n SPECS="$1"
     local rec
     for rec in "${SPECS[@]}"; do
@@ -607,14 +627,36 @@ validate_profile() {  # $1 = nom du tableau de profil
         ! is_kde && [[ "${f[vrr]}" == true ]] && mode="${mode}+vrr"
         local modes; modes="$(connector_modes "$conn")"
         if [[ -z "$modes" ]]; then
-            out_error "connecteur '$conn' introuvable — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
+            echo "connecteur '$conn' introuvable — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
             return 1
         fi
         if ! grep -qxF "$mode" <<< "$modes"; then
-            out_error "'$conn' ne propose pas le mode '$mode' — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
+            echo "'$conn' ne propose pas le mode '$mode' — profil obsolète (câblage changé ?). Relancez ./screen.sh pour régénérer."
             return 1
         fi
     done
+}
+
+# Idem, mais retente pendant $WAIT_SECS secondes (cf. --wait) avant de conclure.
+#
+# Au démarrage de session les connecteurs DP ne sont pas tous énumérés quand
+# swapscreen-login.service s'exécute : le profil est bon, le matériel n'est
+# juste pas encore là. Sans attente, la validation échoue à tort sur « profil
+# obsolète » et l'écran reste sur le profil précédent — typiquement la TV, donc
+# un moniteur noir qu'on prend pour une machine qui n'a pas démarré. Même
+# raison d'être que tv_wake_kde côté TV, mais côté énumération DP.
+#
+# WAIT_SECS=0 par défaut : en interactif l'échec doit rester immédiat, un
+# câblage réellement changé ne doit pas faire mariner l'utilisateur.
+validate_profile() {  # $1 = nom du tableau de profil
+    local deadline=$(( SECONDS + WAIT_SECS )) err
+    while :; do
+        err="$(validate_profile_once "$1")" && return 0
+        (( SECONDS < deadline )) || break
+        sleep 1
+    done
+    out_error "$err"
+    return 1
 }
 
 # Connecteurs propres au profil taiko : présents dans TAIKO_PROFILE mais pas
@@ -915,6 +957,13 @@ main() {
     for arg in "$@"; do
         case "$arg" in
             -j|--json) JSON_MODE=true ;;
+            --wait=*)
+                WAIT_SECS="${arg#*=}"
+                if ! [[ "$WAIT_SECS" =~ ^[0-9]+$ ]]; then
+                    out_error "--wait attend un nombre de secondes : '$arg'"
+                    exit 1
+                fi
+                ;;
             -h|--help|--man|-s|--show|--tv|--monitor|--taiko) action="$arg" ;;
             *)
                 out_error "option inconnue : '$arg'"

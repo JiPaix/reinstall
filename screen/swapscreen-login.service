@@ -7,7 +7,11 @@ PartOf=graphical-session.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/swapscreen --monitor
+# --wait: graphical-session.target is reached before the DP connectors have all
+# been enumerated, so a bare --monitor can find the profile's connector missing,
+# bail out on "profil obsolète" and leave the display on the previous profile —
+# usually the TV, i.e. a black monitor that reads as a machine that never booted.
+ExecStart=%h/.local/bin/swapscreen --monitor --wait=60
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
