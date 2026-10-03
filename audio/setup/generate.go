@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -25,38 +26,108 @@ var eqBandLabels = []string{
 // defaultEQ is the night-listening / voice-clarity curve from the original script.
 var defaultEQ = []string{"-15", "-12", "-10", "-8", "-6", "-3", "0", "3", "5", "6", "5", "4", "2", "0", "-3"}
 
-// Choices is the user's interactive selection — the input to rendering.
-type Choices struct {
-	PrimarySink   string
-	PrimaryDesc   string
-	Priorities    []string // ordered fallback sink names (after the primary)
-	DisabledBT    []string // disabled bluez node names
-	DisabledCards []string // disabled ALSA card names
-	EQGains       []string // 15 dB values
-	IsBT          bool
-	BTInputName   string
+// fxPrefix names the processed outputs; detection skips them.
+const fxPrefix = "audio_fx."
+
+// Output is one ranked output and the extras it asked for.
+type Output struct {
+	Sink      string `json:"sink"`
+	Desc      string `json:"desc"`
+	EQ        bool   `json:"eq"` // equalizable: follows `audio-eq on|off`
+	Swap      bool   `json:"swap"`
+	Keepalive bool   `json:"keepalive"`
 }
 
-// EQBand and PriorityRule feed the templates.
+// Processed says the output gets a second, processed output in front of it.
+func (o Output) Processed() bool { return o.EQ || o.Swap }
+
+// Effects names the processing, as it appears in the processed output's name.
+func (o Output) Effects() string {
+	var x []string
+	if o.EQ {
+		x = append(x, "EQ")
+	}
+	if o.Swap {
+		x = append(x, "L/R swapped")
+	}
+	return strings.Join(x, " + ")
+}
+
+// Choices is the user's interactive selection — the input to rendering. It is
+// also saved as JSON, so the next run starts from the same answers.
+type Choices struct {
+	Outputs       []Output `json:"outputs"`     // highest priority first
+	EQGains       []string `json:"eq_gains"`    // 15 dB values, one curve for every equalizer
+	StatusSink    string   `json:"status_sink"` // what soundbar-status reports on
+	StatusDesc    string   `json:"status_desc"`
+	DisabledBT    []string `json:"disabled_bt"`    // bluez_card.* names
+	DisabledCards []string `json:"disabled_cards"` // alsa_card.* names
+	DefaultSource string   `json:"default_source"` // pinned default mic, "" = leave it to WirePlumber
+	DefaultDesc   string   `json:"default_desc"`
+}
+
+func (c Choices) output(sink string) (Output, bool) {
+	for _, o := range c.Outputs {
+		if o.Sink == sink {
+			return o, true
+		}
+	}
+	return Output{}, false
+}
+
+// outputPrio spreads the ranked outputs above every stock priority.session
+// (ALSA and BlueZ sinks sit around 1000), however many there are.
+const (
+	outputPrioBase = 2000
+	outputPrioStep = 100
+)
+
+func outputPrio(rank, count int) int {
+	return outputPrioBase + (count-1-rank)*outputPrioStep
+}
+
+// originalPrio ranks the bare device behind a processed output: it was ranked
+// through its processed output, so by itself it comes after every ranked one.
+func originalPrio(n int) int {
+	return outputPrioBase - (n+1)*10
+}
+
+// defaultSourcePrio outranks every source's stock priority.session (ALSA gives
+// USB mics ~2100), so the pinned mic wins whenever no default is configured.
+const defaultSourcePrio = 3000
+
+// EQBand, PriorityRule and Filter feed the templates.
 type EQBand struct{ Label, Gain string }
 type PriorityRule struct {
 	Name string
 	Prio int
 }
 
+// Filter is a processed output: a filter-chain sink playing into its device.
+type Filter struct {
+	Name, Desc, Target string
+	Prio               int
+	Conf               string // its standalone PipeWire config
+	EQ                 bool
+	MbeqPath           string
+	Bands              []EQBand
+	Sides              []string // graph node names, left then right
+	Inputs, Outputs    string   // port lists, left then right
+}
+
 type tmplData struct {
-	PrimarySink    string
-	MbeqPath       string
-	Username       string
 	ScriptsDir     string
 	MonitorSource  string
-	EQBands        []EQBand
+	Filters        []Filter
+	KeepaliveSinks []string
+	EQFilters      []string // node names of the equalized outputs, for audio-eq
+	EQParamsOn     string   // Props for pw-cli: the curve / every band at 0 dB
+	EQParamsOff    string
+	RankedSinks    []string
 	BTPriorities   []PriorityRule
 	ALSAPriorities []PriorityRule
 	DisabledBT     []string
 	DisabledCards  []string
-	BtInputName    string
-	IsBT           bool
 }
 
 // destinations under $HOME.
@@ -68,6 +139,37 @@ func homePaths() (wpDir, pwDir, systemdDir, binDir string) {
 		filepath.Join(h, ".local/bin")
 }
 
+// choicesPath is where the answers are kept between runs.
+func choicesPath() string {
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".config/soundbar-setup/choices.json")
+}
+
+// LoadChoices returns the previous run's answers, or a zero Choices when there
+// are none (or they can't be read: they only pre-fill the prompts).
+func LoadChoices() Choices {
+	var c Choices
+	b, err := os.ReadFile(choicesPath())
+	if err != nil {
+		return Choices{}
+	}
+	if json.Unmarshal(b, &c) != nil {
+		return Choices{}
+	}
+	return c
+}
+
+func saveChoices(c Choices) error {
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(choicesPath()), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(choicesPath(), append(b, '\n'), 0o644)
+}
+
 func findMbeq() (string, error) {
 	matches, _ := filepath.Glob("/usr/lib/ladspa/mbeq_1197.so")
 	if len(matches) == 0 {
@@ -76,49 +178,150 @@ func findMbeq() (string, error) {
 	return matches[0], nil
 }
 
-// Render writes every config to its final location, stages the udev rule (which
-// needs sudo to install) and vars.sh into stagingDir, and returns the list of
-// written paths for the summary.
-func Render(c Choices, stagingDir string) ([]string, error) {
-	u, err := user.Current()
-	if err != nil {
-		return nil, err
-	}
-	mbeq, err := findMbeq()
-	if err != nil {
-		return nil, err
-	}
-	wpDir, pwDir, sysDir, binDir := homePaths()
+// confString makes s safe between double quotes in a PipeWire .conf file.
+func confString(s string) string {
+	return strings.NewReplacer(`"`, "'", `\`, "/", "\n", " ").Replace(s)
+}
 
+// fxDir holds one standalone PipeWire config per processed output.
+func fxDir() string {
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".config/soundbar-setup/fx")
+}
+
+// eqBands pairs the labels with the curve, as plain decimal numbers.
+func eqBands(gains []string) ([]EQBand, error) {
+	if len(gains) != len(eqBandLabels) {
+		return nil, fmt.Errorf("expected %d EQ gains, got %d", len(eqBandLabels), len(gains))
+	}
 	bands := make([]EQBand, len(eqBandLabels))
 	for i, label := range eqBandLabels {
-		bands[i] = EQBand{Label: label, Gain: c.EQGains[i]}
+		// A stray word here would make PipeWire reject the whole file.
+		v, err := strconv.ParseFloat(strings.TrimSpace(gains[i]), 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %q is not a number", label, gains[i])
+		}
+		bands[i] = EQBand{Label: label, Gain: strconv.FormatFloat(v, 'f', 1, 64)}
 	}
+	return bands, nil
+}
 
-	var btP, alsaP []PriorityRule
-	for i, name := range c.Priorities {
-		prio := 2000 - i*500
-		switch {
-		case strings.HasPrefix(name, "bluez_output"):
-			btP = append(btP, PriorityRule{name, prio})
-		case strings.HasPrefix(name, "alsa_output"):
-			alsaP = append(alsaP, PriorityRule{name, prio})
+// eqParams builds the Props value that sets every band of both channels, for
+// `pw-cli set-param`: the curve, or 0 dB everywhere when flat.
+func eqParams(bands []EQBand, flat bool) string {
+	var b strings.Builder
+	b.WriteString("{ params = [")
+	for _, side := range []string{"left", "right"} {
+		for _, band := range bands {
+			gain := band.Gain
+			if flat {
+				gain = "0.0"
+			}
+			fmt.Fprintf(&b, ` "%s:%s" %s`, side, band.Label, gain)
 		}
 	}
+	b.WriteString(" ] }")
+	return b.String()
+}
+
+// buildFilters returns one processed output per device that asked for an
+// equalizer and/or swapped channels, ranked where the device was ranked.
+func buildFilters(c Choices) ([]Filter, error) {
+	var filters []Filter
+	for i, o := range c.Outputs {
+		if !o.Processed() {
+			continue
+		}
+		f := Filter{
+			Name:    fxPrefix + o.Sink,
+			Desc:    confString(o.Desc) + " (" + o.Effects() + ")",
+			Target:  o.Sink,
+			Prio:    outputPrio(i, len(c.Outputs)),
+			Conf:    filepath.Join(fxDir(), o.Sink+".conf"),
+			Sides:   []string{"left", "right"},
+			Inputs:  `"left:In" "right:In"`, // builtin copy ports
+			Outputs: `"left:Out" "right:Out"`,
+		}
+		out := "Out"
+		if o.EQ {
+			mbeq, err := findMbeq()
+			if err != nil {
+				return nil, err
+			}
+			bands, err := eqBands(c.EQGains)
+			if err != nil {
+				return nil, err
+			}
+			f.EQ, f.MbeqPath, f.Bands = true, mbeq, bands
+			f.Inputs = `"left:Input" "right:Input"` // mbeq ports
+			f.Outputs = `"left:Output" "right:Output"`
+			out = "Output"
+		}
+		if o.Swap {
+			f.Outputs = fmt.Sprintf(`"right:%s" "left:%s"`, out, out)
+		}
+		filters = append(filters, f)
+	}
+	return filters, nil
+}
+
+// Render writes every config to its final location, stages vars.sh into
+// stagingDir for audio.sh, saves the answers for the next run, and returns the
+// list of written paths for the summary.
+func Render(c Choices, stagingDir string) ([]string, error) {
+	if len(c.Outputs) == 0 {
+		return nil, fmt.Errorf("no output selected")
+	}
+	filters, err := buildFilters(c)
+	if err != nil {
+		return nil, err
+	}
+	wpDir, _, sysDir, binDir := homePaths()
 
 	data := tmplData{
-		PrimarySink:    c.PrimarySink,
-		MbeqPath:       mbeq,
-		Username:       u.Username,
-		ScriptsDir:     binDir,
-		MonitorSource:  c.PrimarySink + ".monitor",
-		EQBands:        bands,
-		BTPriorities:   btP,
-		ALSAPriorities: alsaP,
-		DisabledBT:     c.DisabledBT,
-		DisabledCards:  c.DisabledCards,
-		BtInputName:    c.BTInputName,
-		IsBT:           c.IsBT,
+		ScriptsDir:    binDir,
+		MonitorSource: c.StatusSink + ".monitor",
+		Filters:       filters,
+		DisabledBT:    c.DisabledBT,
+		DisabledCards: c.DisabledCards,
+	}
+	originals := 0
+	for i, o := range c.Outputs {
+		// A processed output carries the rank (in its own config); the device
+		// behind it goes after every ranked output.
+		rule := PriorityRule{o.Sink, outputPrio(i, len(c.Outputs))}
+		ranked := o.Sink
+		if o.Processed() {
+			rule.Prio = originalPrio(originals)
+			originals++
+			ranked = fxPrefix + o.Sink
+		}
+		switch {
+		case strings.HasPrefix(o.Sink, "bluez_output"):
+			data.BTPriorities = append(data.BTPriorities, rule)
+		case strings.HasPrefix(o.Sink, "alsa_output"):
+			data.ALSAPriorities = append(data.ALSAPriorities, rule)
+		}
+		data.RankedSinks = append(data.RankedSinks, ranked)
+		if o.EQ {
+			data.EQFilters = append(data.EQFilters, fxPrefix+o.Sink)
+		}
+		if o.Keepalive {
+			data.KeepaliveSinks = append(data.KeepaliveSinks, o.Sink)
+		}
+	}
+	if len(data.EQFilters) > 0 {
+		bands, err := eqBands(c.EQGains)
+		if err != nil {
+			return nil, err
+		}
+		data.EQParamsOn, data.EQParamsOff = eqParams(bands, false), eqParams(bands, true)
+	}
+	switch {
+	case strings.HasPrefix(c.DefaultSource, "bluez_input"):
+		data.BTPriorities = append(data.BTPriorities, PriorityRule{c.DefaultSource, defaultSourcePrio})
+	case strings.HasPrefix(c.DefaultSource, "alsa_input"):
+		data.ALSAPriorities = append(data.ALSAPriorities, PriorityRule{c.DefaultSource, defaultSourcePrio})
 	}
 
 	jobs := []struct {
@@ -126,11 +329,9 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 		mode       os.FileMode
 	}{
 		{filepath.Join(wpDir, "99-device-priorities.conf"), "wireplumber-priorities.conf.tmpl", 0o644},
-		{filepath.Join(pwDir, "soundbar-eq.conf"), "soundbar-eq.conf.tmpl", 0o644},
-		{filepath.Join(sysDir, "soundbar-keepalive.service"), "soundbar-keepalive.service.tmpl", 0o644},
-		{filepath.Join(sysDir, "soundbar-loopback.service"), "soundbar-loopback.service.tmpl", 0o644},
-		{filepath.Join(binDir, "soundbar-loopback"), "soundbar-loopback.tmpl", 0o755},
-		{filepath.Join(binDir, "soundbar-keepalive"), "soundbar-keepalive.tmpl", 0o755},
+		{filepath.Join(sysDir, "audio-watch.service"), "audio-watch.service.tmpl", 0o644},
+		{filepath.Join(binDir, "audio-watch"), "audio-watch.tmpl", 0o755},
+		{filepath.Join(binDir, "audio-eq"), "audio-eq.tmpl", 0o755},
 		{filepath.Join(binDir, "soundbar-status"), "soundbar-status.tmpl", 0o755},
 	}
 
@@ -142,19 +343,24 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 		written = append(written, j.dest)
 	}
 
-	udevFile := ""
-	if c.IsBT && c.BTInputName != "" {
-		udevFile = filepath.Join(stagingDir, "99-soundbar-keepalive.rules")
-		if err := renderTo(udevFile, "udev-keepalive.rules.tmpl", 0o644, data); err != nil {
-			return nil, err
-		}
-		written = append(written, udevFile+"  (staged → /etc/udev/rules.d)")
-	}
-
-	if err := writeVarsSh(filepath.Join(stagingDir, "vars.sh"), c, udevFile); err != nil {
+	// The processed outputs of a previous run must not outlive it.
+	if err := os.RemoveAll(fxDir()); err != nil {
 		return nil, err
 	}
-	return written, nil
+	for _, f := range filters {
+		if err := renderTo(f.Conf, "audio-fx.conf.tmpl", 0o644, f); err != nil {
+			return nil, err
+		}
+		written = append(written, f.Conf)
+	}
+
+	if err := writeVarsSh(filepath.Join(stagingDir, "vars.sh"), c); err != nil {
+		return nil, err
+	}
+	if err := saveChoices(c); err != nil {
+		return nil, err
+	}
+	return append(written, choicesPath()), nil
 }
 
 func renderTo(dest, name string, mode os.FileMode, data any) error {
@@ -176,20 +382,61 @@ func renderTo(dest, name string, mode os.FileMode, data any) error {
 }
 
 // writeVarsSh emits the facts audio.sh needs to finish the install.
-func writeVarsSh(path string, c Choices, udevFile string) error {
+func writeVarsSh(path string, c Choices) error {
+	hasBT := false
+	hasEQ := false
 	var b strings.Builder
 	b.WriteString("# Generated by soundbar-setup — sourced by audio.sh\n")
-	fmt.Fprintf(&b, "PRIMARY_SINK=%q\n", c.PrimarySink)
-	fmt.Fprintf(&b, "PRIMARY_DESC=%q\n", c.PrimaryDesc)
-	fmt.Fprintf(&b, "IS_BT=%t\n", c.IsBT)
-	fmt.Fprintf(&b, "UDEV_RULE_FILE=%q\n", udevFile)
+	b.WriteString("OUTPUT_SUMMARY=(")
+	for _, line := range outputLines(c) {
+		fmt.Fprintf(&b, " %s", shQuote(line))
+	}
+	for _, o := range c.Outputs {
+		hasBT = hasBT || strings.HasPrefix(o.Sink, "bluez_")
+		hasEQ = hasEQ || o.EQ
+	}
+	b.WriteString(" )\n")
+	fmt.Fprintf(&b, "STATUS_SINK=%s\n", shQuote(c.StatusSink))
+	fmt.Fprintf(&b, "STATUS_DESC=%s\n", shQuote(c.StatusDesc))
+	fmt.Fprintf(&b, "HAS_BT=%t\n", hasBT)
+	fmt.Fprintf(&b, "HAS_EQ=%t\n", hasEQ)
+	fmt.Fprintf(&b, "DEFAULT_SOURCE=%s\n", shQuote(c.DefaultSource))
+	fmt.Fprintf(&b, "DEFAULT_SOURCE_DESC=%s\n", shQuote(c.DefaultDesc))
 	b.WriteString("DISABLED_CARDS=(")
 	for _, card := range c.DisabledCards {
-		fmt.Fprintf(&b, " %q", card)
+		fmt.Fprintf(&b, " %s", shQuote(card))
 	}
 	b.WriteString(" )\n")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// shQuote single-quotes s for bash: nothing in a device description ($, `, ")
+// gets expanded when audio.sh sources the file.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// outputLines lists the outputs as they will be ranked: the processed output
+// takes its device's place, and the devices behind one come last.
+func outputLines(c Choices) []string {
+	var lines, originals []string
+	for _, o := range c.Outputs {
+		line := o.Desc
+		if o.Processed() {
+			line += " (" + o.Effects() + ")"
+			originals = append(originals, o.Desc+" — as it is, unprocessed")
+		}
+		if o.Keepalive {
+			line += " — keepalive"
+		}
+		lines = append(lines, line)
+	}
+	lines = append(lines, originals...)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("%d. %s", i+1, lines[i])
+	}
+	return lines
 }

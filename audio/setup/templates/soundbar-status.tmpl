@@ -1,11 +1,17 @@
 #!/bin/sh
-# Reports whether the primary soundbar is active as JSON: { "soundbar": true|false }
-# Bluetooth: the monitor source is absent while disconnected, so reports false.
+# Reports as JSON: { "soundbar": true|false, "eq": true|false }
+#   soundbar: the output picked in the wizard is playing. Bluetooth: its monitor
+#             source is absent while disconnected, so this reports false.
+#   eq:       the equalizers are switched on (audio-eq on|off).
 state=$(
   pactl list short sources |
   awk -v src="{{.MonitorSource}}" '$2 == src { print $NF }'
 )
 
 [ "$state" = "RUNNING" ] && val=true || val=false
+case "$({{.ScriptsDir}}/audio-eq status 2>/dev/null)" in
+  *true*) eq=true ;;
+  *)      eq=false ;;
+esac
 
-printf '{ "soundbar": %s }\n' "$val"
+printf '{ "soundbar": %s, "eq": %s }\n' "$val" "$eq"

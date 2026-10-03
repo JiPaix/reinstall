@@ -1,5 +1,5 @@
 wireplumber.settings = {
-  default-policy.move   = true
+  linking.allow-moving-streams  = true
   linking.follow-default-target = true
 }
 {{if or .BTPriorities .DisabledBT}}
@@ -11,15 +11,22 @@ monitor.bluez.rules = [
   }
 {{- end}}
 {{- range .DisabledBT}}
+  # device.disabled only exists on devices: a rule matching one of its nodes is
+  # ignored, so a Bluetooth device is hidden whole (output and mic).
   {
-    matches = [{ node.name = "{{.}}" }]
+    matches = [{ device.name = "{{.}}" }]
     actions = { update-props = { device.disabled = true } }
   }
 {{- end}}
 ]
-{{end -}}
-{{if or .ALSAPriorities .DisabledCards}}
+{{end}}
 monitor.alsa.rules = [
+  # Never suspend microphones: a USB mic woken up by a new recording crackles
+  # for its first second or two while the ADC settles.
+  {
+    matches = [{ node.name = "~alsa_input.*" }]
+    actions = { update-props = { session.suspend-timeout-seconds = 0 } }
+  }
 {{- range .ALSAPriorities}}
   {
     matches = [{ node.name = "{{.Name}}" }]
@@ -33,4 +40,3 @@ monitor.alsa.rules = [
   }
 {{- end}}
 ]
-{{end -}}

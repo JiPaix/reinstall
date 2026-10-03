@@ -39,17 +39,39 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen
 > Install these yourself first (package names may vary by distribution):
 > `pipewire`, `pipewire-pulse`, `wireplumber`, `ladspa`, `swh-plugins`, `ffmpeg`.
 
-Sets up the audio path for a soundbar: applies an equalizer, keeps a Bluetooth
-soundbar from dozing off mid-silence, and runs a small service that reports the
-soundbar's current state over the local network.
+Sets up your audio outputs: you rank them, and the highest one connected is the
+one that plays. Each device can get a voice-clarity equalizer, swapped
+left/right channels, and a keepalive that stops it dozing off mid-silence.
 
-With a Bluetooth soundbar, the keepalive also kicks in at login when the
-soundbar was already connected, and you can have every paired Bluetooth device
-reconnect automatically at boot.
+A device with an equalizer or swapped channels gets a second output, named after
+it ("Soundbar (EQ + L/R swapped)"), which takes its place in the ranking and is
+only there while the device is connected. The device itself stays available,
+unprocessed, after all the ranked outputs.
+
+A small service on the local network reports whether one of the outputs (a
+soundbar, typically) is playing, and switches the equalizer on or off for every
+output that has one:
+
+| Request | Answer |
+| --- | --- |
+| `GET /status` | `{ "soundbar": true, "eq": true }` |
+| `GET /eq` | `{ "eq": true }` |
+| `POST /eq/on`, `POST /eq/off` | the new state |
+
+The same switch from a terminal: `audio-eq on`, `audio-eq off`. It survives a
+reboot, and leaves the swapped channels alone.
+
+It also keeps your microphones awake, so recordings don't start with a second of
+crackle, and asks which microphone should always be the default. Apps can still
+use the other one if you pick it inside the app.
+
+You can have every paired Bluetooth device reconnect automatically at boot.
+
+Running it again starts from your previous answers.
 
 It can also install an [MPD](https://www.musicpd.org/) music server that plays
 through PipeWire, reachable from the local network with a generated password
-(shown at the end, and replaced each time you run it again).
+(shown at the end, and kept when you run it again).
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/audio.sh)

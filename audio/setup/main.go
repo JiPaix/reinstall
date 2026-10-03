@@ -1,7 +1,8 @@
-// Command soundbar-setup interactively selects audio devices (primary/disable/
-// priority/EQ) and renders the PipeWire/WirePlumber configs, services, scripts,
-// and udev rule from the embedded templates straight to their final locations.
-// The udev rule and a small vars.sh are staged for audio.sh to finish (sudo).
+// Command soundbar-setup interactively picks what to do with each audio device
+// (hide it, default mic, output priority, per-output equalizer / channel swap /
+// keepalive) and renders the PipeWire/WirePlumber configs, the watcher service
+// and the status script from the embedded templates straight to their final
+// locations. A small vars.sh is staged for audio.sh to finish the install.
 package main
 
 import (
@@ -15,8 +16,12 @@ import (
 	"github.com/charmbracelet/huh"
 )
 
+// ACCESSIBLE=1 swaps the TUI for plain line prompts (screen readers, dumb
+// terminals, scripted runs).
+var accessible = os.Getenv("ACCESSIBLE") != ""
+
 func main() {
-	staging := flag.String("staging", "setup/generated", "dir for the staged udev rule + vars.sh")
+	staging := flag.String("staging", "setup/generated", "dir for the staged vars.sh")
 	dump := flag.Bool("dump", false, "print detected devices and exit (no prompts)")
 	flag.Parse()
 
@@ -24,10 +29,6 @@ func main() {
 	if err != nil {
 		fatalf("%v\n(soundbar-setup needs pipewire-pulse running for pactl)", err)
 	}
-	if len(devs.Sinks) == 0 {
-		fatalf("no output devices detected via pactl")
-	}
-
 	if *dump {
 		dumpDevices(devs)
 		return
@@ -38,7 +39,17 @@ func main() {
 		fatalf("%v", err)
 	}
 
-	c := runWizard(devs)
+	prev := LoadChoices()
+	devs = confirmDevices(devs, prev)
+	var c Choices
+	for {
+		c = runWizard(devs, prev)
+		if review(c) {
+			break
+		}
+		prev = c // start over from what was just answered
+	}
+
 	written, err := Render(c, stagingAbs)
 	if err != nil {
 		fatalf("generating files: %v", err)
@@ -50,166 +61,457 @@ func main() {
 	}
 }
 
-func runWizard(devs Devices) Choices {
+// confirmDevices shows what was detected before any question depends on it,
+// and looks again on request: a Bluetooth device that is off, or that dropped
+// when PipeWire restarted, can be brought back without starting over.
+func confirmDevices(devs Devices, prev Choices) Devices {
+	const (
+		cont = "continue"
+		scan = "scan"
+	)
+	for {
+		v := cont
+		ask(huh.NewSelect[string]().
+			Title("Detected devices").
+			Description(detected(devs, prev)).
+			Options(
+				huh.NewOption("Continue with these", cont),
+				huh.NewOption("Look again (after connecting or switching on a device)", scan),
+			).Value(&v))
+		if v == cont {
+			return devs
+		}
+		again, err := DetectDevices()
+		if err != nil {
+			fatalf("%v", err)
+		}
+		devs = again
+	}
+}
+
+// detected lists the outputs and mics found, plus the outputs only known from
+// the previous run.
+func detected(devs Devices, prev Choices) string {
+	var b strings.Builder
+	list := func(title string, items []string) {
+		fmt.Fprintf(&b, "%s\n", title)
+		if len(items) == 0 {
+			b.WriteString("  none\n")
+		}
+		for _, s := range items {
+			fmt.Fprintf(&b, "  • %s\n", s)
+		}
+	}
+	list("Outputs", deviceLabels(devs.Sinks))
+	list("Microphones", deviceLabels(devs.Sources))
+
+	var absent []string
+	for _, p := range prev.Outputs {
+		if !hasDevice(devs.Sinks, p.Sink) {
+			absent = append(absent, p.Desc)
+		}
+	}
+	if len(absent) > 0 {
+		list("Not connected, kept from the previous run", absent)
+	}
+	return b.String()
+}
+
+// wizard numbers the steps as they are asked: some are skipped (one output,
+// no equalizer…), so the count isn't known up front.
+type wizard struct{ step int }
+
+func (w *wizard) title(s string) string {
+	w.step++
+	return fmt.Sprintf("Step %d · %s", w.step, s)
+}
+
+func runWizard(devs Devices, prev Choices) Choices {
 	var c Choices
+	w := &wizard{}
 
-	// 1. Disable unwanted devices.
-	all := append(append([]Device{}, devs.Sinks...), devs.Sources...)
-	disabledSet := map[string]bool{}
-	for _, d := range multiSelectDevices("Disable any unwanted devices (space toggles, enter confirms — or skip):", all) {
-		disabledSet[d.Name] = true
-		switch {
-		case d.IsBT():
-			c.DisabledBT = append(c.DisabledBT, d.Name)
-		case d.IsALSA() && d.Card != "":
-			c.DisabledCards = appendUnique(c.DisabledCards, d.Card)
+	// 1. Hide unwanted hardware.
+	hidden := map[string]bool{}
+	for _, hw := range pickHidden(w, devs, prev) {
+		hidden[hw.Card] = true
+		if hw.BT {
+			c.DisabledBT = append(c.DisabledBT, hw.Card)
+		} else {
+			c.DisabledCards = append(c.DisabledCards, hw.Card)
 		}
 	}
 
-	// 2. Primary device, among the remaining sinks.
-	var remaining []Device
+	// 2. Default microphone, among the sources still there.
+	var mics []Device
+	for _, s := range devs.Sources {
+		if !hidden[s.Card] {
+			mics = append(mics, s)
+		}
+	}
+	if mic, ok := pickDefaultSource(w, mics, prev); ok {
+		c.DefaultSource = mic.Name
+		c.DefaultDesc = mic.Desc
+	}
+
+	// 3. Outputs, by priority.
+	var outputs []Device
 	for _, s := range devs.Sinks {
-		if !disabledSet[s.Name] {
-			remaining = append(remaining, s)
+		if !hidden[s.Card] {
+			outputs = append(outputs, s)
 		}
 	}
-	if len(remaining) == 0 {
-		fatalf("no output devices left after disabling")
-	}
-	primary := pickDevice("Which device gets L/R swap + EQ + keepalive (primary)?", remaining)
-	c.PrimarySink = primary.Name
-	c.PrimaryDesc = primary.Desc
-
-	// 3. BT udev input name (only for a Bluetooth primary).
-	if primary.IsBT() {
-		c.IsBT = true
-		c.BTInputName = resolveBTInput(primary.Desc)
-	}
-
-	// 4. Fallback priority order for the other sinks.
-	var others []Device
-	for _, s := range remaining {
-		if s.Name != primary.Name {
-			others = append(others, s)
+	// Outputs set up last time but not connected right now stay on offer: a
+	// Bluetooth speaker doesn't have to be on for a re-run to keep it.
+	for _, p := range prev.Outputs {
+		if !hasDevice(outputs, p.Sink) && !hasDevice(devs.Sinks, p.Sink) && !hidden[cardOf(p.Sink, "")] {
+			outputs = append(outputs, Device{Name: p.Sink, Desc: p.Desc, Absent: true})
 		}
 	}
-	c.Priorities = rankDevices(others)
+	if len(outputs) == 0 {
+		fatalf("no output devices left after hiding")
+	}
+	for _, d := range rankOutputs(w, outputs, prev) {
+		o := Output{Sink: d.Name, Desc: d.Desc}
+		if p, ok := prev.output(d.Name); ok {
+			o.EQ, o.Swap, o.Keepalive = p.EQ, p.Swap, p.Keepalive
+		}
+		c.Outputs = append(c.Outputs, o)
+	}
 
-	// 5. EQ curve.
-	c.EQGains = chooseEQ()
+	// 4. Extras, then the curve the equalizers share.
+	pickExtras(w, c.Outputs)
+	c.EQGains = prev.EQGains // kept for a later run even with no equalizer now
+	for _, o := range c.Outputs {
+		if o.EQ {
+			c.EQGains = chooseEQ(w, prev.EQGains)
+			break
+		}
+	}
+
+	// 5. What the status server reports on.
+	status := pickStatus(w, c.Outputs, prev)
+	c.StatusSink, c.StatusDesc = status.Sink, status.Desc
 
 	return c
 }
 
 // ── huh steps ────────────────────────────────────────────────────────────────
 
-func multiSelectDevices(title string, devs []Device) []Device {
-	if len(devs) == 0 {
+// ask runs the fields as one screen.
+func ask(fields ...huh.Field) {
+	askGroups(huh.NewGroup(fields...))
+}
+
+func askGroups(groups ...*huh.Group) {
+	if err := huh.NewForm(groups...).WithAccessible(accessible).Run(); err != nil {
+		fatalf("cancelled: %v", err)
+	}
+}
+
+func pickHidden(w *wizard, devs Devices, prev Choices) []Hardware {
+	if len(devs.Hardware) == 0 {
 		return nil
 	}
+	was := map[string]bool{}
+	for _, card := range append(append([]string{}, prev.DisabledCards...), prev.DisabledBT...) {
+		was[card] = true
+	}
 	var sel []string
-	opts := make([]huh.Option[string], len(devs))
-	for i, d := range devs {
-		opts[i] = huh.NewOption(d.Label(), strconv.Itoa(i))
+	opts := make([]huh.Option[string], len(devs.Hardware))
+	for i, hw := range devs.Hardware {
+		opts[i] = huh.NewOption(hardwareLabel(hw, devs), strconv.Itoa(i))
+		if was[hw.Card] {
+			sel = append(sel, strconv.Itoa(i))
+		}
 	}
-	if err := huh.NewMultiSelect[string]().Title(title).Options(opts...).Value(&sel).Run(); err != nil {
-		fatalf("selection cancelled: %v", err)
-	}
-	out := make([]Device, 0, len(sel))
+	ask(huh.NewMultiSelect[string]().
+		Title(w.title("Hide devices")).
+		Description("Hidden devices never show up as an output or a microphone.\nspace toggles · enter confirms · nothing ticked = keep them all").
+		Value(&sel).Options(opts...))
+
+	out := make([]Hardware, 0, len(sel))
 	for _, s := range sel {
-		out = append(out, devs[atoi(s)])
+		out = append(out, devs.Hardware[atoi(s)])
 	}
 	return out
 }
 
-func pickDevice(title string, devs []Device) Device {
-	opts := make([]huh.Option[string], len(devs))
-	for i, d := range devs {
-		opts[i] = huh.NewOption(d.Label(), strconv.Itoa(i))
-	}
-	v := "0"
-	if err := huh.NewSelect[string]().Title(title).Options(opts...).Value(&v).Run(); err != nil {
-		fatalf("selection cancelled: %v", err)
-	}
-	return devs[atoi(v)]
-}
-
-// rankDevices ranks fallbacks by repeatedly asking for the next-highest one.
-func rankDevices(devs []Device) []string {
-	remaining := append([]Device{}, devs...)
-	var order []string
-	for rank := 1; len(remaining) > 0; rank++ {
-		if len(remaining) == 1 {
-			order = append(order, remaining[0].Name)
+// hardwareLabel tells what the device currently provides, e.g.
+// "Razer BlackShark V2 Pro 2.4 — output + mic".
+func hardwareLabel(hw Hardware, devs Devices) string {
+	var has []string
+	for _, s := range devs.Sinks {
+		if s.Card == hw.Card {
+			has = append(has, "output")
 			break
 		}
-		opts := make([]huh.Option[string], len(remaining))
-		for i, d := range remaining {
-			opts[i] = huh.NewOption(d.Label(), strconv.Itoa(i))
+	}
+	for _, s := range devs.Sources {
+		if s.Card == hw.Card {
+			has = append(has, "mic")
+			break
 		}
+	}
+	what := "currently off"
+	if len(has) > 0 {
+		what = strings.Join(has, " + ")
+	}
+	if hw.BT {
+		what = "Bluetooth, " + what
+	}
+	return fmt.Sprintf("%s — %s", hw.Desc, what)
+}
+
+// deviceLabels returns one label per device: its description, plus the node
+// name only where two devices share a description.
+func deviceLabels(devs []Device) []string {
+	seen := map[string]int{}
+	for _, d := range devs {
+		seen[d.Desc]++
+	}
+	labels := make([]string, len(devs))
+	for i, d := range devs {
+		labels[i] = d.Desc
+		if seen[d.Desc] > 1 {
+			labels[i] = fmt.Sprintf("%s — %s", d.Desc, d.Name)
+		}
+		if d.Absent {
+			labels[i] += " (not connected)"
+		}
+	}
+	return labels
+}
+
+func deviceOptions(devs []Device) []huh.Option[string] {
+	opts := make([]huh.Option[string], len(devs))
+	for i, label := range deviceLabels(devs) {
+		opts[i] = huh.NewOption(label, strconv.Itoa(i))
+	}
+	return opts
+}
+
+// pickDefaultSource asks which mic becomes the default; apps that want another
+// one have to select it themselves. ok is false when there is nothing to pick
+// or the user leaves the choice to WirePlumber.
+func pickDefaultSource(w *wizard, mics []Device, prev Choices) (Device, bool) {
+	if len(mics) == 0 {
+		return Device{}, false
+	}
+	const none = "none"
+	v := "0"
+	if len(prev.Outputs) > 0 && prev.DefaultSource == "" {
+		v = none
+	}
+	for i, d := range mics {
+		if d.Name == prev.DefaultSource {
+			v = strconv.Itoa(i)
+		}
+	}
+	opts := append(deviceOptions(mics), huh.NewOption("No preference (leave it to WirePlumber)", none))
+	ask(huh.NewSelect[string]().
+		Title(w.title("Default microphone")).
+		Description("Apps use this one unless you pick another inside the app.").
+		Options(opts...).Value(&v))
+	if v == none {
+		return Device{}, false
+	}
+	return mics[atoi(v)], true
+}
+
+// rankOutputs orders the outputs, preferred first: the first one connected is
+// the one that plays.
+func rankOutputs(w *wizard, outputs []Device, prev Choices) []Device {
+	if len(outputs) == 1 {
+		return outputs
+	}
+
+	// Same set of outputs as last time: offer to keep their order.
+	var kept []Device
+	for _, p := range prev.Outputs {
+		for _, d := range outputs {
+			if d.Name == p.Sink {
+				kept = append(kept, d)
+			}
+		}
+	}
+	if len(kept) == len(outputs) {
+		keep := true
+		ask(huh.NewConfirm().
+			Title(w.title("Output priority")).
+			Description("Previous order, preferred first:\n" + numbered(deviceLabels(kept)) + "\nKeep it?").
+			Affirmative("Keep").Negative("Change").Value(&keep))
+		if keep {
+			return kept
+		}
+		w.step-- // the ranking below is the same step
+	}
+
+	title := w.title("Output priority")
+	remaining := append([]Device{}, outputs...)
+	var order []Device
+	for len(remaining) > 1 {
 		v := "0"
-		if err := huh.NewSelect[string]().
-			Title(fmt.Sprintf("Fallback priority #%d — pick the next device:", rank)).
-			Options(opts...).Value(&v).Run(); err != nil {
-			fatalf("selection cancelled: %v", err)
+		desc := "When several outputs are connected, the highest one plays."
+		if len(order) > 0 {
+			desc = "So far:\n" + numbered(deviceLabels(order))
 		}
+		ask(huh.NewSelect[string]().
+			Title(fmt.Sprintf("%s — pick #%d", title, len(order)+1)).
+			Description(desc).
+			Options(deviceOptions(remaining)...).Value(&v))
 		idx := atoi(v)
-		order = append(order, remaining[idx].Name)
+		order = append(order, remaining[idx])
 		remaining = append(remaining[:idx], remaining[idx+1:]...)
 	}
-	return order
+	return append(order, remaining...)
 }
 
-func resolveBTInput(desc string) string {
-	names := inputDeviceNames()
-	if m := matchBTInputName(desc, names); m != "" {
-		fmt.Printf("→ Auto-matched Bluetooth input name: %q\n", m)
-		return m
+// pickOutputs asks which outputs get one extra: a tick per output.
+func pickOutputs(w *wizard, outputs []Output, title, desc string, has func(Output) bool) map[string]bool {
+	var sel []string
+	devs := make([]Device, len(outputs))
+	for i, o := range outputs {
+		devs[i] = Device{Name: o.Sink, Desc: o.Desc}
+		if has(o) {
+			sel = append(sel, strconv.Itoa(i))
+		}
 	}
-	if len(names) == 0 {
-		return promptManualInput()
+	ask(huh.NewMultiSelect[string]().
+		Title(w.title(title)).
+		Description(desc + "\nspace toggles · enter confirms · nothing ticked = none").
+		Value(&sel).Options(deviceOptions(devs)...))
+
+	picked := map[string]bool{}
+	for _, s := range sel {
+		picked[outputs[atoi(s)].Sink] = true
 	}
-	const manual = "\x00manual"
-	opts := make([]huh.Option[string], 0, len(names)+1)
-	for _, n := range names {
-		opts = append(opts, huh.NewOption(n, n))
-	}
-	opts = append(opts, huh.NewOption("Enter manually…", manual))
-	v := opts[0].Value
-	if err := huh.NewSelect[string]().
-		Title("Could not auto-match the BT device — pick its udev input name:").
-		Options(opts...).Value(&v).Run(); err != nil {
-		fatalf("selection cancelled: %v", err)
-	}
-	if v == manual {
-		return promptManualInput()
-	}
-	return v
+	return picked
 }
 
-func promptManualInput() string {
-	var v string
-	if err := huh.NewInput().
-		Title("Enter the udev input name (e.g. 'HIGHONE BDS C10 (AVRCP)'):").
-		Value(&v).Run(); err != nil {
-		fatalf("input cancelled: %v", err)
+// pickExtras asks, extra by extra, which outputs get it.
+func pickExtras(w *wizard, outputs []Output) {
+	eq := pickOutputs(w, outputs, "Equalizer (voice clarity)",
+		"Cuts the bass, lifts the voices: made for night listening.\n"+
+			"A ticked device gets a second output, e.g. \"Soundbar (EQ)\", which takes\n"+
+			"its place in the priority order; the device itself stays available,\n"+
+			"below everything else.\n"+
+			"The equalizer is then switched on and off for all of them at once, at\n"+
+			"any time (audio-eq on|off, or POST /eq/on and /eq/off).",
+		func(o Output) bool { return o.EQ })
+	swap := pickOutputs(w, outputs, "Swap left and right",
+		"For a speaker that plays the channels the wrong way round.\n"+
+			"Adds up with the equalizer, in the same second output, e.g.\n"+
+			"\"Soundbar (EQ + L/R swapped)\". Always on, whatever the equalizer does.",
+		func(o Output) bool { return o.Swap })
+	keepalive := pickOutputs(w, outputs, "Keepalive tone",
+		"For a device that powers off after a few minutes of silence:\n"+
+			"an inaudible tone plays on it for as long as it is connected.",
+		func(o Output) bool { return o.Keepalive })
+
+	for i, o := range outputs {
+		outputs[i].EQ, outputs[i].Swap, outputs[i].Keepalive = eq[o.Sink], swap[o.Sink], keepalive[o.Sink]
 	}
-	return strings.TrimSpace(v)
 }
 
-func chooseEQ() []string {
-	if confirm("Use the default EQ curve (voice clarity, night listening, no bass vibration)?", true) {
+// chooseEQ returns the 15 gains shared by every equalizer.
+func chooseEQ(w *wizard, prev []string) []string {
+	const (
+		keep   = "keep"
+		preset = "preset"
+		custom = "custom"
+	)
+	hasPrev := len(prev) == len(eqBandLabels)
+	var opts []huh.Option[string]
+	v := preset
+	if hasPrev {
+		opts = append(opts, huh.NewOption("Keep the current curve ("+strings.Join(prev, " ")+")", keep))
+		v = keep
+	}
+	opts = append(opts,
+		huh.NewOption("Preset: voice clarity, night listening, no bass vibration", preset),
+		huh.NewOption("Custom: enter the 15 bands", custom))
+	ask(huh.NewSelect[string]().
+		Title(w.title("Equalizer curve")).
+		Description("One curve, shared by every equalized output.").
+		Options(opts...).Value(&v))
+
+	switch v {
+	case keep:
+		return prev
+	case preset:
 		return append([]string{}, defaultEQ...)
 	}
+
 	gains := append([]string{}, defaultEQ...)
+	if hasPrev {
+		copy(gains, prev)
+	}
 	fields := make([]huh.Field, len(eqBandLabels))
 	for i := range eqBandLabels {
 		fields[i] = huh.NewInput().Title(eqBandLabels[i] + " (dB)").Value(&gains[i]).Validate(validateNumber)
 	}
-	if err := huh.NewForm(huh.NewGroup(fields...)).Run(); err != nil {
-		fatalf("EQ form cancelled: %v", err)
+	ask(fields...)
+	for i := range gains {
+		gains[i] = strings.TrimSpace(gains[i])
 	}
 	return gains
+}
+
+// pickStatus asks which output the status server reports on.
+func pickStatus(w *wizard, outputs []Output, prev Choices) Output {
+	if len(outputs) == 1 {
+		return outputs[0]
+	}
+	v := "0"
+	devs := make([]Device, len(outputs))
+	for i, o := range outputs {
+		devs[i] = Device{Name: o.Sink, Desc: o.Desc}
+		if o.Sink == prev.StatusSink {
+			v = strconv.Itoa(i)
+		}
+	}
+	ask(huh.NewSelect[string]().
+		Title(w.title("Status server")).
+		Description("soundbar-status-server answers \"is it playing?\" for one output.").
+		Options(deviceOptions(devs)...).Value(&v))
+	return outputs[atoi(v)]
+}
+
+// review shows what is about to be written; false means start over.
+func review(c Choices) bool {
+	ok := true
+	ask(
+		huh.NewNote().Title("Review").Description(summary(c)),
+		huh.NewConfirm().Title("Write this configuration?").
+			Affirmative("Write").Negative("Start over").Value(&ok),
+	)
+	return ok
+}
+
+func summary(c Choices) string {
+	var b strings.Builder
+	b.WriteString("Outputs, preferred first\n")
+	for _, line := range outputLines(c) {
+		fmt.Fprintf(&b, "  %s\n", line)
+	}
+	mic := "left to WirePlumber"
+	if c.DefaultSource != "" {
+		mic = c.DefaultDesc
+	}
+	fmt.Fprintf(&b, "\nDefault microphone: %s\n", mic)
+	fmt.Fprintf(&b, "Status server reports on: %s\n", c.StatusDesc)
+	if n := len(c.DisabledCards) + len(c.DisabledBT); n > 0 {
+		fmt.Fprintf(&b, "Hidden devices: %d\n", n)
+	}
+	return b.String()
+}
+
+func numbered(items []string) string {
+	var b strings.Builder
+	for i, s := range items {
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, s)
+	}
+	return b.String()
 }
 
 func validateNumber(s string) error {
@@ -219,19 +521,15 @@ func validateNumber(s string) error {
 	return nil
 }
 
-func confirm(title string, def bool) bool {
-	v := def
-	if err := huh.NewConfirm().Title(title).Value(&v).Run(); err != nil {
-		fatalf("prompt cancelled: %v", err)
-	}
-	return v
-}
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 func dumpDevices(d Devices) {
+	fmt.Println("Hardware:")
+	for _, hw := range d.Hardware {
+		fmt.Printf("  %-70s %s\n", hw.Card, hardwareLabel(hw, d))
+	}
 	row := func(dev Device) {
-		fmt.Printf("  %-55s alsa=%-5v bt=%-5v card=%s\n", dev.Name, dev.IsALSA(), dev.IsBT(), dev.Card)
+		fmt.Printf("  %-70s card=%s\n", dev.Name, dev.Card)
 	}
 	fmt.Println("Sinks (outputs):")
 	for _, s := range d.Sinks {
@@ -243,13 +541,13 @@ func dumpDevices(d Devices) {
 	}
 }
 
-func appendUnique(s []string, v string) []string {
-	for _, x := range s {
-		if x == v {
-			return s
+func hasDevice(devs []Device, name string) bool {
+	for _, d := range devs {
+		if d.Name == name {
+			return true
 		}
 	}
-	return append(s, v)
+	return false
 }
 
 func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
