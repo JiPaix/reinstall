@@ -70,13 +70,12 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 	mustContain(t, "wireplumber", wp,
 		`linking.allow-moving-streams  = true`,
 		`monitor.bluez.rules = [`,
-		// The two processed devices come after every ranked output…
-		"node.name = \"bluez_output.AA_BB.1\" }]\n    actions = { update-props = { priority.session = 1990 } }",
-		"node.name = \"bluez_output.CC_DD.1\" }]\n    actions = { update-props = { priority.session = 1980 } }",
+		// Every device carries its own rank, extras or not.
+		"node.name = \"bluez_output.AA_BB.1\" }]\n    actions = { update-props = { priority.session = 2200 } }",
+		"node.name = \"bluez_output.CC_DD.1\" }]\n    actions = { update-props = { priority.session = 2100 } }",
 		`device.name = "bluez_card.EE_FF"`, // hidden BT: the device, not a node
 		`device.disabled = true`,
 		`monitor.alsa.rules = [`,
-		// …and the plain one keeps its rank (last of 3).
 		"node.name = \"alsa_output.pci-0000_0b_00.1.analog-stereo\" }]\n    actions = { update-props = { priority.session = 2000 } }",
 		`device.name = "alsa_card.usb-Webcam-02"`,
 		`device.profile = "off"`,
@@ -89,56 +88,47 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 		t.Error("default-policy.move is the WirePlumber 0.4 name; 0.5 ignores it")
 	}
 
-	bar := home(".config/soundbar-setup/fx/bluez_output.AA_BB.1.conf")
-	mustContain(t, "soundbar fx", bar,
-		`node.name        = "audio_fx.bluez_output.AA_BB.1"`,
-		`node.description = "Sound 'bar' (EQ + L/R swapped)"`, // quotes defused
-		`priority.session = 2200`,                             // rank 0 of 3
-		`target.object       = "bluez_output.AA_BB.1"`,
-		`node.dont-fallback  = true`,
-		"label  = mbeq",
-		`"50Hz gain (low shelving)" = -15.0`,
-		`"20000Hz gain" = -3.0`,
-		`outputs = [ "right:Output" "left:Output" ]`,
-		`libpipewire-module-protocol-native`, // a standalone client config
+	// Swapped channels: a graph on the device node, set by WirePlumber.
+	graphs := home(".config/wireplumber/wireplumber.conf.d/98-device-graphs.conf")
+	mustContain(t, "device graphs", graphs,
+		"node.filter-graph.rules = [",
+		"# Sound 'bar'\n", // quotes defused
+		`matches = [{ node.name = "bluez_output.AA_BB.1" }]`,
+		`matches = [{ node.name = "bluez_output.CC_DD.1" }]`,
+		`inputs = [ "l:In" "r:In" ] outputs = [ "r:Out" "l:Out" ]`,
 	)
-	if n := strings.Count(bar, `"50Hz gain (low shelving)" = -15.0`); n != 2 {
-		t.Errorf("EQ band should appear once per channel, got %d", n)
+	if n := strings.Count(graphs, "matches ="); n != 2 {
+		t.Errorf("want a rule for each of the two swapped outputs, got %d", n)
 	}
-	if strings.Contains(bar, "filter.smart") {
-		t.Error("the processed output must be a plain output, selectable by itself")
+	if strings.Contains(graphs, "mbeq") {
+		t.Error("the equalizer has a switch: it must not be a permanent rule")
 	}
-
-	headset := home(".config/soundbar-setup/fx/bluez_output.CC_DD.1.conf")
-	mustContain(t, "headset fx", headset,
-		`node.description = "Headset (L/R swapped)"`,
-		`priority.session = 2100`,
-		`{ type = builtin name = left label = copy }`,
-		`outputs = [ "right:Out" "left:Out" ]`,
-	)
-	if _, err := os.Stat(filepath.Join(homeDir, ".config/soundbar-setup/fx/alsa_output.pci-0000_0b_00.1.analog-stereo.conf")); !os.IsNotExist(err) {
-		t.Error("an output without extras must not get a processed output")
-	}
-	if _, err := os.Stat(filepath.Join(homeDir, ".config/pipewire/pipewire.conf.d/audio-filters.conf")); !os.IsNotExist(err) {
-		t.Error("nothing may be loaded from pipewire.conf.d: it would exist with its device off")
+	for _, gone := range []string{".config/soundbar-setup/fx", ".config/pipewire/pipewire.conf.d/audio-filters.conf"} {
+		if _, err := os.Stat(filepath.Join(homeDir, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s: no effect is an output of its own any more", gone)
+		}
 	}
 
 	watch := home(".local/bin/audio-watch")
 	mustContain(t, "audio-watch", watch,
-		`["bluez_output.AA_BB.1"]="`+homeDir+`/.config/soundbar-setup/fx/bluez_output.AA_BB.1.conf"`,
-		`["bluez_output.CC_DD.1"]="`+homeDir+`/.config/soundbar-setup/fx/bluez_output.CC_DD.1.conf"`,
-		"KEEPALIVE=(\n  \"bluez_output.AA_BB.1\"\n)", // the tone plays on the device itself
-		"RANKED=(\n  \"audio_fx.bluez_output.AA_BB.1\"\n  \"audio_fx.bluez_output.CC_DD.1\"\n  \"alsa_output.pci-0000_0b_00.1.analog-stereo\"\n)",
+		"EQ=(\n  \"bluez_output.AA_BB.1\"\n)",
+		"KEEPALIVE=(\n  \"bluez_output.AA_BB.1\"\n)",
+		"RANKED=(\n  \"bluez_output.AA_BB.1\"\n  \"bluez_output.CC_DD.1\"\n  \"alsa_output.pci-0000_0b_00.1.analog-stereo\"\n)",
+		`/.local/bin/audio-eq apply "$sink"`,
 	)
+	if strings.Contains(watch, "audio_fx") || strings.Contains(watch, "pipewire -c") {
+		t.Error("audio-watch must not run outputs of its own")
+	}
 	mustContain(t, "audio-watch.service", home(".config/systemd/user/audio-watch.service"),
 		filepath.Join(homeDir, ".local/bin/audio-watch"), "Restart=always")
 
+	// The equalizer: a graph audio-eq sets on the device, or clears.
 	eq := home(".local/bin/audio-eq")
 	mustContain(t, "audio-eq", eq,
-		"OUTPUTS=(\n  \"audio_fx.bluez_output.AA_BB.1\"\n)", // the headset has no equalizer
-		`CURVE='{ params = [ "left:50Hz gain (low shelving)" -15.0 "left:100Hz gain" -12.0`,
-		`"right:20000Hz gain" -3.0 ] }'`,
-		`FLAT='{ params = [ "left:50Hz gain (low shelving)" 0.0 "left:100Hz gain" 0.0`,
+		"OUTPUTS=(\n  \"bluez_output.AA_BB.1\"\n)", // the headset has no equalizer
+		`ON='{ params = [ "audioconvert.filter-graph.8" "{ nodes = [ { type = ladspa name = eq plugin = mbeq_1197 label = mbeq control = { \"50Hz gain (low shelving)\" = -15.0 \"100Hz gain\" = -12.0`,
+		`\"20000Hz gain\" = -3.0 } } ] }" ] }'`,
+		`OFF='{ params = [ "audioconvert.filter-graph.8" "" ] }'`,
 	)
 
 	mustContain(t, "soundbar-status", home(".local/bin/soundbar-status"),
@@ -152,15 +142,13 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 		`'1. Sound "bar" (EQ + L/R swapped) — keepalive'`,
 		`'2. Headset (L/R swapped)'`,
 		`'3. Speakers'`,
-		`'4. Sound "bar" — as it is, unprocessed'`,
-		`'5. Headset — as it is, unprocessed'`,
 		`DISABLED_CARDS=( 'alsa_card.usb-Webcam-02' )`,
 		`DEFAULT_SOURCE='alsa_input.usb-Mic-00.mono-fallback'`,
 		`DEFAULT_SOURCE_DESC='USB Mic'\''s'`,
 	)
 }
 
-// TestRenderPlainOutput: no extras anywhere means no processed output, empty
+// TestRenderPlainOutput: no extras anywhere means no graph rule, empty
 // lists in the scripts, and no Bluetooth flag.
 func TestRenderPlainOutput(t *testing.T) {
 	home, staged := render(t, Choices{
@@ -169,11 +157,10 @@ func TestRenderPlainOutput(t *testing.T) {
 		StatusDesc: "Speakers",
 	})
 
-	if entries, _ := os.ReadDir(filepath.Join(os.Getenv("HOME"), ".config/soundbar-setup/fx")); len(entries) != 0 {
-		t.Errorf("no extras: no processed output expected, got %d", len(entries))
+	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), ".config/wireplumber/wireplumber.conf.d/98-device-graphs.conf")); !os.IsNotExist(err) {
+		t.Error("no extras: no graph rule expected")
 	}
-	mustContain(t, "audio-watch", home(".local/bin/audio-watch"),
-		"declare -A FX=(   # device -> config of its processed output\n)", "KEEPALIVE=(\n)")
+	mustContain(t, "audio-watch", home(".local/bin/audio-watch"), "EQ=(\n)", "KEEPALIVE=(\n)")
 	mustContain(t, "audio-eq", home(".local/bin/audio-eq"), "OUTPUTS=(\n)")
 	mustContain(t, "vars.sh", staged("vars.sh"), `HAS_BT=false`, `HAS_EQ=false`, `DISABLED_CARDS=( )`, `DEFAULT_SOURCE=''`)
 
@@ -184,27 +171,52 @@ func TestRenderPlainOutput(t *testing.T) {
 	}
 }
 
-// TestRenderDropsStaleOutputs: a processed output from a previous run goes
-// away when its device no longer asks for one.
-func TestRenderDropsStaleOutputs(t *testing.T) {
+// TestRenderDropsStaleRules: a rule from a previous run goes away when its
+// device no longer asks for it, and so does what earlier versions left.
+func TestRenderDropsStaleRules(t *testing.T) {
 	c := sampleChoices()
-	render(t, c)
-	stale := filepath.Join(os.Getenv("HOME"), ".config/soundbar-setup/fx/bluez_output.CC_DD.1.conf")
-	if _, err := os.Stat(stale); err != nil {
-		t.Fatalf("first render should write %s: %v", stale, err)
+	home, _ := render(t, c)
+	const conf = ".config/wireplumber/wireplumber.conf.d/98-device-graphs.conf"
+	mustContain(t, "first render", home(conf), "bluez_output.CC_DD.1")
+	old := filepath.Join(os.Getenv("HOME"), ".config/soundbar-setup/fx/bluez_output.CC_DD.1.conf")
+	if err := os.MkdirAll(filepath.Dir(old), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	c.Outputs[1].Swap = false
 	if _, err := Render(c, t.TempDir()); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Error("the headset's processed output should be gone")
+	if strings.Contains(home(conf), "bluez_output.CC_DD.1") {
+		t.Error("the headset's swap should be gone")
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Error("the processed output of an earlier version should be gone")
 	}
 }
 
-// TestPriorities: ranks are distinct, ordered, never in the stock range, and
-// the devices behind a processed output come after every ranked one.
+// TestEQGraphFits: the equalizer graph has to fit what a device node accepts.
+func TestEQGraphFits(t *testing.T) {
+	gains := make([]string, len(eqBandLabels))
+	for i := range gains {
+		gains[i] = "-24.5"
+	}
+	bands, err := eqBands(gains)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, err := eqGraph(bands); err != nil {
+		t.Errorf("%v\n%s", err, g)
+	}
+	if len(swapGraph) > maxGraph {
+		t.Error("the swap graph is too long")
+	}
+}
+
+// TestPriorities: ranks are distinct, ordered, never in the stock range.
 func TestPriorities(t *testing.T) {
 	for _, count := range []int{1, 3, 12} {
 		last := 1 << 30
@@ -217,11 +229,6 @@ func TestPriorities(t *testing.T) {
 				t.Errorf("count %d: rank %d got %d, below the base %d", count, rank, p, outputPrioBase)
 			}
 			last = p
-		}
-		for n := 0; n < count; n++ {
-			if p := originalPrio(n); p >= outputPrio(count-1, count) || p <= 1100 {
-				t.Errorf("count %d: original %d got %d, want below the last rank and above stock", count, n, p)
-			}
 		}
 	}
 }
@@ -302,8 +309,7 @@ func mustContain(t *testing.T, label, body string, subs ...string) {
 	}
 }
 
-// TestIsVirtual: our own nodes, current and from earlier versions, are never
-// offered as devices.
+// TestIsVirtual: the nodes earlier versions made are never offered as devices.
 func TestIsVirtual(t *testing.T) {
 	for name, want := range map[string]bool{
 		"audio_fx.bluez_output.AA_BB.1":   true,
@@ -320,11 +326,11 @@ func TestIsVirtual(t *testing.T) {
 }
 
 // TestRenderCorrectionEQ checks the correction rule of a known model: matched
-// by card name (no serial), the graph on the device itself, and no rule left
-// behind once the output is gone.
+// by card name (no serial), after the swap in the same rule, and gone with the
+// output.
 func TestRenderCorrectionEQ(t *testing.T) {
 	const (
-		conf   = ".config/wireplumber/wireplumber.conf.d/98-correction-eq.conf"
+		conf   = ".config/wireplumber/wireplumber.conf.d/98-device-graphs.conf"
 		preset = ".config/soundbar-setup/eq/usb-1532-0555.txt"
 	)
 	c := sampleChoices()
@@ -333,6 +339,7 @@ func TestRenderCorrectionEQ(t *testing.T) {
 		Desc:     "Razer BlackShark V2 Pro 2.4",
 		Model:    "usb:1532:0555",
 		CardName: "Razer BlackShark V2 Pro 2.4",
+		Swap:     true,
 	})
 	home, staged := render(t, c)
 
@@ -347,6 +354,9 @@ func TestRenderCorrectionEQ(t *testing.T) {
 		"Filter 1: ON LSC Fc 105 Hz Gain 7 dB Q 0.7\n",
 		"Filter 10: ON HSC Fc 10000 Hz Gain -0.9 dB Q 0.7\n",
 	)
+	if swap, eq := strings.Index(body, `"r:Out" "l:Out"`), strings.Index(body, "param_eq"); swap < 0 || eq < swap {
+		t.Error("want the swap, then the correction, in the Razer's rule")
+	}
 	if strings.Contains(body, "O001") {
 		t.Error("the rule must not depend on the unit's serial")
 	}
@@ -356,7 +366,7 @@ func TestRenderCorrectionEQ(t *testing.T) {
 	if _, err := Render(sampleChoices(), t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), conf)); !os.IsNotExist(err) {
+	if strings.Contains(home(conf), "Razer") {
 		t.Error("a correction outlived its output")
 	}
 	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), preset)); !os.IsNotExist(err) {
@@ -380,7 +390,7 @@ func TestUserEQDB(t *testing.T) {
 		{Sink: "bluez_output.CC_DD.1", Desc: "Headset", Model: "bluetooth:05d6:000a"},
 		{Sink: "bluez_output.EE_FF.1", Desc: "Same chipset", Model: "bluetooth:05d6:000a"},
 	}}
-	got, err := buildCorrections(c)
+	got, err := buildRules(c)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +401,7 @@ func TestUserEQDB(t *testing.T) {
 	if err := os.WriteFile(userEQDBPath(), []byte(`[{"id": "usb:1:2", "filters": [{"type": "XX", "fc": 1, "q": 1}]}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := buildCorrections(c); err == nil {
+	if _, err := buildRules(c); err == nil {
 		t.Error("an unknown filter type must be rejected")
 	}
 }

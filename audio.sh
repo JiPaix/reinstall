@@ -8,10 +8,10 @@
 # - This script orchestrates: cleanup, running the wizard, service reload, the
 #   optional extras below, and the firewall.
 # - Each output picks its own extras in the wizard: equalizer, left/right swap
-#   (a second, processed output in front of the device, there only while the
-#   device is, and ranked in its place; the device itself goes last) and
-#   keepalive tone (audio-watch.service, which also hands the default output
-#   back to the priority order whenever an output comes or goes).
+#   (filter graphs on the device node itself, so no extra output shows up; a
+#   known model also gets its correction EQ that way) and keepalive tone
+#   (audio-watch.service, which also hands the default output back to the
+#   priority order whenever an output comes or goes).
 # - The equalizers are switched on and off together, at any time: `audio-eq
 #   on|off`, or POST /eq/on and /eq/off on the status server. Swaps stay.
 # - Optional: a root oneshot reconnects every paired Bluetooth device at boot.

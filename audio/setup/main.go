@@ -23,7 +23,7 @@ var accessible = os.Getenv("ACCESSIBLE") != ""
 func main() {
 	staging := flag.String("staging", "setup/generated", "dir for the staged vars.sh")
 	dump := flag.Bool("dump", false, "print detected devices and exit (no prompts)")
-	correction := flag.Bool("correction", false, "rewrite only the correction EQs of the saved outputs and exit (no prompts)")
+	apply := flag.Bool("apply", false, "render the saved answers again and exit (no prompts)")
 	flag.Parse()
 
 	devs, err := DetectDevices()
@@ -41,8 +41,8 @@ func main() {
 	}
 
 	prev := LoadChoices()
-	if *correction {
-		refreshCorrections(devs, prev)
+	if *apply {
+		applySaved(devs, prev, stagingAbs)
 		return
 	}
 	devs = confirmDevices(devs, prev)
@@ -66,10 +66,10 @@ func main() {
 	}
 }
 
-// refreshCorrections rewrites the correction EQ rules for the outputs of the
-// last run, after an edit of the database. WirePlumber reads them when it
-// starts.
-func refreshCorrections(devs Devices, c Choices) {
+// applySaved renders the answers of the last run again, without a question:
+// after an edit of the correction EQ database, or an update of the templates.
+// It only writes the files; audio.sh is what restarts the services.
+func applySaved(devs Devices, c Choices, staging string) {
 	if len(c.Outputs) == 0 {
 		fatalf("no saved outputs in %s — run audio.sh first", choicesPath())
 	}
@@ -80,21 +80,15 @@ func refreshCorrections(devs Devices, c Choices) {
 			}
 		}
 	}
-	conf, corrections, err := writeCorrections(c)
+	written, err := Render(c, staging)
 	if err != nil {
-		fatalf("correction EQs: %v", err)
+		fatalf("generating files: %v", err)
 	}
-	if err := saveChoices(c); err != nil {
-		fatalf("%v", err)
+	fmt.Println(summary(c))
+	fmt.Println("✓ Generated:")
+	for _, w := range written {
+		fmt.Println("  -", w)
 	}
-	if conf == "" {
-		fmt.Println("No saved output has a correction EQ.")
-		return
-	}
-	for _, k := range corrections {
-		fmt.Printf("%s: %s\n", k.Desc, k.Name)
-	}
-	fmt.Printf("✓ Wrote %s (loaded when WirePlumber next starts)\n", conf)
 }
 
 // confirmDevices shows what was detected before any question depends on it,
@@ -432,16 +426,13 @@ func pickOutputs(w *wizard, outputs []Output, title, desc string, has func(Outpu
 func pickExtras(w *wizard, outputs []Output) {
 	eq := pickOutputs(w, outputs, "Equalizer (voice clarity)",
 		"Cuts the bass, lifts the voices: made for night listening.\n"+
-			"A ticked device gets a second output, e.g. \"Soundbar (EQ)\", which takes\n"+
-			"its place in the priority order; the device itself stays available,\n"+
-			"below everything else.\n"+
-			"The equalizer is then switched on and off for all of them at once, at\n"+
-			"any time (audio-eq on|off, or POST /eq/on and /eq/off).",
+			"Applied on the device itself: no extra output to pick.\n"+
+			"It is switched on and off for every ticked device at once, at any\n"+
+			"time (audio-eq on|off, or POST /eq/on and /eq/off).",
 		func(o Output) bool { return o.EQ })
 	swap := pickOutputs(w, outputs, "Swap left and right",
 		"For a speaker that plays the channels the wrong way round.\n"+
-			"Adds up with the equalizer, in the same second output, e.g.\n"+
-			"\"Soundbar (EQ + L/R swapped)\". Always on, whatever the equalizer does.",
+			"Applied on the device itself, always on, whatever the equalizer does.",
 		func(o Output) bool { return o.Swap })
 	keepalive := pickOutputs(w, outputs, "Keepalive tone",
 		"For a device that powers off after a few minutes of silence:\n"+

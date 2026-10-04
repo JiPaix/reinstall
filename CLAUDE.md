@@ -111,46 +111,45 @@ below.
   (KWalletManager → Change Password…).
 - Audio extras are per output, not tied to one "primary": the wizard ranks the outputs
   (`priority.session` computed by `outputPrio`, never hard-coded) and each one picks equalizer /
-  left-right swap / keepalive. EQ and swap are asked separately but **add up into one processed
-  output** per device (`audio_fx.<sink>`, shown as "Name (EQ + L/R swapped)"), a plain
-  filter-chain sink the user can select by itself. It takes the device's rank; the device
-  behind it gets `originalPrio`, below every ranked output. This was asked for explicitly — a
-  first version used WirePlumber smart filters (`filter.smart`), which process transparently but
-  leave no way to pick the unprocessed device.
-- A processed output must exist only while its device does: a filter-chain loaded from
-  `pipewire.conf.d` is always there, wins by priority with its device off, and stays selected
-  (the original bug, then done with `pactl set-default-sink`). So each one is a standalone
-  client config (`~/.config/soundbar-setup/fx/<sink>.conf`) that `audio-watch` runs with
-  `pipewire -c` when the device appears and kills when it goes. Its playback stream has
-  `node.dont-fallback`/`node.dont-reconnect`, so nothing lands on another output in between.
-- **Correction EQs** (AutoEq presets, `audio/setup/eqdb.go`) are the opposite of the processed
-  outputs: no node of their own. `98-correction-eq.conf` holds WirePlumber
-  `node.filter-graph.rules`, which set `audioconvert.filter-graph.N` on the device node, so they
-  apply to everything played there, the `audio_fx.*` output included. No prompt: the wizard looks
-  each output's model up in `audio/setup/eqdb.json` (embedded) plus the optional
+  left-right swap / keepalive. **No effect is a node of its own**: each is a filter graph set on
+  the device node (`audioconvert.filter-graph.N`, `audio/setup/graphs.go`), so nothing extra shows
+  up in the output list and nothing can stay selected with its device gone. History, so it isn't
+  redone: smart filters (`filter.smart`) still create a visible sink; then came a second output
+  per device (`audio_fx.<sink>`, a `pipewire -c` client run by `audio-watch`), dropped on request
+  once in-node graphs were found — `fxPrefix`/`fxDir` only survive to clean those up.
+- Swap and correction EQ are permanent: `98-device-graphs.conf` holds WirePlumber
+  `node.filter-graph.rules`, one rule per device, graphs numbered from 0 in rule order (swap,
+  then correction). Correction EQs (AutoEq presets, `audio/setup/eqdb.go`) are never asked: the
+  wizard looks each output's model up in `audio/setup/eqdb.json` (embedded) plus the optional
   `~/.config/soundbar-setup/eqdb.json` (user entries win). The key is the *card's*
   `<bus>:<vendor>:<product>` (`usb:1532:0555`), never a serial; a Bluetooth entry can add
   `"device"` (must equal the device name) because cheap devices report their chipset's ids.
-  Nodes don't carry those ids, so the rule matches `api.alsa.card.name` (USB node names contain
+  Nodes don't carry those ids, so a rule matches `api.alsa.card.name` (USB node names contain
   the serial) or the bluez `node.name`; `model`/`card_name` are saved in `choices.json` for
-  outputs that are off. The graph must stay a one-line `param_eq` naming a preset file
-  (`~/.config/soundbar-setup/eq/`): an ALSA node drops any param value over 511 bytes
-  (`spa.alsa: can't copy value`), which inline filters exceed. A set graph is not readable back
-  (`pw-dump` shows nothing) and a sink's monitor taps before it: to check one, raise
-  `pw-metadata -n settings 0 log.level 4` and look for `load_filter_graph`, or measure the same
-  graph set on a `pw-record` stream. `soundbar-setup -correction` (from a checkout:
-  `cd audio && go run ./setup -correction`) rewrites only these files; WirePlumber reads the
-  rules at start.
+  outputs that are off.
+- **Every graph must be one line under 511 bytes**: an ALSA node drops a longer param value
+  (`spa.alsa: can't copy value`). Hence the correction graph is a `param_eq` naming a preset
+  file (`~/.config/soundbar-setup/eq/`) and the mbeq graph uses the short plugin name. A set
+  graph can't be read back (`pw-dump` shows nothing) and a sink's monitor taps *before* the
+  graphs: to check one, raise the log level (`pw-metadata -n settings 0 log.level 4` for ALSA
+  nodes, `wpctl set-log-level 4` for Bluetooth ones, which live in the WirePlumber process —
+  so does their mbeq) and look for `load_filter_graph`, or measure the same graph set on a
+  `pw-record` stream. A mono graph is instantiated once per channel.
 - **EQ on/off** is one global runtime switch over every equalized output (`audio-eq
-  on|off|status|apply`, `GET /eq`, `POST /eq/{on,off}`, and the `eq` key of `GET /status`), with
-  a single curve (`Choices.EQGains`). "Off" sets every band to 0 dB with `pw-cli set-param
-  <node> Props` — no relinking, and the swap, which lives in the graph's output mapping, is
-  untouched. Params die with the node: the state lives in `~/.local/state/soundbar-setup/eq`
-  and `audio-watch` re-applies it after starting an output and on every pass.
+  on|off|status|apply [output…]`, `GET /eq`, `POST /eq/{on,off}`, and the `eq` key of `GET
+  /status`), with a single curve (`Choices.EQGains`). It is not a WirePlumber rule: `audio-eq`
+  sets the mbeq graph at slot 8 (the last one, after the rules' graphs) with `pw-cli set-param
+  <node> Props`, and clears it (`""`) for "off" — the swap, another slot, is untouched. The
+  graph dies with the node: the state lives in `~/.local/state/soundbar-setup/eq` and
+  `audio-watch` applies it when an equalized device appears — only then, never on every pass:
+  setting it again reloads the graph on a playing device.
+- `soundbar-setup -apply` (from a checkout: `cd audio && go run ./setup -apply`) renders the
+  saved answers again without a question, e.g. after editing the EQ database. It only writes
+  files: the rules and priorities load when WirePlumber starts, `audio-watch` needs a restart.
 - `audio-watch.service` (generated `~/.local/bin/audio-watch`) replaces the udev rule, the
   `soundbar-keepalive`/`soundbar-loopback` units and the login catch-up; `audio.sh`'s cleanup
   removes those. It follows `pactl subscribe` (under `LC_ALL=C` — the output is translated),
-  runs the processed outputs, plays the 18 kHz tone on the devices that want one while they are
+  hands the equalizer state to the devices that have one, plays the 18 kHz tone on the devices that want one while they are
   connected, and runs `wpctl clear-default` whenever a ranked output comes or goes so the
   priority order decides again. It kills the tone itself: a `pw-cat` with `node.dont-reconnect`
   whose target is gone just sits there unlinked. A udev `remove` rule can't match `ATTRS{}`

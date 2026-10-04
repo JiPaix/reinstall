@@ -26,7 +26,8 @@ var eqBandLabels = []string{
 // defaultEQ is the night-listening / voice-clarity curve from the original script.
 var defaultEQ = []string{"-15", "-12", "-10", "-8", "-6", "-3", "0", "3", "5", "6", "5", "4", "2", "0", "-3"}
 
-// fxPrefix names the processed outputs; detection skips them.
+// fxPrefix named the processed outputs of earlier versions (a second output in
+// front of the device); detection skips the ones still loaded.
 const fxPrefix = "audio_fx."
 
 // Output is one ranked output and the extras it asked for.
@@ -42,10 +43,7 @@ type Output struct {
 	CardName string `json:"card_name,omitempty"`
 }
 
-// Processed says the output gets a second, processed output in front of it.
-func (o Output) Processed() bool { return o.EQ || o.Swap }
-
-// Effects names the processing, as it appears in the processed output's name.
+// Effects names what was asked for the output, for the summaries.
 func (o Output) Effects() string {
 	var x []string
 	if o.EQ {
@@ -90,12 +88,6 @@ func outputPrio(rank, count int) int {
 	return outputPrioBase + (count-1-rank)*outputPrioStep
 }
 
-// originalPrio ranks the bare device behind a processed output: it was ranked
-// through its processed output, so by itself it comes after every ranked one.
-func originalPrio(n int) int {
-	return outputPrioBase - (n+1)*10
-}
-
 // defaultSourcePrio outranks every source's stock priority.session (ALSA gives
 // USB mics ~2100), so the pinned mic wins whenever no default is configured.
 const defaultSourcePrio = 3000
@@ -107,25 +99,12 @@ type PriorityRule struct {
 	Prio int
 }
 
-// Filter is a processed output: a filter-chain sink playing into its device.
-type Filter struct {
-	Name, Desc, Target string
-	Prio               int
-	Conf               string // its standalone PipeWire config
-	EQ                 bool
-	MbeqPath           string
-	Bands              []EQBand
-	Sides              []string // graph node names, left then right
-	Inputs, Outputs    string   // port lists, left then right
-}
-
 type tmplData struct {
 	ScriptsDir     string
 	MonitorSource  string
-	Filters        []Filter
 	KeepaliveSinks []string
-	EQFilters      []string // node names of the equalized outputs, for audio-eq
-	EQParamsOn     string   // Props for pw-cli: the curve / every band at 0 dB
+	EQSinks        []string // the equalized outputs, for audio-eq
+	EQParamsOn     string   // Props for pw-cli: the equalizer graph / none
 	EQParamsOff    string
 	RankedSinks    []string
 	BTPriorities   []PriorityRule
@@ -187,7 +166,7 @@ func confString(s string) string {
 	return strings.NewReplacer(`"`, "'", `\`, "/", "\n", " ").Replace(s)
 }
 
-// fxDir holds one standalone PipeWire config per processed output.
+// fxDir held the configs of the processed outputs of earlier versions.
 func fxDir() string {
 	h, _ := os.UserHomeDir()
 	return filepath.Join(h, ".config/soundbar-setup/fx")
@@ -210,65 +189,6 @@ func eqBands(gains []string) ([]EQBand, error) {
 	return bands, nil
 }
 
-// eqParams builds the Props value that sets every band of both channels, for
-// `pw-cli set-param`: the curve, or 0 dB everywhere when flat.
-func eqParams(bands []EQBand, flat bool) string {
-	var b strings.Builder
-	b.WriteString("{ params = [")
-	for _, side := range []string{"left", "right"} {
-		for _, band := range bands {
-			gain := band.Gain
-			if flat {
-				gain = "0.0"
-			}
-			fmt.Fprintf(&b, ` "%s:%s" %s`, side, band.Label, gain)
-		}
-	}
-	b.WriteString(" ] }")
-	return b.String()
-}
-
-// buildFilters returns one processed output per device that asked for an
-// equalizer and/or swapped channels, ranked where the device was ranked.
-func buildFilters(c Choices) ([]Filter, error) {
-	var filters []Filter
-	for i, o := range c.Outputs {
-		if !o.Processed() {
-			continue
-		}
-		f := Filter{
-			Name:    fxPrefix + o.Sink,
-			Desc:    confString(o.Desc) + " (" + o.Effects() + ")",
-			Target:  o.Sink,
-			Prio:    outputPrio(i, len(c.Outputs)),
-			Conf:    filepath.Join(fxDir(), o.Sink+".conf"),
-			Sides:   []string{"left", "right"},
-			Inputs:  `"left:In" "right:In"`, // builtin copy ports
-			Outputs: `"left:Out" "right:Out"`,
-		}
-		out := "Out"
-		if o.EQ {
-			mbeq, err := findMbeq()
-			if err != nil {
-				return nil, err
-			}
-			bands, err := eqBands(c.EQGains)
-			if err != nil {
-				return nil, err
-			}
-			f.EQ, f.MbeqPath, f.Bands = true, mbeq, bands
-			f.Inputs = `"left:Input" "right:Input"` // mbeq ports
-			f.Outputs = `"left:Output" "right:Output"`
-			out = "Output"
-		}
-		if o.Swap {
-			f.Outputs = fmt.Sprintf(`"right:%s" "left:%s"`, out, out)
-		}
-		filters = append(filters, f)
-	}
-	return filters, nil
-}
-
 // Render writes every config to its final location, stages vars.sh into
 // stagingDir for audio.sh, saves the answers for the next run, and returns the
 // list of written paths for the summary.
@@ -276,50 +196,44 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 	if len(c.Outputs) == 0 {
 		return nil, fmt.Errorf("no output selected")
 	}
-	filters, err := buildFilters(c)
-	if err != nil {
-		return nil, err
-	}
 	wpDir, _, sysDir, binDir := homePaths()
 
 	data := tmplData{
 		ScriptsDir:    binDir,
 		MonitorSource: c.StatusSink + ".monitor",
-		Filters:       filters,
 		DisabledBT:    c.DisabledBT,
 		DisabledCards: c.DisabledCards,
+		EQParamsOff:   eqProps(""),
 	}
-	originals := 0
 	for i, o := range c.Outputs {
-		// A processed output carries the rank (in its own config); the device
-		// behind it goes after every ranked output.
 		rule := PriorityRule{o.Sink, outputPrio(i, len(c.Outputs))}
-		ranked := o.Sink
-		if o.Processed() {
-			rule.Prio = originalPrio(originals)
-			originals++
-			ranked = fxPrefix + o.Sink
-		}
 		switch {
 		case strings.HasPrefix(o.Sink, "bluez_output"):
 			data.BTPriorities = append(data.BTPriorities, rule)
 		case strings.HasPrefix(o.Sink, "alsa_output"):
 			data.ALSAPriorities = append(data.ALSAPriorities, rule)
 		}
-		data.RankedSinks = append(data.RankedSinks, ranked)
+		data.RankedSinks = append(data.RankedSinks, o.Sink)
 		if o.EQ {
-			data.EQFilters = append(data.EQFilters, fxPrefix+o.Sink)
+			data.EQSinks = append(data.EQSinks, o.Sink)
 		}
 		if o.Keepalive {
 			data.KeepaliveSinks = append(data.KeepaliveSinks, o.Sink)
 		}
 	}
-	if len(data.EQFilters) > 0 {
+	if len(data.EQSinks) > 0 {
+		if _, err := findMbeq(); err != nil {
+			return nil, err
+		}
 		bands, err := eqBands(c.EQGains)
 		if err != nil {
 			return nil, err
 		}
-		data.EQParamsOn, data.EQParamsOff = eqParams(bands, false), eqParams(bands, true)
+		graph, err := eqGraph(bands)
+		if err != nil {
+			return nil, err
+		}
+		data.EQParamsOn = eqProps(graph)
 	}
 	switch {
 	case strings.HasPrefix(c.DefaultSource, "bluez_input"):
@@ -347,18 +261,11 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 		written = append(written, j.dest)
 	}
 
-	// The processed outputs of a previous run must not outlive it.
+	// Earlier versions ran a second output in front of a device from here.
 	if err := os.RemoveAll(fxDir()); err != nil {
 		return nil, err
 	}
-	for _, f := range filters {
-		if err := renderTo(f.Conf, "audio-fx.conf.tmpl", 0o644, f); err != nil {
-			return nil, err
-		}
-		written = append(written, f.Conf)
-	}
-
-	conf, _, err := writeCorrections(c)
+	conf, err := writeRules(c)
 	if err != nil {
 		return nil, err
 	}
@@ -431,25 +338,18 @@ func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// outputLines lists the outputs as they will be ranked: the processed output
-// takes its device's place, and the devices behind one come last.
+// outputLines lists the outputs as they are ranked, with what each one gets.
 func outputLines(c Choices) []string {
-	var lines, originals []string
-	for _, o := range c.Outputs {
+	lines := make([]string, len(c.Outputs))
+	for i, o := range c.Outputs {
 		line := o.Desc
-		if o.Processed() {
-			line += " (" + o.Effects() + ")"
-			originals = append(originals, o.Desc+" — as it is, unprocessed")
+		if fx := o.Effects(); fx != "" {
+			line += " (" + fx + ")"
 		}
 		if o.Keepalive {
 			line += " — keepalive"
 		}
-		line += correctionLabel(o)
-		lines = append(lines, line)
-	}
-	lines = append(lines, originals...)
-	for i := range lines {
-		lines[i] = fmt.Sprintf("%d. %s", i+1, lines[i])
+		lines[i] = fmt.Sprintf("%d. %s%s", i+1, line, correctionLabel(o))
 	}
 	return lines
 }

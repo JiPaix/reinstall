@@ -13,16 +13,11 @@ import (
 )
 
 // Correction EQs fix a device's frequency response (AutoEq-style parametric
-// presets). Unlike the equalizer/swap extras they are not an output of their
-// own: WirePlumber sets the graph on the device node itself
-// (node.filter-graph.rules), so everything played to the device goes through
-// it and nothing new shows up in the output list.
+// presets). Nothing is asked: an output whose model is in the database gets
+// its preset, as one of the graphs set on the device node (graphs.go).
 
 //go:embed eqdb.json
 var embeddedEQDB []byte
-
-// correctionConf is the WirePlumber config holding the rules.
-const correctionConf = "98-correction-eq.conf"
 
 // EQFilter is one band, with the AutoEq type names: PK, LSC, HSC.
 type EQFilter struct {
@@ -159,17 +154,6 @@ func eqDir() string {
 	return filepath.Join(h, ".config/soundbar-setup/eq")
 }
 
-// maxGraph is that limit (spa.alsa: "can't copy value … (max 511 bytes)").
-const maxGraph = 511
-
-// Correction is one WirePlumber rule: the graph of a model on its node(s).
-type Correction struct {
-	Desc, Name, Source string
-	Match              string // the rule's match, in .conf syntax
-	Graph              string
-	File, Preset       string // the preset file and its content
-}
-
 // presetText writes an entry the way AutoEq does (ParametricEq.txt).
 func presetText(e EQEntry) string {
 	num := func(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
@@ -193,81 +177,8 @@ func fileName(parts ...string) string {
 	return strings.Trim(name, "-") + ".txt"
 }
 
-// buildCorrections returns one rule per output whose model is in the database.
-func buildCorrections(c Choices) ([]Correction, error) {
-	db, err := loadEQDB()
-	if err != nil {
-		return nil, err
-	}
-	var out []Correction
-	seen := map[string]bool{}
-	for _, o := range c.Outputs {
-		e, ok := findCorrection(db, o)
-		if !ok {
-			continue
-		}
-		// A USB node name carries the unit's serial; the card name doesn't, so
-		// the rule holds for any unit of the model, whatever its profile. A
-		// Bluetooth node name is the address, and nothing else on the node
-		// names the device.
-		match := fmt.Sprintf(`node.name = "%s"`, o.Sink)
-		if o.CardName != "" && strings.HasPrefix(o.Sink, "alsa_output") {
-			match = fmt.Sprintf(`api.alsa.card.name = "%s", media.class = "Audio/Sink"`, confString(o.CardName))
-		}
-		if seen[match] {
-			continue
-		}
-		seen[match] = true
-
-		file := filepath.Join(eqDir(), fileName(e.ID, e.Device))
-		// One line: WirePlumber passes the text as written, spaces included.
-		graph := fmt.Sprintf(`{ nodes = [ { type = builtin name = eq label = param_eq config = { filename = "%s" } } ] }`, confString(file))
-		if len(graph) > maxGraph {
-			return nil, fmt.Errorf("correction EQ for %s: %s is too long a path", o.Desc, file)
-		}
-		out = append(out, Correction{
-			Desc:   confString(o.Desc),
-			Name:   confString(e.Name),
-			Source: confString(e.Source),
-			Match:  match,
-			Graph:  graph,
-			File:   file,
-			Preset: presetText(e),
-		})
-	}
-	return out, nil
-}
-
-// writeCorrections renders the rules to WirePlumber's conf.d with their preset
-// files, or removes the lot when no output has a correction. It returns the
-// path of the rules when written.
-func writeCorrections(c Choices) (string, []Correction, error) {
-	corrections, err := buildCorrections(c)
-	if err != nil {
-		return "", nil, err
-	}
-	wpDir, _, _, _ := homePaths()
-	dest := filepath.Join(wpDir, correctionConf)
-	// The presets of a previous run must not outlive it.
-	if err := os.RemoveAll(eqDir()); err != nil {
-		return "", nil, err
-	}
-	if len(corrections) == 0 {
-		if err := os.Remove(dest); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return "", nil, err
-		}
-		return "", nil, nil
-	}
-	if err := os.MkdirAll(eqDir(), 0o755); err != nil {
-		return "", nil, err
-	}
-	for _, k := range corrections {
-		if err := os.WriteFile(k.File, []byte(k.Preset), 0o644); err != nil {
-			return "", nil, err
-		}
-	}
-	if err := renderTo(dest, "correction-eq.conf.tmpl", 0o644, corrections); err != nil {
-		return "", nil, err
-	}
-	return dest, corrections, nil
+// correctionGraph is the graph of an entry and the preset file it reads.
+func correctionGraph(e EQEntry) (graph, file string) {
+	file = filepath.Join(eqDir(), fileName(e.ID, e.Device))
+	return fmt.Sprintf(`{ nodes = [ { type = builtin name = eq label = param_eq config = { filename = "%s" } } ] }`, confString(file)), file
 }

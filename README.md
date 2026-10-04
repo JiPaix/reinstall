@@ -43,15 +43,11 @@ Sets up your audio outputs: you rank them, and the highest one connected is the
 one that plays. Each device can get a voice-clarity equalizer, swapped
 left/right channels, and a keepalive that stops it dozing off mid-silence.
 
-A device with an equalizer or swapped channels gets a second output, named after
-it ("Soundbar (EQ + L/R swapped)"), which takes its place in the ranking and is
-only there while the device is connected. The device itself stays available,
-unprocessed, after all the ranked outputs.
-
-A device whose model has a known correction EQ (an [AutoEq](https://autoeq.app/)
-preset that flattens what the manufacturer got wrong) gets it automatically. It
-is applied on the device itself: no extra output, nothing to switch. The known
-models are in [`audio/setup/eqdb.json`](audio/setup/eqdb.json); add your own in
+All of it is applied on the device itself: no extra output shows up in your
+sound settings. A device whose model has a known correction EQ (an
+[AutoEq](https://autoeq.app/) preset that flattens what the manufacturer got
+wrong) also gets it automatically, before the voice equalizer. The known models
+are in [`audio/setup/eqdb.json`](audio/setup/eqdb.json); add your own in
 `~/.config/soundbar-setup/eqdb.json`, same format.
 
 A small service on the local network reports whether one of the outputs (a
