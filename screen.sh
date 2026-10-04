@@ -5,13 +5,19 @@
 # - Downloads the prebuilt HTTP server + interactive setup CLI from the Release
 #   (or builds them from this checkout with `--local`, for testing engine
 #   changes before they're tagged/released)
-# - Runs the interactive setup (detect monitors → build monitor/tv/taiko grids),
-#   which generates screen/swapscreen.sh from the engine template; on GNOME it
-#   also emits a gdm-monitors.xml for the GDM greeter (primary monitor only)
+# - Runs the interactive setup (detect monitors → build monitor/tv/taiko grids,
+#   then, on KDE, say which screens are TVs), which generates
+#   screen/swapscreen.sh from the engine template; on GNOME it also emits a
+#   gdm-monitors.xml for the GDM greeter (primary monitor only). The answers
+#   are saved (~/.config/swapscreen-setup) and offered back on the next run.
+# - Nothing of the previous install is touched before the setup is confirmed:
+#   cancelling it leaves the machine as it was.
 # - Installs swapscreen + swapscreen-server to ~/.local/bin and the systemd
 #   units (server + a oneshot that forces monitor mode on every login)
 # - GNOME: installs the GDM greeter layout (needs sudo). KDE: installs a root
-#   helper + sudoers rule for the TV DRM loop workaround (needs sudo)
+#   helper + sudoers rule for the TV DRM loop workaround, and pins every screen
+#   declared as a TV with its captured EDID (needs sudo)
+# - The server's auth token survives a re-run (delete server.env to rotate it)
 # - Opens the server port in the firewall (ufw)
 # - Enables Sunshine (if installed) so it starts with every graphical session
 # - amdgpu: writes a ddcutilrc that keeps ddcutil's I2C bus scan serial
@@ -66,25 +72,70 @@ ask() {
   echo -e "${BOLD}$1${NC}"
 }
 
-# Prompt for the package manager and install one or more packages. Reused by the
-# curl / jq / kscreen-doctor prerequisite checks.
+# Install one or more packages, asking for the package manager the first time
+# only: most runs need nothing installed and never see the question. Reused by
+# the curl / jq / kscreen-doctor prerequisite checks.
+PKG_MANAGER=""
 install_with_pkg_manager() {  # $@ = packages
-  ask "Which package manager do you use?"
-  echo "  1) pacman"
-  echo "  2) paru"
-  echo "  3) yay"
-  read -rp "Choice [1-3]: " pm_choice
+  if [ -z "$PKG_MANAGER" ]; then
+    ask "Which package manager do you use?"
+    echo "  1) pacman"
+    echo "  2) paru"
+    echo "  3) yay"
+    read -rp "Choice [1-3]: " pm_choice
 
-  local pm
-  case $pm_choice in
-    1) pm="sudo pacman -S --noconfirm" ;;
-    2) pm="paru -S --noconfirm" ;;
-    3) pm="yay -S --noconfirm" ;;
-    *) print_error "Invalid choice"; exit 1 ;;
-  esac
+    case $pm_choice in
+      1) PKG_MANAGER="sudo pacman -S --noconfirm" ;;
+      2) PKG_MANAGER="paru -S --noconfirm" ;;
+      3) PKG_MANAGER="yay -S --noconfirm" ;;
+      *) print_error "Invalid choice"; exit 1 ;;
+    esac
+  fi
 
-  print_info "Installing $* with: $pm"
-  $pm "$@"
+  print_info "Installing $* with: $PKG_MANAGER"
+  $PKG_MANAGER "$@"
+}
+
+in_list() {  # $1 = needle, $2.. = haystack
+  local needle="$1" x; shift
+  for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
+  return 1
+}
+
+# Primary connector of a profile: first record marked primary=true, else
+# the first record's connector. Mirrors profile_primary() in the engine.
+profile_primary_connector() {  # $1 = array name -> echoes connector
+  local -n arr="$1"
+  local rec tok conn is_primary first=""
+  for rec in "${arr[@]}"; do
+    conn=""; is_primary=false
+    for tok in $rec; do
+      case "$tok" in
+        connector=*)  conn="${tok#connector=}" ;;
+        primary=true) is_primary=true ;;
+      esac
+    done
+    [ -z "$first" ] && first="$conn"
+    $is_primary && { echo "$conn"; return; }
+  done
+  echo "$first"
+}
+
+# One line per profile for the final summary: "DP-3 2560x1440@165, DP-1 …".
+profile_summary() {  # $1 = array name
+  local -n arr="$1"
+  local rec tok conn mode out=""
+  for rec in "${arr[@]}"; do
+    conn=""; mode=""
+    for tok in $rec; do
+      case "$tok" in
+        connector=*) conn="${tok#connector=}" ;;
+        mode=*)      mode="${tok#mode=}" ;;
+      esac
+    done
+    out+="${out:+, }$conn $mode"
+  done
+  echo "$out"
 }
 
 # Pick the desktop backend: BACKEND env override wins, then $XDG_CURRENT_DESKTOP,
@@ -171,47 +222,6 @@ case "$BACKEND" in
   *)
     print_error "Unknown backend '$BACKEND' (expected gnome or kde)"; exit 1 ;;
 esac
-
-# =============================================================================
-# STEP 0 — Cleanup previous install if any
-# =============================================================================
-print_header "Cleaning Up Previous Install"
-
-systemctl --user stop    "$SERVICE" 2>/dev/null && print_ok "Stopped $SERVICE"    || true
-systemctl --user disable "$SERVICE" 2>/dev/null && print_ok "Disabled $SERVICE"   || true
-systemctl --user disable "$LOGIN_SERVICE" 2>/dev/null && print_ok "Disabled $LOGIN_SERVICE" || true
-
-[ -f "$BIN_DIR/swapscreen-server" ] && rm -f "$BIN_DIR/swapscreen-server" && print_ok "Removed previous server binary"
-[ -f "$BIN_DIR/swapscreen" ]        && rm -f "$BIN_DIR/swapscreen"        && print_ok "Removed previous swapscreen script"
-[ -f "$UNIT_DIR/$SERVICE" ]         && rm -f "$UNIT_DIR/$SERVICE"         && print_ok "Removed previous service unit"
-[ -f "$UNIT_DIR/$LOGIN_SERVICE" ]   && rm -f "$UNIT_DIR/$LOGIN_SERVICE"   && print_ok "Removed previous login unit"
-
-# Remove the KDE DRM helper + sudoers rule only when re-provisioning under a
-# non-KDE backend. Under KDE they are kept (STEP 2 overwrites them) so the TV
-# connector can still be redetected between this cleanup and the interactive
-# setup — removing them here once left a mid-install machine with a forced-off
-# TV and no way to wake it.
-if [ "$BACKEND" != kde ] && { [ -f /etc/sudoers.d/swapscreen-drm ] || [ -f /usr/local/bin/swapscreen-drm ]; }; then
-  sudo rm -f /etc/sudoers.d/swapscreen-drm /usr/local/bin/swapscreen-drm && print_ok "Removed KDE DRM helper + sudoers rule"
-fi
-# Same for the KDE TV pin (service + helper + captured EDID).
-if [ "$BACKEND" != kde ] && [ -f /etc/systemd/system/swapscreen-pin-tv.service ]; then
-  sudo systemctl disable --now swapscreen-pin-tv.service 2>/dev/null || true
-  sudo rm -f /etc/systemd/system/swapscreen-pin-tv.service /usr/local/bin/swapscreen-pin-tv /var/lib/swapscreen/tv-edid.bin
-  sudo systemctl daemon-reload
-  print_ok "Removed KDE TV pin service + helper + captured EDID"
-fi
-
-# Remove the firewall rule (re-added in STEP 7) so it never stacks/goes stale.
-if command -v ufw &>/dev/null; then
-  sudo ufw delete allow "$SERVER_PORT/tcp" 2>/dev/null && print_ok "Removed ufw rule $SERVER_PORT/tcp" || true
-fi
-
-# Remove the engine's runtime KMS cache (leaves sunshine.conf untouched).
-[ -f "$SUNSHINE_KMS_CACHE" ]         && rm -f "$SUNSHINE_KMS_CACHE"         && print_ok "Removed Sunshine KMS cache"
-
-systemctl --user daemon-reload
-print_ok "Cleanup done"
 
 # =============================================================================
 # STEP 1 — Get the binaries: local build (--local) or the GitHub Release
@@ -343,104 +353,220 @@ if [ "$BACKEND" = gnome ] && [ ! -f "$WORK/gdm-monitors.xml" ]; then
 fi
 print_ok "Generated swapscreen.sh"
 
+# This run's profiles (BACKEND, TV_CONNECTORS, the three *_PROFILE arrays).
+# shellcheck disable=SC1091
+source "$WORK/profiles.conf"
+
 # =============================================================================
-# STEP 3b — Pin the TV connector (needs sudo; KDE only)
+# STEP 4 — Cleanup previous install if any
 # =============================================================================
-# Capture the TV's EDID now (the setup just required the TV to be detected)
-# and pin the connector at every boot: EDID override + forced "connected" via
-# amdgpu debugfs. The connector then behaves like a permanently-on TV — no
-# detect loop, no wake dance, and `swapscreen --tv` works even with the TV
-# off: the signal starts flowing immediately and the TV later boots INTO an
+# Only now that the setup went through: a failed download or a cancelled wizard
+# above leaves the previous install running.
+print_header "Cleaning Up Previous Install"
+
+systemctl --user stop    "$SERVICE" 2>/dev/null && print_ok "Stopped $SERVICE"    || true
+systemctl --user disable "$SERVICE" 2>/dev/null && print_ok "Disabled $SERVICE"   || true
+systemctl --user disable "$LOGIN_SERVICE" 2>/dev/null && print_ok "Disabled $LOGIN_SERVICE" || true
+
+[ -f "$BIN_DIR/swapscreen-server" ] && rm -f "$BIN_DIR/swapscreen-server" && print_ok "Removed previous server binary"
+[ -f "$BIN_DIR/swapscreen" ]        && rm -f "$BIN_DIR/swapscreen"        && print_ok "Removed previous swapscreen script"
+[ -f "$UNIT_DIR/$SERVICE" ]         && rm -f "$UNIT_DIR/$SERVICE"         && print_ok "Removed previous service unit"
+[ -f "$UNIT_DIR/$LOGIN_SERVICE" ]   && rm -f "$UNIT_DIR/$LOGIN_SERVICE"   && print_ok "Removed previous login unit"
+
+# Remove the KDE DRM helper + sudoers rule when re-provisioning under a non-KDE
+# backend (under KDE, STEP 2 already replaced them).
+if [ "$BACKEND" != kde ] && { [ -f /etc/sudoers.d/swapscreen-drm ] || [ -f /usr/local/bin/swapscreen-drm ]; }; then
+  sudo rm -f /etc/sudoers.d/swapscreen-drm /usr/local/bin/swapscreen-drm && print_ok "Removed KDE DRM helper + sudoers rule"
+fi
+# Same for the KDE TV pin (service + helper + captured EDIDs). The connectors
+# stay forced until the next boot.
+if [ "$BACKEND" != kde ] && [ -f /etc/systemd/system/swapscreen-pin-tv.service ]; then
+  sudo systemctl disable --now swapscreen-pin-tv.service 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/swapscreen-pin-tv.service /usr/local/bin/swapscreen-pin-tv
+  sudo rm -rf /var/lib/swapscreen
+  sudo systemctl daemon-reload
+  print_ok "Removed KDE TV pin service + helper + captured EDIDs"
+fi
+
+# Remove the firewall rule (re-added in STEP 10) so it never stacks/goes stale.
+if command -v ufw &>/dev/null; then
+  sudo ufw delete allow "$SERVER_PORT/tcp" 2>/dev/null && print_ok "Removed ufw rule $SERVER_PORT/tcp" || true
+fi
+
+# Remove the engine's runtime KMS cache (leaves sunshine.conf untouched).
+[ -f "$SUNSHINE_KMS_CACHE" ]         && rm -f "$SUNSHINE_KMS_CACHE"         && print_ok "Removed Sunshine KMS cache"
+
+systemctl --user daemon-reload
+print_ok "Cleanup done"
+
+# =============================================================================
+# STEP 5 — Pin the TV connectors (needs sudo; KDE only)
+# =============================================================================
+# For every screen the wizard was told is a TV: capture its EDID and pin its
+# connector at every boot — EDID override + forced "connected" via amdgpu
+# debugfs. The connector then behaves like a permanently-on TV — no detect
+# loop, no wake dance, and a switch to it works even with the TV off: the
+# signal starts flowing immediately and the TV later boots INTO an
 # already-stable signal, the only sequence this class of TV syncs reliably
 # (a mode change hitting the TV mid-boot leaves it at "no signal" forever).
+# One <connector>.bin per pinned TV in /var/lib/swapscreen/edid: the helper
+# pins whatever is there, and the engine reads the same files to know which
+# connectors are pinned.
+PINNED_TVS=()
 if [ "$BACKEND" = kde ]; then
   print_header "TV Connector Pin"
 
-  # Primary connector of TV_PROFILE from this run's profiles.
-  # shellcheck disable=SC1091
-  source "$WORK/profiles.conf"
-  TV_CONN=""
-  for rec in "${TV_PROFILE[@]}"; do
-    conn=""; prim=false
-    for tok in $rec; do
-      case "$tok" in
-        connector=*)  conn="${tok#connector=}" ;;
-        primary=true) prim=true ;;
-      esac
-    done
-    [ -z "$TV_CONN" ] && TV_CONN="$conn"
-    if $prim; then TV_CONN="$conn"; break; fi
-  done
+  PIN_HELPER=/usr/local/bin/swapscreen-pin-tv
+  PIN_SERVICE=/etc/systemd/system/swapscreen-pin-tv.service
+  PIN_DIR=/var/lib/swapscreen/edid
+  PIN_LEGACY=/var/lib/swapscreen/tv-edid.bin   # the single EDID of earlier versions
 
-  EDID_SRC=""
-  for f in /sys/class/drm/card*-"$TV_CONN"/edid; do
-    [ -e "$f" ] && [ "$(wc -c < "$f")" -gt 0 ] && { EDID_SRC="$f"; break; }
-  done
+  # A swapscreen-setup from a Release that predates the TV question emits no
+  # TV_CONNECTORS, and its engine only knows the single-EDID layout: pin the
+  # "tv" profile's primary as before, and keep the legacy path alive for it.
+  LEGACY_ENGINE=false
+  if ! declare -p TV_CONNECTORS &>/dev/null; then
+    LEGACY_ENGINE=true
+    TV_CONNECTORS=()
+    tv_primary="$(profile_primary_connector TV_PROFILE)"
+    if [ -n "$tv_primary" ]; then TV_CONNECTORS=("$tv_primary"); fi
+  fi
 
-  if [ -z "$TV_CONN" ]; then
-    print_warn "No TV connector in TV_PROFILE — skipping pin."
-  elif [ -z "$EDID_SRC" ]; then
-    print_warn "No readable EDID for $TV_CONN (TV off?) — skipping pin."
-    print_warn "The engine falls back to DRM wake/detect; re-run with the TV on to enable the pin."
-  else
-    PIN_HELPER=/usr/local/bin/swapscreen-pin-tv
-    PIN_SERVICE=/etc/systemd/system/swapscreen-pin-tv.service
-    PIN_EDID=/var/lib/swapscreen/tv-edid.bin
-
-    sudo install -d -m 0755 /var/lib/swapscreen
-    sudo install -m 0644 "$EDID_SRC" "$PIN_EDID"
-    print_ok "Captured $TV_CONN EDID → $PIN_EDID ($(wc -c < "$EDID_SRC") bytes)"
-
-    sudo tee "$PIN_HELPER" >/dev/null <<'PINEOF'
+  sudo tee "$PIN_HELPER" >/dev/null <<'PINEOF'
 #!/usr/bin/env bash
-# swapscreen-pin-tv <connector>
-# Pin the TV connector: serve the captured EDID from the kernel and force the
-# status to "connected" (amdgpu debugfs), then fire a hotplug so the session
-# picks it up. Installed by screen.sh; run at boot by swapscreen-pin-tv.service.
+# swapscreen-pin-tv                        pin every TV connector
+# swapscreen-pin-tv --release <connector>  give one back to normal detection
+# Pin: for each /var/lib/swapscreen/edid/<connector>.bin, serve that EDID from
+# the kernel and force the connector's status to "connected" (amdgpu debugfs),
+# then fire a hotplug so the session picks it up.
+# Installed by screen.sh; run at boot by swapscreen-pin-tv.service.
 set -euo pipefail
 shopt -s nullglob
-conn="${1:?usage: swapscreen-pin-tv <connector>}"
-edid=/var/lib/swapscreen/tv-edid.bin
-[ -s "$edid" ] || { echo "missing or empty $edid" >&2; exit 1; }
-# debugfs shows up a moment after amdgpu loads — wait for it at early boot.
-for _ in $(seq 1 30); do
-  dirs=( /sys/kernel/debug/dri/*/"$conn" )
-  [ "${#dirs[@]}" -gt 0 ] && break
-  sleep 1
-done
-ok=0
-for d in /sys/kernel/debug/dri/*/"$conn"; do
-  [ -d "$d" ] || continue
-  cat "$edid" > "$d/edid_override"
-  echo on > "$d/force"
-  if [ -w "$d/trigger_hotplug" ]; then echo 1 > "$d/trigger_hotplug"; fi
-  ok=1
-done
-[ "$ok" = 1 ] || { echo "no debugfs dir for connector $conn" >&2; exit 1; }
-PINEOF
-    sudo chmod 0755 "$PIN_HELPER"
-    print_ok "Installed $PIN_HELPER"
+dir=/var/lib/swapscreen/edid
 
+hotplug() {  # $1 = debugfs connector dir
+  if [ -w "$1/trigger_hotplug" ]; then echo 1 > "$1/trigger_hotplug"; fi
+}
+
+if [ "${1:-}" = --release ]; then
+  conn="${2:?usage: swapscreen-pin-tv --release <connector>}"
+  [[ "$conn" =~ ^[A-Za-z0-9-]+$ ]] || { echo "invalid connector: $conn" >&2; exit 1; }
+  ok=0
+  for d in /sys/kernel/debug/dri/*/"$conn"; do
+    [ -d "$d" ] || continue
+    echo reset > "$d/edid_override"
+    echo unspecified > "$d/force"
+    hotplug "$d"
+    ok=1
+  done
+  [ "$ok" = 1 ] || { echo "no debugfs dir for connector $conn" >&2; exit 1; }
+  exit 0
+fi
+
+edids=( "$dir"/*.bin )
+[ "${#edids[@]}" -gt 0 ] || { echo "no captured EDID in $dir" >&2; exit 1; }
+failed=0
+for edid in "${edids[@]}"; do
+  conn="$(basename "$edid" .bin)"
+  [ -s "$edid" ] || { echo "empty $edid" >&2; failed=1; continue; }
+  # debugfs shows up a moment after amdgpu loads — wait for it at early boot
+  # (30 s for the whole run, not per connector).
+  while [ "$SECONDS" -lt 30 ]; do
+    dirs=( /sys/kernel/debug/dri/*/"$conn" )
+    [ "${#dirs[@]}" -gt 0 ] && break
+    sleep 1
+  done
+  ok=0
+  for d in /sys/kernel/debug/dri/*/"$conn"; do
+    [ -d "$d" ] || continue
+    cat "$edid" > "$d/edid_override"
+    echo on > "$d/force"
+    hotplug "$d"
+    ok=1
+  done
+  [ "$ok" = 1 ] || { echo "no debugfs dir for connector $conn" >&2; failed=1; }
+done
+exit "$failed"
+PINEOF
+  sudo chmod 0755 "$PIN_HELPER"
+  print_ok "Installed $PIN_HELPER"
+
+  sudo install -d -m 0755 "$PIN_DIR"
+
+  # Earlier versions kept a single EDID, for the connector named in the unit:
+  # file it under that connector so a TV that is off right now stays pinned.
+  if [ -f "$PIN_LEGACY" ] && [ ! -L "$PIN_LEGACY" ]; then
+    old_conn="$(sed -n 's|^ExecStart=.*/swapscreen-pin-tv[[:space:]]\{1,\}\([A-Za-z0-9-]\{1,\}\)[[:space:]]*$|\1|p' "$PIN_SERVICE" 2>/dev/null | head -n1 || true)"
+    if [ -n "$old_conn" ] && [ ! -e "$PIN_DIR/$old_conn.bin" ]; then
+      sudo mv "$PIN_LEGACY" "$PIN_DIR/$old_conn.bin"
+    fi
+  fi
+  sudo rm -f "$PIN_LEGACY"
+
+  for conn in "${TV_CONNECTORS[@]}"; do
+    edid_src=""
+    for f in /sys/class/drm/card*-"$conn"/edid; do
+      [ -e "$f" ] && [ "$(wc -c < "$f")" -gt 0 ] && { edid_src="$f"; break; }
+    done
+    if [ -n "$edid_src" ]; then
+      sudo install -m 0644 "$edid_src" "$PIN_DIR/$conn.bin"
+      print_ok "$conn: captured its EDID ($(wc -c < "$edid_src") bytes)"
+    elif [ -s "$PIN_DIR/$conn.bin" ]; then
+      print_ok "$conn: no EDID to read right now — kept the one captured by a previous run"
+    else
+      print_warn "$conn: no readable EDID (TV off?) — not pinned."
+      print_warn "The engine falls back to DRM wake/detect for it; re-run with the TV on to pin it."
+      continue
+    fi
+    PINNED_TVS+=("$conn")
+  done
+
+  # A connector that was pinned and is no longer a TV: hand it back to normal
+  # detection now rather than at the next boot.
+  for f in "$PIN_DIR"/*.bin; do
+    [ -e "$f" ] || continue
+    conn="$(basename "$f" .bin)"
+    in_list "$conn" "${PINNED_TVS[@]}" && continue
+    sudo rm -f "$f"
+    if sudo "$PIN_HELPER" --release "$conn"; then
+      print_ok "$conn: no longer a TV — pin released"
+    else
+      print_warn "$conn: no longer a TV — its pin is removed, but stays applied until the next boot"
+    fi
+  done
+
+  if [ ${#PINNED_TVS[@]} -gt 0 ]; then
     sudo tee "$PIN_SERVICE" >/dev/null <<PINSVC
 [Unit]
-Description=Pin the swapscreen TV connector ($TV_CONN) with its captured EDID
-ConditionPathExists=/var/lib/swapscreen/tv-edid.bin
+Description=Pin the swapscreen TV connectors (${PINNED_TVS[*]}) with their captured EDID
+ConditionDirectoryNotEmpty=$PIN_DIR
 
 [Service]
 Type=oneshot
-ExecStart=$PIN_HELPER $TV_CONN
+ExecStart=$PIN_HELPER
 
 [Install]
 WantedBy=multi-user.target
 PINSVC
+    if $LEGACY_ENGINE; then
+      sudo ln -sf "edid/${PINNED_TVS[0]}.bin" "$PIN_LEGACY"
+    fi
     sudo systemctl daemon-reload
-    sudo systemctl enable --now swapscreen-pin-tv.service
-    print_ok "Enabled swapscreen-pin-tv.service (pin applied now and at every boot)"
+    sudo systemctl enable swapscreen-pin-tv.service
+    sudo systemctl restart swapscreen-pin-tv.service
+    print_ok "Enabled swapscreen-pin-tv.service (${PINNED_TVS[*]} pinned now and at every boot)"
+  elif [ -f "$PIN_SERVICE" ]; then
+    sudo systemctl disable --now swapscreen-pin-tv.service 2>/dev/null || true
+    sudo rm -f "$PIN_SERVICE"
+    sudo systemctl daemon-reload
+    print_ok "No TV left to pin — removed swapscreen-pin-tv.service"
+  else
+    print_info "No TV to pin."
   fi
 fi
 
 # =============================================================================
-# STEP 4 — Install directories
+# STEP 6 — Install directories
 # =============================================================================
 print_header "Installing Files"
 
@@ -448,7 +574,7 @@ mkdir -p "$BIN_DIR" "$UNIT_DIR"
 print_ok "Ensured $BIN_DIR and $UNIT_DIR exist"
 
 # =============================================================================
-# STEP 5 — Install server, generated script, and unit
+# STEP 7 — Install server, generated script, and unit
 # (swapscreen-setup is a build-time tool — not installed; reconfigure = re-run.)
 # =============================================================================
 cp "$WORK/swapscreen-server" "$BIN_DIR/swapscreen-server"
@@ -466,23 +592,36 @@ cp "$WORK/$LOGIN_SERVICE" "$UNIT_DIR/$LOGIN_SERVICE"
 print_ok "Installed $UNIT_DIR/$LOGIN_SERVICE"
 
 # =============================================================================
-# STEP 5b — HTTP server access control (optional)
+# STEP 7b — HTTP server access control (optional)
 # =============================================================================
 # Neither check is required: an empty ALLOWED_IPS means no IP restriction, and
-# the token is always generated but only enforced because the server checks it
-# unconditionally once present in server.env. Written before the (re)start
-# below so the fresh binary picks it up immediately via EnvironmentFile=.
+# the token is only enforced because the server checks it unconditionally once
+# present in server.env. Written before the (re)start below so the fresh binary
+# picks it up immediately via EnvironmentFile=.
+# A token from a previous run is kept: whatever calls the server (a Home
+# Assistant automation, …) has it stored, and a new one would lock it out with
+# a bare 401. Delete server.env before running this to get a new token.
 print_header "HTTP Server Access Control"
 
 SERVER_CONFIG_DIR="$HOME/.config/swapscreen-server"
 mkdir -p "$SERVER_CONFIG_DIR"
 chmod 700 "$SERVER_CONFIG_DIR"
 
+AUTH_TOKEN=""
+if [ -f "$SERVER_CONFIG_DIR/server.env" ]; then
+  AUTH_TOKEN="$(sed -n 's/^AUTH_TOKEN=//p' "$SERVER_CONFIG_DIR/server.env" | head -n1)"
+fi
+
 ask "Restrict swapscreen-server access by IP?"
 print_info "Comma-separated IPs and/or CIDRs, mixed freely (e.g. 192.168.1.3,10.0.0.0/24)."
 read -rp "Allowed IPs (blank = no restriction): " ALLOWED_IPS
 
-AUTH_TOKEN="$(head -c 32 /dev/urandom | base64)"
+if [ -n "$AUTH_TOKEN" ]; then
+  token_note="Kept the existing auth token"
+else
+  AUTH_TOKEN="$(head -c 32 /dev/urandom | base64)"
+  token_note="Generated auth token"
+fi
 
 {
   echo "ALLOWED_IPS=$ALLOWED_IPS"
@@ -495,10 +634,10 @@ if [ -n "$ALLOWED_IPS" ]; then
 else
   print_warn "No IP restriction set — reachable from any host that can route to it"
 fi
-print_ok "Generated auth token (send it as 'Authorization: Bearer <token>')"
+print_ok "$token_note (send it as 'Authorization: Bearer <token>')"
 
 # =============================================================================
-# STEP 6 — Enable and (re)start the services
+# STEP 8 — Enable and (re)start the services
 # =============================================================================
 print_header "Enabling Services"
 
@@ -521,7 +660,7 @@ print_info "Note: both units are WantedBy=graphical-session.target, so they only
 print_info "auto-start inside a graphical login session (not over plain SSH)."
 
 # =============================================================================
-# STEP 7 — Greeter layout
+# STEP 9 — Greeter layout
 # =============================================================================
 # GNOME: install a mutter monitors.xml so the GDM greeter shows only the primary
 # monitor (rest disabled). KDE (SDDM) has no mutter-style greeter layout, so we
@@ -550,7 +689,7 @@ else
 fi
 
 # =============================================================================
-# STEP 8 — Firewall (open the server port)
+# STEP 10 — Firewall (open the server port)
 # =============================================================================
 print_header "Firewall"
 
@@ -562,7 +701,7 @@ else
 fi
 
 # =============================================================================
-# STEP 9 — Sunshine integration (global_prep_cmd + apps.json)
+# STEP 11 — Sunshine integration (global_prep_cmd + apps.json)
 # =============================================================================
 # Sunshine's sunshine.conf has a `global_prep_cmd` setting: a JSON array of
 # {do, undo} commands run before/after every streamed app (unless that app
@@ -588,35 +727,17 @@ else
     install_with_pkg_manager jq
   fi
 
+  # The unit's real name. Recent packages ship app-dev.lizardbyte.app.Sunshine
+  # with `Alias=sunshine.service`, and `systemctl enable` refuses an alias
+  # ("Refusing to operate on linked unit file") — so resolve it through Id.
   sunshine_service_name() {
-    if systemctl --user cat sunshine.service &>/dev/null; then
-      echo "sunshine.service"
+    local id
+    id="$(systemctl --user show -p Id --value sunshine.service 2>/dev/null)"
+    if [ -n "$id" ] && systemctl --user cat "$id" &>/dev/null; then
+      echo "$id"
     else
       echo "app-dev.lizardbyte.app.Sunshine.service"
     fi
-  }
-
-  # This run's profiles, produced by swapscreen-setup in STEP 3.
-  # shellcheck disable=SC1091
-  source "$WORK/profiles.conf"
-
-  # Primary connector of a profile: first record marked primary=true, else
-  # the first record's connector. Mirrors profile_primary() in the engine.
-  profile_primary_connector() {  # $1 = array name -> echoes connector
-    local -n arr="$1"
-    local rec tok conn is_primary first=""
-    for rec in "${arr[@]}"; do
-      conn=""; is_primary=false
-      for tok in $rec; do
-        case "$tok" in
-          connector=*)  conn="${tok#connector=}" ;;
-          primary=true) is_primary=true ;;
-        esac
-      done
-      [ -z "$first" ] && first="$conn"
-      $is_primary && { echo "$conn"; return; }
-    done
-    echo "$first"
   }
 
   # A specific key's value for a connector within a profile (with a default).
@@ -755,7 +876,7 @@ else
 fi
 
 # =============================================================================
-# STEP 10 — ddcutil parallel bus-scan workaround (amdgpu)
+# STEP 12 — ddcutil parallel bus-scan workaround (amdgpu)
 # =============================================================================
 # ddcutil 3.0.0 lowered --i2c-bus-checks-async-min / --i2c-init-async-min from
 # 99 to 4 (upstream commit 09263068). amdgpu exposes an I2C bus per connector
@@ -810,10 +931,23 @@ else
   print_ok "Wrote $DDCUTIL_RC (serial I2C bus scan)"
 fi
 
-echo
-systemctl --user --no-pager --full status "$SERVICE" || true
-
 print_header "Setup Complete"
+if ! systemctl --user is-active -q "$SERVICE"; then
+  print_warn "$SERVICE is not running — check: systemctl --user status $SERVICE"
+  echo
+fi
+echo -e "  monitor:      ${CYAN}$(profile_summary MONITOR_PROFILE)${NC}"
+echo -e "  tv:           ${CYAN}$(profile_summary TV_PROFILE)${NC}"
+echo -e "  taiko:        ${CYAN}$(profile_summary TAIKO_PROFILE)${NC}"
+if [ "$BACKEND" = kde ]; then
+  tv_line=""
+  for conn in "${TV_CONNECTORS[@]}"; do
+    if in_list "$conn" "${PINNED_TVS[@]}"; then state=pinned; else state="not pinned"; fi
+    tv_line+="${tv_line:+, }$conn ($state)"
+  done
+  echo -e "  TVs:          ${CYAN}${tv_line:-none}${NC}"
+fi
+echo -e "  Switch:       ${CYAN}swapscreen --monitor | --tv | --taiko${NC} (no option: toggle; --help)"
 echo -e "  Server:       ${CYAN}http://localhost:$SERVER_PORT/mode${NC}"
 echo -e "  Access token: ${CYAN}$AUTH_TOKEN${NC}"
 echo -e "  Token file:   ${CYAN}$SERVER_CONFIG_DIR/server.env${NC}"

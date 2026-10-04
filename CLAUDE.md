@@ -32,12 +32,31 @@ below.
   installs a root `swapscreen-drm` helper + sudoers rule for the TV DRM loop workaround. Backend
   quirks are documented at their call sites (`screen/setup/kscreen.go`) — read them before
   touching detection.
-- The KDE install also PINS the TV connector: `screen.sh` captures the TV's EDID at setup and
-  `swapscreen-pin-tv.service` re-applies it at every boot via amdgpu debugfs (`edid_override` +
-  `force=on`), so the connector is always "connected" and `swapscreen --tv` works with the TV
-  off (the TV must boot INTO a stable signal — a mode change hitting it mid-boot wedges it at
-  "no signal"). Never write the connector's sysfs `status` (swapscreen-drm off/detect) on a
-  pinned system: it overwrites the pin until reboot — the engine gates this on `tv_pinned`.
+- TV handling (KDE only) is per connector, not tied to the "tv" profile: the wizard asks which of
+  the placed screens are TVs and emits `TV_CONNECTORS=(…)` next to `BACKEND=` (always, empty when
+  there is none — the engine expands it under `set -u`). The engine wakes every TV of the target
+  profile before validating it and puts to sleep every TV outside it, in all three modes.
+- The KDE install also PINS each of those connectors: `screen.sh` captures the TV's EDID at setup
+  into `/var/lib/swapscreen/edid/<connector>.bin` and `swapscreen-pin-tv.service` re-applies
+  every file there at each boot via amdgpu debugfs (`edid_override` + `force=on`), so the
+  connector is always "connected" and a switch to it works with the TV off (the TV must boot INTO
+  a stable signal — a mode change hitting it mid-boot wedges it at "no signal"). The same files
+  are how the engine knows a connector is pinned (`tv_pinned <connector>`). Never write a pinned
+  connector's sysfs `status` (swapscreen-drm off/detect): it overwrites the pin until reboot —
+  the engine gates this on `tv_pinned`. A TV that is off at a re-run keeps its saved EDID; one
+  that is un-ticked is released (`swapscreen-pin-tv --release`: `reset` + `force=unspecified`,
+  untested on real hardware — on failure the pin just lasts until the next boot). Earlier
+  versions had a single `/var/lib/swapscreen/tv-edid.bin` and the connector in the unit's
+  `ExecStart`: `screen.sh` migrates that, and recreates it as a symlink only when the downloaded
+  `swapscreen-setup` predates `TV_CONNECTORS` (checkout ahead of the latest Release).
+- `swapscreen-setup` saves its answers in `~/.config/swapscreen-setup/choices.json` and offers
+  each layout back on the next run when its connectors and modes are still detected (answers
+  from the other backend are dropped: mode names differ). `ACCESSIBLE=1` turns the TUI into line
+  prompts, with the same caveats as the audio wizard (feed answers slowly; descriptions are not
+  printed; a select needs its number, Enter does not pick the default). On KDE the screens are
+  named from their EDID (`edid.go`) since kscreen reports no model.
+- `screen.sh` touches nothing of the previous install until the wizard is confirmed (the cleanup
+  is STEP 4, after it) — keep it that way: a cancelled wizard must leave a working machine.
   The engine's KDE apply is deliberately two kscreen-doctor calls with a propagation gate
   between them (kscreen submits full-state configs from possibly-stale snapshots); don't merge
   them back into one call and don't re-order — the why is commented at each step.
@@ -71,7 +90,7 @@ below.
   instance that truncates `~/.config/sunshine/sunshine.log`.
 - `*.sh` installers can't run end-to-end outside a real graphical session (need `gdctl` or
   `kscreen-doctor`) and a GitHub Release fetch. To test engine logic, render the template by
-  replacing the `#__PROFILES__` line with a `BACKEND=` + profile-array block (exactly what
+  replacing the `#__PROFILES__` line with a `BACKEND=` + `TV_CONNECTORS=(…)` + profile-array block (exactly what
   `generate.go` does), `bash -n` it, then stub `gdctl`/`kscreen-doctor`/`sudo`/`systemctl` on
   `PATH` and assert the emitted command order. For installers, extract the block with `sed`/`awk`
   and stub `print_*`/`systemctl`.
@@ -81,12 +100,12 @@ below.
   `ALLOWED_IPS`/`AUTH_TOKEN` pair generated at install time, written to a `server.env` (chmod
   600), loaded via each unit's `EnvironmentFile=-.../server.env`. The middleware lives in each
   `main.go` (duplicated, not shared — see the per-module gotcha above) and gates every route
-  including `/healthz`. **Re-running `screen.sh` or `power.sh` always generates a brand-new
-  token**, silently invalidating the old one — any external caller (e.g. a Home Assistant
-  automation hitting `/mode/{tv,monitor}` or `/shutdown`) needs its stored token updated after
-  every reinstall, or it'll get a 401 with no other symptom. `audio.sh` keeps the `AUTH_TOKEN`
-  already in its `server.env` (delete the file to rotate it); `ALLOWED_IPS` is still asked every
-  time, and a blank answer still means no restriction. The optional MPD server (`audio.sh`
+  including `/healthz`. **Re-running `power.sh` always generates a brand-new token**, silently
+  invalidating the old one — any external caller (e.g. a Home Assistant automation hitting
+  `/shutdown`) needs its stored token updated after every reinstall, or it'll get a 401 with no
+  other symptom. `screen.sh` and `audio.sh` keep the `AUTH_TOKEN` already in their `server.env`
+  (delete the file to rotate it); `ALLOWED_IPS` is still asked every time, and a blank answer
+  still means no restriction. The optional MPD server (`audio.sh`
   step 8b) follows the same rule: a "yes" rewrites `~/.config/mpd/mpd.conf` but keeps the
   password found in it (delete the file to rotate); `default_permissions ""` means a client
   with a wrong password is silently refused everything.

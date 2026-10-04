@@ -33,13 +33,14 @@ func TestGenerateReproducesLegacyConfig(t *testing.T) {
 	profilesPath := filepath.Join(dir, "profiles.conf")
 	scriptPath := filepath.Join(dir, "swapscreen.sh")
 	gdmPath := filepath.Join(dir, "gdm-monitors.xml")
-	if err := Generate(profilesPath, scriptPath, gdmPath, "gnome", conns, monitor, tv, taikoExtra); err != nil {
+	if err := Generate(profilesPath, scriptPath, gdmPath, conns, Choices{Backend: "gnome", Monitor: monitor, TV: tv, TaikoExtra: taikoExtra}); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
 
 	profiles := readFile(t, profilesPath)
-	if !strings.Contains(profiles, "BACKEND=gnome") {
-		t.Errorf("profiles.conf missing BACKEND=gnome:\n%s", profiles)
+	// No TV handling on GNOME: the list is still emitted, empty.
+	if !strings.Contains(profiles, "BACKEND=gnome\nTV_CONNECTORS=()\n") {
+		t.Errorf("profiles.conf missing BACKEND=gnome + empty TV_CONNECTORS:\n%s", profiles)
 	}
 	wantLines := []string{
 		// MONITOR_PROFILE: standalone grid, origin at (0,0).
@@ -136,7 +137,7 @@ func TestGenerateKDESkipsGDM(t *testing.T) {
 	profilesPath := filepath.Join(dir, "profiles.conf")
 	scriptPath := filepath.Join(dir, "swapscreen.sh")
 	gdmPath := filepath.Join(dir, "gdm-monitors.xml")
-	if err := Generate(profilesPath, scriptPath, gdmPath, "kde", conns, monitor, tv, nil); err != nil {
+	if err := Generate(profilesPath, scriptPath, gdmPath, conns, Choices{Backend: "kde", Monitor: monitor, TV: tv, TVs: []string{"HDMI-A-1"}}); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
 
@@ -148,11 +149,55 @@ func TestGenerateKDESkipsGDM(t *testing.T) {
 	if !strings.Contains(profiles, "connector=HDMI-A-1 mode=3840x2160@60") {
 		t.Errorf("profiles.conf missing the KDE TV record:\n%s", profiles)
 	}
-	if !strings.Contains(readFile(t, scriptPath), "BACKEND=kde") {
-		t.Error("generated script missing injected BACKEND=kde")
+	if !strings.Contains(profiles, `TV_CONNECTORS=("HDMI-A-1")`) {
+		t.Errorf("profiles.conf missing the TV connector list:\n%s", profiles)
+	}
+	if !strings.Contains(readFile(t, scriptPath), "BACKEND=kde\nTV_CONNECTORS=(\"HDMI-A-1\")") {
+		t.Error("generated script missing injected BACKEND=kde + TV_CONNECTORS")
 	}
 	if _, err := os.Stat(gdmPath); !os.IsNotExist(err) {
 		t.Errorf("KDE backend should not write gdm-monitors.xml, but Stat err = %v", err)
+	}
+}
+
+// TestLayoutUsable: a saved layout is only offered back when every screen it
+// places is detected with the saved mode.
+func TestLayoutUsable(t *testing.T) {
+	conns := []Connector{
+		{Name: "DP-1", Modes: []Mode{{W: 2560, H: 1440, Refresh: "165"}}},
+		{Name: "HDMI-A-1", Modes: []Mode{{W: 3840, H: 2160, Refresh: "60"}}},
+	}
+	rows := func(conn, mode string) [][]Cell { return [][]Cell{{{Connector: conn, ModeSpec: mode}}} }
+	cases := []struct {
+		name string
+		rows [][]Cell
+		want bool
+	}{
+		{"detected, same mode", rows("DP-1", "2560x1440@165"), true},
+		{"mode gone", rows("DP-1", "2560x1440@144"), false},
+		{"connector gone", rows("DP-2", "2560x1440@165"), false},
+		{"nothing saved", nil, false},
+	}
+	for _, c := range cases {
+		if got := layoutUsable(c.rows, conns); got != c.want {
+			t.Errorf("%s: layoutUsable = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestParseEDIDName: the 0xFC descriptor wins, the PNP id is the fallback.
+func TestParseEDIDName(t *testing.T) {
+	edid := make([]byte, 128)
+	edid[8], edid[9] = 0x58, 0xB3 // "VES"
+	if got := parseEDIDName(edid); got != "VES" {
+		t.Errorf("manufacturer fallback = %q, want VES", got)
+	}
+	copy(edid[72:], append([]byte{0, 0, 0, 0xFC, 0}, "65UHD_LCD_TV\n"...))
+	if got := parseEDIDName(edid); got != "65UHD_LCD_TV" {
+		t.Errorf("monitor name = %q, want 65UHD_LCD_TV", got)
+	}
+	if got := parseEDIDName(edid[:64]); got != "" {
+		t.Errorf("truncated EDID = %q, want empty", got)
 	}
 }
 

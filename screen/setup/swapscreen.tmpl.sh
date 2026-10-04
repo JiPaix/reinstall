@@ -15,6 +15,8 @@ set -euo pipefail
 #   color      bt2100|sdr-native|default  (défaut: default)
 #   x, y       position logique     (défaut: 0, 0)
 #   primary    true|false           (défaut: false)
+# TV_CONNECTORS liste les connecteurs traités comme des TV (KDE : réveil avant
+# bascule, mise en veille après, épinglage par screen.sh) — vide = aucun.
 #__PROFILES__
 
 # ────────────────────────────────────────────────
@@ -211,15 +213,24 @@ _in_list() {  # $1 = aiguille, $2.. = meule
 # statut était forcé off) resterait invisible jusqu'au redémarrage de session.
 DRM_HELPER=/usr/local/bin/swapscreen-drm
 
-# Fichier déposé par screen.sh quand le connecteur TV est ÉPINGLÉ : EDID
-# capturé à l'installation + statut forcé « connected » à chaque boot
+# Vrai si le connecteur a été déclaré comme TV dans swapscreen-setup
+# (TV_CONNECTORS, injecté avec les profils). Tout le traitement TV ci-dessous
+# s'applique à CHACUN de ces connecteurs, quel que soit le profil qui l'utilise.
+is_tv() {  # $1 = connecteur
+    _in_list "$1" "${TV_CONNECTORS[@]}"
+}
+
+# Un fichier <connecteur>.bin par connecteur TV ÉPINGLÉ, déposé par screen.sh :
+# EDID capturé à l'installation + statut forcé « connected » à chaque boot
 # (swapscreen-pin-tv.service). Le connecteur devient alors indistinguable
 # d'une TV allumée en permanence : plus de boucle de détection, plus de
 # réveil — et une bascule --tv marche même TV éteinte, la TV démarrant
 # ensuite DANS un signal déjà stable (seul enchaînement qui synchronise à
 # tous les coups cette TV).
-TV_PIN_EDID=/var/lib/swapscreen/tv-edid.bin
-tv_pinned() { [[ -f "$TV_PIN_EDID" ]]; }
+TV_PIN_DIR=/var/lib/swapscreen/edid
+tv_pinned() {  # $1 = connecteur
+    [[ -f "$TV_PIN_DIR/$1.bin" ]]
+}
 
 drm_status() {  # $1 = connecteur, $2 = detect|off|on
     if ! sudo -n "$DRM_HELPER" "$1" "$2" 2>/dev/null; then
@@ -277,7 +288,7 @@ kde_connector_lit() {  # $1 = connecteur
 #      plusieurs secondes, et activer la sortie PENDANT ce clignotement fait
 #      sombrer KWin dans un état « zéro sortie » (placeholder screen) dont
 #      seule une nouvelle session sort — vu en pratique, d'où ce garde-fou.
-tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
+tv_wake_kde() {  # $1 = connecteur TV → 0 prêt, 1 pas prêt
     local tv="$1"
     [[ -z "$tv" ]] && return 0
     # Connecteur épinglé : l'EDID est servi par le kernel lui-même, il est
@@ -285,7 +296,7 @@ tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
     # (Si le pin est actif mais le connecteur absent, on retombe sur le réveil
     # classique : le poke « detect » écrase le pin jusqu'au prochain boot,
     # mais c'est le bon fallback si le service de pin a échoué.)
-    if tv_pinned && kde_connector_known "$tv"; then
+    if tv_pinned "$tv" && kde_connector_known "$tv"; then
         return 0
     fi
     # 45 s : certaines TV (Vestel…) mettent 20-30 s après power-on avant de
@@ -329,22 +340,45 @@ tv_wake_kde() {  # $1 = connecteur primaire TV → 0 prêt, 1 pas prêt
 # HPD). AVEC épinglage, ne surtout PAS toucher au statut : l'écriture sysfs
 # écraserait le force=on du pin (même variable kernel côté connecteur) et le
 # connecteur retomberait dans le régime instable jusqu'au prochain boot.
-tv_sleep_kde() {  # $1 = connecteur primaire TV
+tv_sleep_kde() {  # $1 = connecteur TV
     local tv="$1"
     [[ -z "$tv" ]] && return 0
     kscreen-doctor "output.${tv}.disable" 2>/dev/null || true
-    tv_pinned || drm_status "$tv" off
+    tv_pinned "$tv" || drm_status "$tv" off
 }
 
-# Endort la TV UNIQUEMENT si son connecteur primaire n'appartient pas au profil
-# cible (jamais couper un écran effectivement utilisé par le profil).
-tv_sleep_if_absent() {  # $1 = nom du profil cible
-    local tv c; tv="$(profile_primary TV_PROFILE)"
-    [[ -z "$tv" ]] && return 0
-    while IFS= read -r c; do
-        [[ "$c" == "$tv" ]] && return 0
-    done < <(profile_connectors "$1")
-    tv_sleep_kde "$tv"
+# Réveille chaque TV dont le profil cible a besoin. Retourne 1 dès qu'une
+# n'est pas prête — il ne faut alors PAS basculer.
+tv_wake_profile() {  # $1 = nom du profil cible
+    local c used=()
+    mapfile -t used < <(profile_connectors "$1")
+    for c in "${used[@]}"; do
+        is_tv "$c" || continue
+        tv_wake_kde "$c" || return 1
+    done
+}
+
+# Endort chaque TV qui n'appartient PAS au profil cible (jamais couper un écran
+# effectivement utilisé par le profil).
+tv_sleep_absent() {  # $1 = nom du profil cible
+    local tv used=()
+    mapfile -t used < <(profile_connectors "$1")
+    for tv in "${TV_CONNECTORS[@]}"; do
+        _in_list "$tv" "${used[@]}" || tv_sleep_kde "$tv"
+    done
+}
+
+# Garde commune aux trois modes : réveiller les TV du profil (redétection DRM)
+# AVANT de le valider. Une TV endormie (tv_sleep_kde) a son connecteur forcé à
+# « off » ; sans ce réveil préalable, validate_profile ne le trouve pas dans
+# `kscreen-doctor -o` et échoue à tort avec « profil obsolète » — alors que le
+# câblage n'a pas bougé, il fallait juste réveiller le connecteur.
+tv_wake_or_exit() {  # $1 = nom du profil cible
+    is_kde || return 0
+    if ! tv_wake_profile "$1"; then
+        out_error "la TV n'est pas prête (connecteur absent ou instable) — bascule annulée, réessayez dans quelques secondes"
+        exit 1
+    fi
 }
 
 # ────────────────────────────────────────────────
@@ -899,11 +933,12 @@ active_set() {
 # ────────────────────────────────────────────────
 set_monitor_mode() {
     local previous="$1"
+    tv_wake_or_exit MONITOR_PROFILE
     validate_profile MONITOR_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode monitor ($(profile_connectors MONITOR_PROFILE | tr '\n' ' '))…"
     apply_profile MONITOR_PROFILE
-    # KDE : endormir la TV (statut DRM off) si elle ne sert pas dans ce profil.
-    is_kde && tv_sleep_if_absent MONITOR_PROFILE
+    # KDE : endormir les TV (statut DRM off) qui ne servent pas dans ce profil.
+    is_kde && tv_sleep_absent MONITOR_PROFILE
     $JSON_MODE || echo "✓ Mode monitor activé."
     reconcile_profile MONITOR_PROFILE
     # || true : l'affichage a déjà basculé — un souci Sunshine (restart refusé,
@@ -914,19 +949,12 @@ set_monitor_mode() {
 
 set_tv_mode() {
     local previous="$1"
-    # KDE : réveiller la TV (redétection DRM) AVANT de valider le profil.
-    # Après un passage en mode monitor, le connecteur TV est forcé à l'état
-    # "off" (tv_sleep_kde) ; sans ce réveil préalable, validate_profile ne le
-    # trouve pas dans `kscreen-doctor -o` et échoue à tort avec « profil
-    # obsolète » — alors que le câblage n'a pas bougé, il fallait juste réveiller
-    # le connecteur.
-    if is_kde && ! tv_wake_kde "$(profile_primary TV_PROFILE)"; then
-        out_error "la TV n'est pas prête (connecteur absent ou instable) — bascule annulée, réessayez dans quelques secondes"
-        exit 1
-    fi
+    tv_wake_or_exit TV_PROFILE
     validate_profile TV_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode tv ($(profile_connectors TV_PROFILE | tr '\n' ' '))…"
     apply_profile TV_PROFILE
+    # KDE : endormir les TV déclarées qui ne servent pas dans ce profil.
+    is_kde && tv_sleep_absent TV_PROFILE
     $JSON_MODE || echo "✓ Mode tv activé."
     reconcile_profile TV_PROFILE
     sunshine_update_output TV_PROFILE || true
@@ -935,11 +963,12 @@ set_tv_mode() {
 
 set_taiko_mode() {
     local previous="$1"
+    tv_wake_or_exit TAIKO_PROFILE
     validate_profile TAIKO_PROFILE || exit 1
     $JSON_MODE || echo "→ Passage en mode taiko ($(profile_connectors TAIKO_PROFILE | tr '\n' ' '))…"
     apply_profile TAIKO_PROFILE
-    # KDE : endormir la TV (statut DRM off) si elle ne sert pas dans ce profil.
-    is_kde && tv_sleep_if_absent TAIKO_PROFILE
+    # KDE : endormir les TV (statut DRM off) qui ne servent pas dans ce profil.
+    is_kde && tv_sleep_absent TAIKO_PROFILE
     $JSON_MODE || echo "✓ Mode taiko activé."
     reconcile_profile TAIKO_PROFILE
     sunshine_update_output TAIKO_PROFILE || true

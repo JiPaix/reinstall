@@ -3,10 +3,12 @@
 //
 // For each mode the user places detected monitors on a grid (a row at a time),
 // picks each monitor's resolution/scale/color/VRR and a primary; positions are
-// derived automatically from the grid (see grid.go). Output:
+// derived automatically from the grid (see grid.go). On KDE the user then says
+// which of the placed screens are TVs. The answers are saved, and the next run
+// offers each layout back. Output:
 //
-//	profiles.conf  — the three captured bash arrays
-//	swapscreen.sh  — engine template with the arrays injected
+//	profiles.conf  — the three captured bash arrays + TV_CONNECTORS
+//	swapscreen.sh  — engine template with that block injected
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -21,6 +24,10 @@ import (
 )
 
 var colorOptions = []string{"default", "bt2100", "sdr-native"}
+
+// ACCESSIBLE=1 swaps the TUI for plain line prompts (screen readers, dumb
+// terminals, scripted runs).
+var accessible = os.Getenv("ACCESSIBLE") != ""
 
 func main() {
 	profilesOut := flag.String("profiles", "setup/profiles.conf", "path to write the captured profile arrays")
@@ -31,7 +38,46 @@ func main() {
 	flag.Parse()
 
 	backend := resolveBackend(*deFlag)
+	conns := detect(backend)
 
+	if *dump {
+		dumpConnectors(conns)
+		return
+	}
+
+	// Mode names differ between backends (kscreen rounds the refresh rate), so
+	// answers saved under the other desktop can't be offered back.
+	prev := LoadChoices()
+	if prev.Backend != backend {
+		prev = Choices{}
+	}
+
+	conns = confirmScreens(backend, conns)
+	var c Choices
+	for {
+		c = runWizard(backend, conns, prev)
+		if review(c) {
+			break
+		}
+		prev = c // start over from what was just answered
+	}
+
+	if err := Generate(*profilesOut, *scriptOut, *gdmOut, conns, c); err != nil {
+		fatalf("generating files: %v", err)
+	}
+	if err := saveChoices(c); err != nil {
+		fmt.Fprintf(os.Stderr, "swapscreen-setup: answers not saved for the next run: %v\n", err)
+	}
+	if backend == "kde" {
+		fmt.Printf("\n✓ Wrote %s and %s (KDE backend — no GDM greeter layout)\n", *profilesOut, *scriptOut)
+	} else {
+		fmt.Printf("\n✓ Wrote %s, %s, and %s\n", *profilesOut, *scriptOut, *gdmOut)
+	}
+}
+
+// detect lists the connected screens, or exits: nothing can be set up without
+// a session to ask.
+func detect(backend string) []Connector {
 	conns, err := DetectConnectors(backend)
 	if err != nil {
 		fatalf("%v\n(swapscreen-setup needs a running %s session — %s)", err, backend, backendTool(backend))
@@ -39,31 +85,55 @@ func main() {
 	if len(conns) == 0 {
 		fatalf("no monitors detected via %s", backendTool(backend))
 	}
+	return conns
+}
 
-	if *dump {
-		dumpConnectors(conns)
-		return
+// confirmScreens shows what was detected before any question depends on it,
+// and looks again on request: a TV that is off (and not pinned) isn't listed,
+// and can be switched on without starting over.
+func confirmScreens(backend string, conns []Connector) []Connector {
+	const (
+		cont = "continue"
+		scan = "scan"
+	)
+	for {
+		var b strings.Builder
+		for _, c := range conns {
+			fmt.Fprintf(&b, "  • %s — %s\n", c.Label(), c.DefaultMode().Spec())
+		}
+		b.WriteString("\nA screen that is off may be missing: switch it on, then look again.")
+		v := cont
+		ask(huh.NewSelect[string]().
+			Title("Detected screens").
+			Description(b.String()).
+			Options(
+				huh.NewOption("Continue with these", cont),
+				huh.NewOption("Look again (after switching on or plugging in a screen)", scan),
+			).Value(&v))
+		if v == cont {
+			return conns
+		}
+		conns = detect(backend)
 	}
+}
 
-	fmt.Printf("\nDetected %d connector(s): ", len(conns))
-	names := make([]string, len(conns))
-	for i, c := range conns {
-		names[i] = c.Name
-	}
-	fmt.Println(strings.Join(names, ", "))
+// wizard numbers the steps as they are asked: some are skipped (no screen left
+// for taiko, no TV question on GNOME), so the count isn't known up front.
+type wizard struct{ step int }
 
-	monitor := buildProfile("monitor", conns)
-	tv := buildProfile("tv", conns)
-	taikoExtra := buildTaikoExtra(conns, monitor)
+func (w *wizard) title(s string) string {
+	w.step++
+	return fmt.Sprintf("Step %d · %s", w.step, s)
+}
 
-	if err := Generate(*profilesOut, *scriptOut, *gdmOut, backend, conns, monitor, tv, taikoExtra); err != nil {
-		fatalf("generating files: %v", err)
-	}
-	if backend == "kde" {
-		fmt.Printf("\n✓ Wrote %s and %s (KDE backend — no GDM greeter layout)\n", *profilesOut, *scriptOut)
-	} else {
-		fmt.Printf("\n✓ Wrote %s, %s, and %s\n", *profilesOut, *scriptOut, *gdmOut)
-	}
+func runWizard(backend string, conns []Connector, prev Choices) Choices {
+	w := &wizard{}
+	c := Choices{Backend: backend}
+	c.Monitor = buildProfile(w, "monitor", conns, prev.Monitor)
+	c.TV = buildProfile(w, "tv", conns, prev.TV)
+	c.TaikoExtra = buildTaikoExtra(w, conns, c.Monitor, prev.TaikoExtra)
+	c.TVs = pickTVs(w, conns, c, prev)
+	return c
 }
 
 // resolveBackend picks the display backend: an explicit -de flag wins, else
@@ -99,9 +169,22 @@ func backendTool(backend string) string {
 }
 
 // buildProfile drives the full grid flow for a standalone mode and assigns a
-// primary. Guaranteed to place at least one monitor (conns is non-empty).
-func buildProfile(label string, conns []Connector) Profile {
-	note(fmt.Sprintf("Configure the %q layout", label),
+// primary. Guaranteed to place at least one monitor (conns is non-empty). A
+// layout saved by the previous run is offered back when it still fits the
+// detected screens.
+func buildProfile(w *wizard, label string, conns []Connector, prev Profile) Profile {
+	title := w.title(fmt.Sprintf("%q layout", label))
+	if layoutUsable(prev.Rows, conns) {
+		keep := true
+		ask(huh.NewConfirm().
+			Title(title + " — keep the previous one?").
+			Description("★ primary\n" + describeRows(prev.Rows)).
+			Affirmative("Keep").Negative("Change").Value(&keep))
+		if keep {
+			return prev
+		}
+	}
+	note(title,
 		"Place monitors on a grid. Columns go left→right (A, B, …) within a row; "+
 			"new rows stack on top, auto-centered. Stop when you're done or all monitors are placed.")
 	rows := buildRows(label, conns)
@@ -111,18 +194,115 @@ func buildProfile(label string, conns []Connector) Profile {
 
 // buildTaikoExtra optionally collects the extra row(s) stacked on top of the
 // monitor grid. Returns nil if the user skips taiko (then taiko == monitor).
-func buildTaikoExtra(conns []Connector, monitor Profile) [][]Cell {
+func buildTaikoExtra(w *wizard, conns []Connector, monitor Profile, prev [][]Cell) [][]Cell {
 	avail := excludeUsed(conns, usedConnectors(monitor.Rows))
 	if len(avail) == 0 {
 		return nil
 	}
-	if !confirm("Configure a 'taiko' layout (monitor grid + extra display stacked on top)?", false) {
-		return nil
+	title := w.title(`"taiko" layout`)
+	const what = "The monitor layout, plus extra display(s) stacked on top."
+	if layoutUsable(prev, avail) {
+		const (
+			keep   = "keep"
+			change = "change"
+			none   = "none"
+		)
+		v := keep
+		ask(huh.NewSelect[string]().
+			Title(title).
+			Description(what+"\nPrevious extra display(s):\n"+describeRows(prev)).
+			Options(
+				huh.NewOption("Keep it", keep),
+				huh.NewOption("Change it", change),
+				huh.NewOption("No taiko layout", none),
+			).Value(&v))
+		switch v {
+		case keep:
+			return prev
+		case none:
+			return nil
+		}
+	} else {
+		configure := false
+		ask(huh.NewConfirm().Title(title + " — configure one?").Description(what).Value(&configure))
+		if !configure {
+			return nil
+		}
 	}
 	note("Configure the taiko extra row(s)",
 		"These displays sit ON TOP of the monitor grid, centered over their column. "+
 			"The monitor layout and its primary are reused as-is.")
 	return buildRows("taiko (extra)", avail)
+}
+
+// pickTVs asks which of the placed screens are TVs (KDE only: the GNOME
+// backend has no TV handling). The engine wakes a TV before switching to a
+// layout that uses it and puts it to sleep after leaving one, and screen.sh
+// pins its connector; a monitor needs none of that.
+func pickTVs(w *wizard, conns []Connector, c Choices, prev Choices) []string {
+	if c.Backend != "kde" {
+		return nil
+	}
+	used := usedConnectors(c.Monitor.Rows)
+	for _, rows := range [][][]Cell{c.TV.Rows, c.TaikoExtra} {
+		for name := range usedConnectors(rows) {
+			used[name] = true
+		}
+	}
+	var placed []Connector
+	for _, conn := range conns {
+		if used[conn.Name] {
+			placed = append(placed, conn)
+		}
+	}
+
+	// First run: the primary of the "tv" layout is the obvious candidate.
+	was := prev.TVs
+	if prev.Backend == "" {
+		was = nil
+		for _, row := range c.TV.Rows {
+			for _, cell := range row {
+				if cell.Primary {
+					was = []string{cell.Connector}
+				}
+			}
+		}
+	}
+
+	var sel []string
+	opts := make([]huh.Option[string], len(placed))
+	for i, conn := range placed {
+		opts[i] = huh.NewOption(conn.Label(), conn.Name)
+		if slices.Contains(was, conn.Name) {
+			sel = append(sel, conn.Name)
+		}
+	}
+	ask(huh.NewMultiSelect[string]().
+		Title(w.title("Which of these screens are TVs?")).
+		Description("A TV drops off its connector when it is off or asleep. Each ticked screen\n" +
+			"gets its EDID captured and its connector pinned as always connected, so a\n" +
+			"switch works even with the TV off. Leave monitors unticked.\n" +
+			"space toggles · enter confirms · nothing ticked = no TV").
+		Value(&sel).Options(opts...))
+
+	var tvs []string
+	for _, conn := range placed { // detection order, whatever the ticking order
+		if slices.Contains(sel, conn.Name) {
+			tvs = append(tvs, conn.Name)
+		}
+	}
+	return tvs
+}
+
+// review shows what is about to be written; false means start over.
+func review(c Choices) bool {
+	ok := true
+	ask(
+		huh.NewNote().Title("Review").Description(summary(c)),
+		huh.NewConfirm().Title("Write this configuration?").
+			Affirmative("Write").Negative("Start over").Value(&ok),
+	)
+	return ok
 }
 
 const (
@@ -320,23 +500,24 @@ func selectKV(title string, labels, values []string, def string) string {
 	for i := range values {
 		opts[i] = huh.NewOption(labels[i], values[i])
 	}
-	if err := huh.NewSelect[string]().Title(title).Options(opts...).Value(&v).Run(); err != nil {
-		fatalf("selection cancelled: %v", err)
-	}
+	ask(huh.NewSelect[string]().Title(title).Options(opts...).Value(&v))
 	return v
 }
 
 func confirm(title string, def bool) bool {
 	v := def
-	if err := huh.NewConfirm().Title(title).Value(&v).Run(); err != nil {
-		fatalf("prompt cancelled: %v", err)
-	}
+	ask(huh.NewConfirm().Title(title).Value(&v))
 	return v
 }
 
 func note(title, desc string) {
-	if err := huh.NewNote().Title(title).Description(desc).Next(true).Run(); err != nil {
-		fatalf("prompt cancelled: %v", err)
+	ask(huh.NewNote().Title(title).Description(desc).Next(true))
+}
+
+// ask runs the fields as one screen.
+func ask(fields ...huh.Field) {
+	if err := huh.NewForm(huh.NewGroup(fields...)).WithAccessible(accessible).Run(); err != nil {
+		fatalf("cancelled: %v", err)
 	}
 }
 

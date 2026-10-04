@@ -88,7 +88,8 @@ func detectKscreen() ([]Connector, error) {
 		scales := kdeScalesFor(o.Scale)
 		// bt2100 enables both HDR and WCG, so it needs both capabilities.
 		hdr := o.HDR != nil && o.WCG != nil
-		c := Connector{Name: o.Name, HDR: &hdr}
+		// kscreen reports no vendor or model: name the screen from its EDID.
+		c := Connector{Name: o.Name, Desc: edidName(o.Name), HDR: &hdr}
 		for _, m := range o.Modes {
 			w, h, refresh := ksModeFields(m)
 			if w == 0 || h == 0 {

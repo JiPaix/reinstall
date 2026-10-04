@@ -46,31 +46,40 @@ func arrayLiteral(name string, placed []Placed) string {
 	return b.String()
 }
 
-// buildProfilesBlock renders the three profile arrays. taikoExtra holds the rows
-// stacked on top of the monitor grid; the full taiko layout (monitor rows +
-// extra) is auto-aligned and normalized as one grid, so its cells are emitted
+// buildProfilesBlock renders the three profile arrays. c.TaikoExtra holds the
+// rows stacked on top of the monitor grid; the full taiko layout (monitor rows
+// + extra) is auto-aligned and normalized as one grid, so its cells are emitted
 // explicitly (it can't reuse MONITOR_PROFILE — the monitor rows shift down to
 // make room above).
-func buildProfilesBlock(backend string, monitor, tv Profile, taikoExtra [][]Cell) string {
-	taiko := Profile{Rows: append(append([][]Cell{}, monitor.Rows...), taikoExtra...)}
+func buildProfilesBlock(c Choices) string {
+	taiko := Profile{Rows: append(append([][]Cell{}, c.Monitor.Rows...), c.TaikoExtra...)}
 
 	var b strings.Builder
 	// BACKEND drives the engine's apply/query dispatch (gnome=gdctl, kde=
 	// kscreen-doctor) and is also read by screen.sh when it sources this block.
-	fmt.Fprintf(&b, "BACKEND=%s\n\n", backend)
-	b.WriteString(arrayLiteral("MONITOR_PROFILE", monitor.AutoAlign()))
-	b.WriteString(arrayLiteral("TV_PROFILE", tv.AutoAlign()))
+	fmt.Fprintf(&b, "BACKEND=%s\n", c.Backend)
+	// The connectors the engine handles as TVs (wake, sleep, pin) — always
+	// emitted, empty when there is none, so the engine never sees it unset.
+	// screen.sh pins exactly these.
+	quoted := make([]string, len(c.TVs))
+	for i, tv := range c.TVs {
+		quoted[i] = strconv.Quote(tv)
+	}
+	fmt.Fprintf(&b, "TV_CONNECTORS=(%s)\n\n", strings.Join(quoted, " "))
+	b.WriteString(arrayLiteral("MONITOR_PROFILE", c.Monitor.AutoAlign()))
+	b.WriteString(arrayLiteral("TV_PROFILE", c.TV.AutoAlign()))
 	b.WriteString(arrayLiteral("TAIKO_PROFILE", taiko.AutoAlign()))
 	return b.String()
 }
 
-// Generate writes profiles.conf (the captured arrays, prefixed with BACKEND=)
+// Generate writes profiles.conf (the captured arrays, prefixed with BACKEND=
+// and TV_CONNECTORS=)
 // and the rendered swapscreen.sh (the engine template with that block injected).
 // For the GNOME backend it also writes gdm-monitors.xml (the GDM greeter layout:
 // monitor profile's primary screen only, everything else explicitly disabled);
 // KDE uses SDDM, which has no equivalent, so that file is skipped there.
-func Generate(profilesPath, scriptPath, gdmPath, backend string, conns []Connector, monitor, tv Profile, taikoExtra [][]Cell) error {
-	block := strings.TrimRight(buildProfilesBlock(backend, monitor, tv, taikoExtra), "\n")
+func Generate(profilesPath, scriptPath, gdmPath string, conns []Connector, c Choices) error {
+	block := strings.TrimRight(buildProfilesBlock(c), "\n")
 
 	header := "# Généré par swapscreen-setup — ne pas éditer à la main.\n" +
 		"# Reconfigurer : relancer ./screen.sh\n\n"
@@ -87,8 +96,8 @@ func Generate(profilesPath, scriptPath, gdmPath, backend string, conns []Connect
 		return err
 	}
 
-	if backend == "gnome" {
-		return writeFile(gdmPath, buildGDMMonitorsXML(conns, monitor))
+	if c.Backend == "gnome" {
+		return writeFile(gdmPath, buildGDMMonitorsXML(conns, c.Monitor))
 	}
 	return nil
 }
