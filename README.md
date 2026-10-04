@@ -1,7 +1,8 @@
 # reinstall
 
 Personal setup scripts to get a freshly installed machine back to my preferred
-display, audio and session configuration in one command each. Built for Arch-based
+display, audio and session configuration in one command each — plus one that
+sets up an Android tablet as a network speaker. Built for Arch-based
 systems (pacman / paru / yay) running PipeWire.
 
 Each command walks you through a short interactive setup. Screen and audio also
@@ -95,6 +96,44 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/sessio
 With autologin on, give your wallet an empty password once — KWalletManager →
 kdewallet → Change Password… — or apps that store passwords in it will ask for
 it after every boot.
+
+## Android tablet
+
+> [!NOTE]
+> The tablet needs USB debugging on, `adb` reachable over the network and a
+> fixed IP in your router. The script starts by listing these steps. No root.
+
+Turns an Android tablet into a network speaker. It installs
+[Termux](https://termux.dev/) and Termux:Boot from F-Droid, then starts
+[squeezelite](https://github.com/ralph-irving/squeezelite) at every boot, so the
+tablet shows up as a player in Lyrion or Music Assistant. It also sets a few
+things on the tablet so the player isn't put to sleep.
+
+The tablet then becomes an audio output of your PC, listed with the others in
+your sound settings whenever it is reachable. It is never picked by default.
+You choose which addresses may play on it.
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/android.sh)
+```
+
+To use a tablet that is already set up from another PC — it asks which addresses
+to add to the tablet's allowed ones, then adds the output on that PC:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/android.sh) --add-pc
+```
+
+That PC reaches the tablet over SSH; if its key isn't known there yet, it needs
+adb once, like a first install. With `--pc-only` instead, the tablet isn't
+touched at all (the PC must already be allowed).
+
+To rename a tablet, on the PC, as a player in your music server, or both, add
+`--rename`: it lists the installed tablets and loops until you exit. Without a
+terminal: `--rename <tablet IP or current name> <local|player|both> <new name>`.
+
+Running it again starts from the tablet's current settings, and works over SSH
+when adb is no longer connected.
 
 ## Notes
 

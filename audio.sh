@@ -468,6 +468,25 @@ esac
 # =============================================================================
 print_header "Reloading Services"
 
+# Network outputs (the tablets added by android.sh) are never part of the
+# wizard: they are picked by hand only. Their priority is set here, after the
+# wizard's own, under every local device (ranked ones start at 2000, stock ALSA
+# sits around 1000) and distinct, so which one wins a tie is never left to
+# chance. The priority is a property of the node, which its own PipeWire client
+# creates: a WirePlumber rule can't set it, hence the edit of android.sh's
+# files. Their units are PartOf=pipewire.service — the restart below reloads them.
+net_prio=100
+for conf in "$HOME/.config/tablet-sink"/*.conf; do
+  [ -f "$conf" ] || continue
+  if grep -q '^ *priority\.session = ' "$conf"; then
+    sed -i "s/^\( *\)priority\.session = .*/\1priority.session = $net_prio/" "$conf"
+  else
+    sed -i "s/^\( *\)node\.description = .*/&\n\1priority.session = $net_prio/" "$conf"
+  fi
+  print_ok "Network output $(basename "$conf" .conf): priority $net_prio (never picked by default)"
+  net_prio=$((net_prio - 1))
+done
+
 systemctl --user daemon-reload
 restart_pipewire 2
 

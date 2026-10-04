@@ -26,6 +26,12 @@ func isVirtual(name string) bool {
 	return virtualNodes[name]
 }
 
+// isNetwork tells a node that is a network connection rather than a device of
+// this machine (a tunnel to an Android tablet set up by android.sh, an RTP
+// sink…). Those are picked by hand only: the wizard never offers them, and
+// audio.sh keeps their priority under every local device's.
+func isNetwork(n pactlNode) bool { return n.Properties["node.network"] == "true" }
+
 // Device is a sink or source as reported by `pactl -f json`.
 type Device struct {
 	Name  string
@@ -149,7 +155,7 @@ func DetectDevices() (Devices, error) {
 		})
 	}
 	for _, n := range sinks {
-		if isVirtual(n.Name) {
+		if isVirtual(n.Name) || isNetwork(n) {
 			continue
 		}
 		dev := n.toDevice()
@@ -161,7 +167,7 @@ func DetectDevices() (Devices, error) {
 	}
 	for _, n := range sources {
 		dev := n.toDevice()
-		if isVirtual(n.Name) || dev.Class == "monitor" || strings.HasSuffix(n.Name, ".monitor") {
+		if isVirtual(n.Name) || isNetwork(n) || dev.Class == "monitor" || strings.HasSuffix(n.Name, ".monitor") {
 			continue
 		}
 		d.Sources = append(d.Sources, dev)

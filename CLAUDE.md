@@ -3,8 +3,8 @@
 Personal dotfiles-style toolkit. Each top-level `*.sh` (`screen.sh`, `audio.sh`) downloads
 prebuilt Go binaries from the latest GitHub Release, runs an interactive TUI setup, generates
 a final shell script + systemd units from templates, and installs everything to `~/.local/bin`
-/ `~/.config/systemd/user`. `power.sh` and `session.sh` are the exceptions — see their gotchas
-below.
+/ `~/.config/systemd/user`. `power.sh`, `session.sh` and `android.sh` are the exceptions — see their
+gotchas below.
 
 ## Gotchas
 
@@ -212,3 +212,61 @@ below.
   autologin) never probes, so it proves nothing either way. rockowitz/ddcutil#629.
 - The Sunshine package doesn't enable its user unit, so `screen.sh` enables it — then restarts
   it, which also starts it, so `global_prep_cmd` applies immediately.
+- `android.sh` is the third exception: no Release download, no Go — adb and ssh against a
+  tablet (Termux + Termux:Boot + squeezelite + PulseAudio on TCP 4713), then a PC-side
+  `tablet-sink@<slug>.service` (`pipewire -c ~/.config/tablet-sink/<slug>.conf`, a pulse-tunnel
+  client of its own so the session's PipeWire is never restarted). Home Assistant's side of
+  the tablet (`00-sshd`, `10-dashboard` in `~/.termux/boot`, entities, automations) belongs
+  to another session's config: the installer only writes `start-squeezelite` and
+  `$PREFIX/etc/pulse/default.pa.d/50-reinstall.pa`, and creates `00-sshd` only when missing.
+- adb can't reach Termux's files (`run-as` fails) and can't send `RUN_COMMAND` (the shell
+  user lacks the permission), so a fresh install pushes a script to `/sdcard/Download` and
+  *types* `sh …` into the Termux window (`input text`); everything after goes over SSH (8022).
+  That first-install path has never been run for real — the only tablet so far was set up
+  by hand and adopted. adb over Wi-Fi dies at each tablet reboot, SSH doesn't: a re-run
+  without adb skips the Android settings step and still works.
+- Tablet audio: the `module-aaudio-sink` sink (`tablet`) has ~20 ms of buffer against ~150 for
+  the stock OpenSL ES one, but **deadlocks the whole PulseAudio daemon when it suspends**
+  (intermittent; the log ends on "Sink … idle for too long, suspending"). So the config
+  unloads `module-suspend-on-idle` — keep that — and the boot script has a watchdog that
+  replaces a daemon that stops answering `pactl info`. Symptom of a hung daemon: `pactl`
+  on the tablet hangs, and a tunnel from a PC gets "connection failure: Timeout".
+- In every `tablet_ssh` call, stdin is closed (`ssh -n`): otherwise ssh swallows the answers
+  typed ahead for the next prompt (`tablet_ssh_in` is for the heredoc-fed calls). And a
+  `pkill -f` pattern must not appear literally anywhere on the same remote command line —
+  the `[s]` trick only works if the script's path isn't also there, hence two ssh calls.
+- The tunnel's remote sink goes in the module args (`target.object = "tablet"`), not in
+  `stream.props` (there it is ignored and the stream lands on the tablet's default sink).
+  The debloat list in `android.sh` is per `ro.product.model`; another tablet = another case.
+- Network outputs (`node.network = true`: the tablets' tunnels) are invisible to the audio
+  wizard (`isNetwork` in `audio/setup/pactl.go`) and are never ranked there. Their
+  `priority.session` can't come from a WirePlumber rule — the node belongs to its own
+  `pipewire -c` client — so `audio.sh` rewrites it in `~/.config/tablet-sink/*.conf` (100,
+  99, … in file order) just before its PipeWire restart, which restarts the units
+  (`PartOf=pipewire.service`). `android.sh` writes no priority of its own (none = ranks
+  last) and keeps the line `audio.sh` put there on a re-run.
+- `android.sh --add-pc` (another PC, tablet already set up) only merges addresses into the
+  `auth-ip-acl=` of the tablet's `50-reinstall.pa` and reloads `module-native-protocol-tcp`
+  live (no daemon restart: music keeps playing, connected PCs' tunnels reconnect in ~3 s);
+  it never rewrites the boot script or the Android settings. A full run, by contrast, asks
+  the allowlist from scratch and replaces it. `--pc-only` touches nothing on the tablet.
+- `android.sh` detects an existing install on every route (`detect_existing`) and asks
+  reconfigure/stop. What it can see depends on the channel: SSH reads the tablet's files and
+  processes; adb alone only sees apps and processes (Termux's files are private); `--pc-only`
+  only probes the audio port (`pactl -s tcp:…`). Like `screen.sh`, nothing is removed at
+  that prompt: the old player (boot script, `50-reinstall.pa`) goes at STEP 7 and the PC
+  output at STEP 8, right before the new ones are written — keep it that way, a run
+  stopped at a later prompt must leave a working tablet. `00-sshd`/`10-dashboard` never go.
+- `android.sh --rename` (menu, or `--rename <ip|name> <local|player|both> <new>` with no
+  question for scripts). "local" moves `~/.config/tablet-sink/<slug>.conf` and its unit
+  instance to the new slug; "player" seds the `-n "…"` of the tablet's boot script and
+  restarts *the script* (the running loop already read the old name), leaving PulseAudio
+  up so tunnels aren't cut. The two names are independent after that: `--add-pc` reads the
+  player's name, `--pc-only` offers the local one.
+- adb after a tablet reboot: `adb tcpip` is gone (and `persist.adb.tcp.port` can't be set
+  without root, nor can Termux re-enable anything: the `settings` command is refused to app
+  uids on Android 13 even with `WRITE_SECURE_SETTINGS`). What does work without a cable is
+  turning Wireless debugging on in the tablet's settings: `connect_adb` then finds its
+  random port by probing 30000–60999 (a few seconds; skipped when the tablet doesn't ping),
+  connects, and runs `adb tcpip $ADB_PORT` to get back on the fixed port. A PC already
+  authorized over USB needs no pairing for that.
