@@ -48,6 +48,12 @@ it ("Soundbar (EQ + L/R swapped)"), which takes its place in the ranking and is
 only there while the device is connected. The device itself stays available,
 unprocessed, after all the ranked outputs.
 
+A device whose model has a known correction EQ (an [AutoEq](https://autoeq.app/)
+preset that flattens what the manufacturer got wrong) gets it automatically. It
+is applied on the device itself: no extra output, nothing to switch. The known
+models are in [`audio/setup/eqdb.json`](audio/setup/eqdb.json); add your own in
+`~/.config/soundbar-setup/eqdb.json`, same format.
+
 A small service on the local network reports whether one of the outputs (a
 soundbar, typically) is playing, and switches the equalizer on or off for every
 output that has one:

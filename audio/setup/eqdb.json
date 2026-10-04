@@ -1,0 +1,20 @@
+[
+  {
+    "id": "usb:1532:0555",
+    "name": "Razer BlackShark V2 Pro (2023)",
+    "source": "AutoEq, Rtings measurement (HMS II.3)",
+    "preamp": -6.62,
+    "filters": [
+      { "type": "LSC", "fc": 105.0, "gain": 7.0, "q": 0.70 },
+      { "type": "PK", "fc": 105.1, "gain": -2.8, "q": 0.46 },
+      { "type": "PK", "fc": 302.5, "gain": 1.8, "q": 2.18 },
+      { "type": "PK", "fc": 533.1, "gain": 4.0, "q": 1.20 },
+      { "type": "PK", "fc": 1306.4, "gain": -2.6, "q": 1.78 },
+      { "type": "PK", "fc": 2321.2, "gain": -1.7, "q": 3.76 },
+      { "type": "PK", "fc": 3250.0, "gain": 3.1, "q": 5.90 },
+      { "type": "PK", "fc": 4395.4, "gain": 2.0, "q": 4.26 },
+      { "type": "PK", "fc": 8446.2, "gain": -5.1, "q": 2.05 },
+      { "type": "HSC", "fc": 10000.0, "gain": -0.9, "q": 0.70 }
+    ]
+  }
+]

@@ -23,6 +23,7 @@ var accessible = os.Getenv("ACCESSIBLE") != ""
 func main() {
 	staging := flag.String("staging", "setup/generated", "dir for the staged vars.sh")
 	dump := flag.Bool("dump", false, "print detected devices and exit (no prompts)")
+	correction := flag.Bool("correction", false, "rewrite only the correction EQs of the saved outputs and exit (no prompts)")
 	flag.Parse()
 
 	devs, err := DetectDevices()
@@ -40,6 +41,10 @@ func main() {
 	}
 
 	prev := LoadChoices()
+	if *correction {
+		refreshCorrections(devs, prev)
+		return
+	}
 	devs = confirmDevices(devs, prev)
 	var c Choices
 	for {
@@ -59,6 +64,37 @@ func main() {
 	for _, w := range written {
 		fmt.Println("  -", w)
 	}
+}
+
+// refreshCorrections rewrites the correction EQ rules for the outputs of the
+// last run, after an edit of the database. WirePlumber reads them when it
+// starts.
+func refreshCorrections(devs Devices, c Choices) {
+	if len(c.Outputs) == 0 {
+		fatalf("no saved outputs in %s — run audio.sh first", choicesPath())
+	}
+	for i, o := range c.Outputs {
+		for _, d := range devs.Sinks {
+			if d.Name == o.Sink {
+				c.Outputs[i].Model, c.Outputs[i].CardName = d.Model, d.CardName
+			}
+		}
+	}
+	conf, corrections, err := writeCorrections(c)
+	if err != nil {
+		fatalf("correction EQs: %v", err)
+	}
+	if err := saveChoices(c); err != nil {
+		fatalf("%v", err)
+	}
+	if conf == "" {
+		fmt.Println("No saved output has a correction EQ.")
+		return
+	}
+	for _, k := range corrections {
+		fmt.Printf("%s: %s\n", k.Desc, k.Name)
+	}
+	fmt.Printf("✓ Wrote %s (loaded when WirePlumber next starts)\n", conf)
 }
 
 // confirmDevices shows what was detected before any question depends on it,
@@ -102,7 +138,11 @@ func detected(devs Devices, prev Choices) string {
 			fmt.Fprintf(&b, "  • %s\n", s)
 		}
 	}
-	list("Outputs", deviceLabels(devs.Sinks))
+	sinks := deviceLabels(devs.Sinks)
+	for i, d := range devs.Sinks {
+		sinks[i] += correctionLabel(Output{Desc: d.Desc, Model: d.Model})
+	}
+	list("Outputs", sinks)
 	list("Microphones", deviceLabels(devs.Sources))
 
 	var absent []string
@@ -164,14 +204,14 @@ func runWizard(devs Devices, prev Choices) Choices {
 	// Bluetooth speaker doesn't have to be on for a re-run to keep it.
 	for _, p := range prev.Outputs {
 		if !hasDevice(outputs, p.Sink) && !hasDevice(devs.Sinks, p.Sink) && !hidden[cardOf(p.Sink, "")] {
-			outputs = append(outputs, Device{Name: p.Sink, Desc: p.Desc, Absent: true})
+			outputs = append(outputs, Device{Name: p.Sink, Desc: p.Desc, Model: p.Model, CardName: p.CardName, Absent: true})
 		}
 	}
 	if len(outputs) == 0 {
 		fatalf("no output devices left after hiding")
 	}
 	for _, d := range rankOutputs(w, outputs, prev) {
-		o := Output{Sink: d.Name, Desc: d.Desc}
+		o := Output{Sink: d.Name, Desc: d.Desc, Model: d.Model, CardName: d.CardName}
 		if p, ok := prev.output(d.Name); ok {
 			o.EQ, o.Swap, o.Keepalive = p.EQ, p.Swap, p.Keepalive
 		}

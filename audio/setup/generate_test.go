@@ -318,3 +318,100 @@ func TestIsVirtual(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderCorrectionEQ checks the correction rule of a known model: matched
+// by card name (no serial), the graph on the device itself, and no rule left
+// behind once the output is gone.
+func TestRenderCorrectionEQ(t *testing.T) {
+	const (
+		conf   = ".config/wireplumber/wireplumber.conf.d/98-correction-eq.conf"
+		preset = ".config/soundbar-setup/eq/usb-1532-0555.txt"
+	)
+	c := sampleChoices()
+	c.Outputs = append(c.Outputs, Output{
+		Sink:     "alsa_output.usb-1532_Razer_BlackShark_V2_Pro_2.4_O001-00.analog-stereo",
+		Desc:     "Razer BlackShark V2 Pro 2.4",
+		Model:    "usb:1532:0555",
+		CardName: "Razer BlackShark V2 Pro 2.4",
+	})
+	home, staged := render(t, c)
+
+	body := home(conf)
+	mustContain(t, "correction", body,
+		"node.filter-graph.rules",
+		`api.alsa.card.name = "Razer BlackShark V2 Pro 2.4", media.class = "Audio/Sink"`,
+		`label = param_eq config = { filename = "`+filepath.Join(os.Getenv("HOME"), preset)+`" }`,
+	)
+	mustContain(t, "preset", home(preset),
+		"Preamp: -6.62 dB\n",
+		"Filter 1: ON LSC Fc 105 Hz Gain 7 dB Q 0.7\n",
+		"Filter 10: ON HSC Fc 10000 Hz Gain -0.9 dB Q 0.7\n",
+	)
+	if strings.Contains(body, "O001") {
+		t.Error("the rule must not depend on the unit's serial")
+	}
+	mustContain(t, "vars.sh", staged("vars.sh"), "correction EQ: Razer BlackShark V2 Pro (2023)")
+
+	// Same $HOME, the headset gone: its rule goes too.
+	if _, err := Render(sampleChoices(), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), conf)); !os.IsNotExist(err) {
+		t.Error("a correction outlived its output")
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), preset)); !os.IsNotExist(err) {
+		t.Error("a preset outlived its output")
+	}
+}
+
+// TestUserEQDB: the user's database adds models, and a Bluetooth entry can be
+// tied to the device name.
+func TestUserEQDB(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(userEQDBPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db := `[{"id": "bluetooth:05d6:000a", "device": "Headset", "name": "Mine", "preamp": -1,
+	         "filters": [{"type": "PK", "fc": 1000, "gain": 2, "q": 1}]}]`
+	if err := os.WriteFile(userEQDBPath(), []byte(db), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := Choices{Outputs: []Output{
+		{Sink: "bluez_output.CC_DD.1", Desc: "Headset", Model: "bluetooth:05d6:000a"},
+		{Sink: "bluez_output.EE_FF.1", Desc: "Same chipset", Model: "bluetooth:05d6:000a"},
+	}}
+	got, err := buildCorrections(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Match != `node.name = "bluez_output.CC_DD.1"` {
+		t.Errorf("got %+v", got)
+	}
+
+	if err := os.WriteFile(userEQDBPath(), []byte(`[{"id": "usb:1:2", "filters": [{"type": "XX", "fc": 1, "q": 1}]}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildCorrections(c); err == nil {
+		t.Error("an unknown filter type must be rejected")
+	}
+}
+
+func TestModelID(t *testing.T) {
+	cases := []struct {
+		bus, vendor, product, want string
+	}{
+		{"usb", "0x1532", "0x0555", "usb:1532:0555"},
+		{"bluetooth", "bluetooth:05d6", "0x000a", "bluetooth:05d6:000a"},
+		{"bluetooth", "usb:054C", "0x9cc", "bluetooth:054c:09cc"},
+		{"pci", "0x1002", "0xab40", ""},
+		{"usb", "", "0x0555", ""},
+	}
+	for _, tc := range cases {
+		got := modelID(map[string]string{
+			"device.bus": tc.bus, "device.vendor.id": tc.vendor, "device.product.id": tc.product,
+		})
+		if got != tc.want {
+			t.Errorf("modelID(%s, %s, %s) = %q, want %q", tc.bus, tc.vendor, tc.product, got, tc.want)
+		}
+	}
+}

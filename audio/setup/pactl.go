@@ -33,6 +33,11 @@ type Device struct {
 	Card  string // owning card (alsa_card.* / bluez_card.*), "" if none
 	Class string // properties["device.class"], e.g. "sound" | "monitor"
 
+	// Model and CardName come from the card: the model id a correction EQ is
+	// looked up by (see modelID), and the ALSA card name ("" on Bluetooth).
+	Model    string
+	CardName string
+
 	// Absent marks an output kept from the previous run that isn't connected
 	// right now (a Bluetooth speaker that is off).
 	Absent bool
@@ -130,7 +135,9 @@ func DetectDevices() (Devices, error) {
 	}
 
 	var d Devices
+	byName := map[string]pactlNode{}
 	for _, n := range cards {
+		byName[n.Name] = n
 		desc := n.Properties["device.description"]
 		if desc == "" {
 			desc = n.Name
@@ -145,7 +152,12 @@ func DetectDevices() (Devices, error) {
 		if isVirtual(n.Name) {
 			continue
 		}
-		d.Sinks = append(d.Sinks, n.toDevice())
+		dev := n.toDevice()
+		if card, ok := byName[dev.Card]; ok {
+			dev.Model = modelID(card.Properties)
+			dev.CardName = card.Properties["alsa.card_name"]
+		}
+		d.Sinks = append(d.Sinks, dev)
 	}
 	for _, n := range sources {
 		dev := n.toDevice()

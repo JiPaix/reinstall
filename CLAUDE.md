@@ -123,6 +123,24 @@ below.
   client config (`~/.config/soundbar-setup/fx/<sink>.conf`) that `audio-watch` runs with
   `pipewire -c` when the device appears and kills when it goes. Its playback stream has
   `node.dont-fallback`/`node.dont-reconnect`, so nothing lands on another output in between.
+- **Correction EQs** (AutoEq presets, `audio/setup/eqdb.go`) are the opposite of the processed
+  outputs: no node of their own. `98-correction-eq.conf` holds WirePlumber
+  `node.filter-graph.rules`, which set `audioconvert.filter-graph.N` on the device node, so they
+  apply to everything played there, the `audio_fx.*` output included. No prompt: the wizard looks
+  each output's model up in `audio/setup/eqdb.json` (embedded) plus the optional
+  `~/.config/soundbar-setup/eqdb.json` (user entries win). The key is the *card's*
+  `<bus>:<vendor>:<product>` (`usb:1532:0555`), never a serial; a Bluetooth entry can add
+  `"device"` (must equal the device name) because cheap devices report their chipset's ids.
+  Nodes don't carry those ids, so the rule matches `api.alsa.card.name` (USB node names contain
+  the serial) or the bluez `node.name`; `model`/`card_name` are saved in `choices.json` for
+  outputs that are off. The graph must stay a one-line `param_eq` naming a preset file
+  (`~/.config/soundbar-setup/eq/`): an ALSA node drops any param value over 511 bytes
+  (`spa.alsa: can't copy value`), which inline filters exceed. A set graph is not readable back
+  (`pw-dump` shows nothing) and a sink's monitor taps before it: to check one, raise
+  `pw-metadata -n settings 0 log.level 4` and look for `load_filter_graph`, or measure the same
+  graph set on a `pw-record` stream. `soundbar-setup -correction` (from a checkout:
+  `cd audio && go run ./setup -correction`) rewrites only these files; WirePlumber reads the
+  rules at start.
 - **EQ on/off** is one global runtime switch over every equalized output (`audio-eq
   on|off|status|apply`, `GET /eq`, `POST /eq/{on,off}`, and the `eq` key of `GET /status`), with
   a single curve (`Choices.EQGains`). "Off" sets every band to 0 dB with `pw-cli set-param

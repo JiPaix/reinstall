@@ -36,6 +36,10 @@ type Output struct {
 	EQ        bool   `json:"eq"` // equalizable: follows `audio-eq on|off`
 	Swap      bool   `json:"swap"`
 	Keepalive bool   `json:"keepalive"`
+	// Model and CardName are kept so an output that is off during a re-run
+	// still gets its correction EQ (see eqdb.go).
+	Model    string `json:"model,omitempty"`
+	CardName string `json:"card_name,omitempty"`
 }
 
 // Processed says the output gets a second, processed output in front of it.
@@ -354,6 +358,14 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 		written = append(written, f.Conf)
 	}
 
+	conf, _, err := writeCorrections(c)
+	if err != nil {
+		return nil, err
+	}
+	if conf != "" {
+		written = append(written, conf)
+	}
+
 	if err := writeVarsSh(filepath.Join(stagingDir, "vars.sh"), c); err != nil {
 		return nil, err
 	}
@@ -432,6 +444,7 @@ func outputLines(c Choices) []string {
 		if o.Keepalive {
 			line += " — keepalive"
 		}
+		line += correctionLabel(o)
 		lines = append(lines, line)
 	}
 	lines = append(lines, originals...)
