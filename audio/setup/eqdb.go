@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -27,6 +28,13 @@ type EQFilter struct {
 	Q    float64 `json:"q"`
 }
 
+// EQChannel is what one ear gets on top of the entry's preamp and filters: a
+// headset whose two drivers don't play at the same level.
+type EQChannel struct {
+	Preamp  float64    `json:"preamp,omitempty"`
+	Filters []EQFilter `json:"filters,omitempty"`
+}
+
 // EQEntry is the correction for one device model.
 type EQEntry struct {
 	// ID names the model, never one unit of it: "usb:<vendor>:<product>" or
@@ -39,6 +47,29 @@ type EQEntry struct {
 	Source  string     `json:"source,omitempty"`
 	Preamp  float64    `json:"preamp"`
 	Filters []EQFilter `json:"filters"`
+	// Left and Right are added to Preamp and Filters for that channel only
+	// (the first and second of the device). Unlike the rest of the entry they
+	// can describe one unit rather than the model.
+	Left  *EQChannel `json:"left,omitempty"`
+	Right *EQChannel `json:"right,omitempty"`
+}
+
+// entryChannel is one per-channel part of an entry.
+type entryChannel struct {
+	N    int    // the channel number param_eq knows it by, from 1
+	Side string // "left" or "right"
+	*EQChannel
+}
+
+// channels lists the per-channel parts an entry really has.
+func (e EQEntry) channels() []entryChannel {
+	var out []entryChannel
+	for i, ch := range []*EQChannel{e.Left, e.Right} {
+		if ch != nil && (ch.Preamp != 0 || len(ch.Filters) > 0) {
+			out = append(out, entryChannel{i + 1, []string{"left", "right"}[i], ch})
+		}
+	}
+	return out
 }
 
 // filterTypes are the AutoEq filter types param_eq knows: peaking, low shelf
@@ -62,7 +93,11 @@ func parseEQDB(b []byte, from string) ([]EQEntry, error) {
 		if e.ID == "" || len(e.Filters) == 0 {
 			return nil, fmt.Errorf("%s: entry %q needs an id and filters", from, e.Name)
 		}
-		for _, f := range e.Filters {
+		filters := e.Filters
+		for _, ch := range e.channels() {
+			filters = append(filters[:len(filters):len(filters)], ch.Filters...)
+		}
+		for _, f := range filters {
 			if !filterTypes[f.Type] || f.Fc <= 0 || f.Q <= 0 {
 				return nil, fmt.Errorf("%s: %s: bad filter %+v (type PK, LSC or HSC; fc and q above 0)", from, e.ID, f)
 			}
@@ -154,12 +189,19 @@ func eqDir() string {
 	return filepath.Join(h, ".config/soundbar-setup/eq")
 }
 
-// presetText writes an entry the way AutoEq does (ParametricEq.txt).
-func presetText(e EQEntry) string {
+// presetText writes an entry the way AutoEq does (ParametricEq.txt): all of
+// it for one channel when ch is set, the part every channel shares otherwise.
+func presetText(e EQEntry, ch *EQChannel) string {
 	num := func(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+	preamp, filters := e.Preamp, e.Filters
+	if ch != nil {
+		// Two decimals: the sum of two short decimals isn't one in binary.
+		preamp = math.Round((preamp+ch.Preamp)*100) / 100
+		filters = append(filters[:len(filters):len(filters)], ch.Filters...)
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Preamp: %s dB\n", num(e.Preamp))
-	for i, f := range e.Filters {
+	fmt.Fprintf(&b, "Preamp: %s dB\n", num(preamp))
+	for i, f := range filters {
 		fmt.Fprintf(&b, "Filter %d: ON %s Fc %s Hz Gain %s dB Q %s\n", i+1, f.Type, num(f.Fc), num(f.Gain), num(f.Q))
 	}
 	return b.String()
@@ -177,8 +219,35 @@ func fileName(parts ...string) string {
 	return strings.Trim(name, "-") + ".txt"
 }
 
-// correctionGraph is the graph of an entry and the preset file it reads.
-func correctionGraph(e EQEntry) (graph, file string) {
-	file = filepath.Join(eqDir(), fileName(e.ID, e.Device))
-	return fmt.Sprintf(`{ nodes = [ { type = builtin name = eq label = param_eq config = { filename = "%s" } } ] }`, confString(file)), file
+// correctionGraph is the graph of an entry and the preset files it reads
+// (file -> content). param_eq takes its keys in order: "filename" sets every
+// channel, then "filenameN" replaces channel N — whole, which is why a
+// channel's file repeats the shared filters.
+func correctionGraph(e EQEntry) (graph string, presets map[string]string) {
+	file := filepath.Join(eqDir(), fileName(e.ID, e.Device))
+	presets = map[string]string{file: presetText(e, nil)}
+	config := fmt.Sprintf(`filename = "%s"`, confString(file))
+	for _, ch := range e.channels() {
+		chFile := strings.TrimSuffix(file, ".txt") + "-" + ch.Side + ".txt"
+		presets[chFile] = presetText(e, ch.EQChannel)
+		config += fmt.Sprintf(` filename%d = "%s"`, ch.N, confString(chFile))
+	}
+	return fmt.Sprintf(`{ nodes = [ { type = builtin name = eq label = param_eq config = { %s } } ] }`, config), presets
+}
+
+// correctionNote is the comment of a correction graph in the rules.
+func correctionNote(e EQEntry) string {
+	note := "correction EQ: " + e.Name
+	if e.Source != "" {
+		note += " (" + e.Source + ")"
+	}
+	for _, ch := range e.channels() {
+		note += fmt.Sprintf("; %s ear %+g dB", ch.Side, ch.Preamp)
+		if n := len(ch.Filters); n == 1 {
+			note += " and 1 filter of its own"
+		} else if n > 1 {
+			note += fmt.Sprintf(" and %d filters of its own", n)
+		}
+	}
+	return note
 }

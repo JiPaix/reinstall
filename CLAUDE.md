@@ -140,7 +140,11 @@ gotchas below.
   `~/.config/soundbar-setup/eqdb.json` (user entries win). The key is the *card's*
   `<bus>:<vendor>:<product>`, never a serial; a Bluetooth entry can add `"device"` (the device
   name) because cheap devices report their chipset's ids. Nodes don't carry those ids, so a
-  rule matches `api.alsa.card.name` or the bluez `node.name`.
+  rule matches `api.alsa.card.name` or the bluez `node.name`. An entry's `left`/`right` add a
+  preamp and filters to one channel: the graph then also names `filename1`/`filename2`, which
+  `param_eq` takes *in place of* the shared preset for that channel, so that file repeats the
+  shared filters. The BlackShark's `right` (-1.5 dB, eased in the treble) was set by ear on
+  this unit; Rtings' own unit measured 4.3 dB. AutoEq averages both ears, so it never shows.
 - **Every graph must be one line under 511 bytes**: an ALSA node drops a longer param value
   (`spa.alsa: can't copy value`). Hence the correction graph is a `param_eq` naming a preset
   file (`~/.config/soundbar-setup/eq/`) and the mbeq graph uses the short plugin name. A set

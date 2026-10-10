@@ -14,7 +14,9 @@ import (
 // in the output list and nothing can stay selected with its device gone.
 //
 //   - swapped channels and the correction EQ are permanent: WirePlumber sets
-//     them whenever the node appears (node.filter-graph.rules, numbered from 0);
+//     them whenever the node appears (node.filter-graph.rules, numbered from 0).
+//     The swap comes first, so a correction's per-channel part (eqdb.go) lands
+//     on the driver it was meant for;
 //   - the equalizer has a switch: audio-eq sets or clears it at eqGraphIndex.
 
 // graphsConf is the WirePlumber config holding the rules.
@@ -79,14 +81,10 @@ func buildRules(c Choices) ([]GraphRule, error) {
 			r.Notes = append(r.Notes, "left and right swapped")
 		}
 		if e, ok := findCorrection(db, o); ok {
-			graph, file := correctionGraph(e)
-			note := "correction EQ: " + e.Name
-			if e.Source != "" {
-				note += " (" + e.Source + ")"
-			}
+			graph, presets := correctionGraph(e)
 			r.Graphs = append(r.Graphs, graph)
-			r.Notes = append(r.Notes, confString(note))
-			r.presets[file] = presetText(e)
+			r.Notes = append(r.Notes, confString(correctionNote(e)))
+			r.presets = presets
 		}
 		if len(r.Graphs) == 0 {
 			continue

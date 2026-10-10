@@ -332,6 +332,8 @@ func TestRenderCorrectionEQ(t *testing.T) {
 	const (
 		conf   = ".config/wireplumber/wireplumber.conf.d/98-device-graphs.conf"
 		preset = ".config/soundbar-setup/eq/usb-1532-0555.txt"
+		// The right driver of this headset plays louder than the left one.
+		presetRight = ".config/soundbar-setup/eq/usb-1532-0555-right.txt"
 	)
 	c := sampleChoices()
 	c.Outputs = append(c.Outputs, Output{
@@ -347,12 +349,26 @@ func TestRenderCorrectionEQ(t *testing.T) {
 	mustContain(t, "correction", body,
 		"node.filter-graph.rules",
 		`api.alsa.card.name = "Razer BlackShark V2 Pro 2.4", media.class = "Audio/Sink"`,
-		`label = param_eq config = { filename = "`+filepath.Join(os.Getenv("HOME"), preset)+`" }`,
+		// Every channel gets the preset, then the right one (2) its own.
+		`label = param_eq config = { filename = "`+filepath.Join(os.Getenv("HOME"), preset)+
+			`" filename2 = "`+filepath.Join(os.Getenv("HOME"), presetRight)+`" }`,
+		"; right ear -1.5 dB and 1 filter of its own",
 	)
 	mustContain(t, "preset", home(preset),
 		"Preamp: -6.62 dB\n",
 		"Filter 1: ON LSC Fc 105 Hz Gain 7 dB Q 0.7\n",
 		"Filter 10: ON HSC Fc 10000 Hz Gain -0.9 dB Q 0.7\n",
+	)
+	if strings.Contains(home(preset), "Filter 11") {
+		t.Error("the right ear's filter leaked into the shared preset")
+	}
+	// The right ear's file is the whole preset again, 1.5 dB lower, plus its
+	// own filter: param_eq replaces a channel, it doesn't add to it.
+	mustContain(t, "right preset", home(presetRight),
+		"Preamp: -8.12 dB\n",
+		"Filter 1: ON LSC Fc 105 Hz Gain 7 dB Q 0.7\n",
+		"Filter 10: ON HSC Fc 10000 Hz Gain -0.9 dB Q 0.7\n",
+		"Filter 11: ON HSC Fc 6000 Hz Gain 0.8 dB Q 0.7\n",
 	)
 	if swap, eq := strings.Index(body, `"r:Out" "l:Out"`), strings.Index(body, "param_eq"); swap < 0 || eq < swap {
 		t.Error("want the swap, then the correction, in the Razer's rule")
@@ -369,8 +385,10 @@ func TestRenderCorrectionEQ(t *testing.T) {
 	if strings.Contains(home(conf), "Razer") {
 		t.Error("a correction outlived its output")
 	}
-	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), preset)); !os.IsNotExist(err) {
-		t.Error("a preset outlived its output")
+	for _, f := range []string{preset, presetRight} {
+		if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), f)); !os.IsNotExist(err) {
+			t.Errorf("%s outlived its output", f)
+		}
 	}
 }
 
@@ -403,6 +421,54 @@ func TestUserEQDB(t *testing.T) {
 	}
 	if _, err := buildRules(c); err == nil {
 		t.Error("an unknown filter type must be rejected")
+	}
+}
+
+// TestEQChannels: an entry can correct one ear apart from the other; an entry
+// without that keeps the single preset file.
+func TestEQChannels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	shared := []EQFilter{{Type: "PK", Fc: 1000, Gain: 2, Q: 1}}
+	plain := EQEntry{ID: "usb:1:2", Name: "Plain", Preamp: -2, Filters: shared}
+	graph, presets := correctionGraph(plain)
+	if len(presets) != 1 || strings.Contains(graph, "filename1") || strings.Contains(graph, "filename2") {
+		t.Errorf("plain entry: graph %s, %d presets", graph, len(presets))
+	}
+	if strings.Contains(correctionNote(plain), "ear") {
+		t.Errorf("plain entry: note %q", correctionNote(plain))
+	}
+
+	// An empty part is no part: no file, no key.
+	plain.Left = &EQChannel{}
+	if _, presets := correctionGraph(plain); len(presets) != 1 {
+		t.Errorf("an empty channel part wrote %d presets", len(presets))
+	}
+
+	both := plain
+	both.Left = &EQChannel{Preamp: -0.3}
+	both.Right = &EQChannel{Filters: []EQFilter{{Type: "LSC", Fc: 200, Gain: -1, Q: 0.7}}}
+	graph, presets = correctionGraph(both)
+	base := filepath.Join(eqDir(), "usb-1-2")
+	want := `config = { filename = "` + base + `.txt" filename1 = "` + base + `-left.txt" filename2 = "` + base + `-right.txt" }`
+	if !strings.Contains(graph, want) {
+		t.Errorf("graph %s\nwant %s", graph, want)
+	}
+	if len(graph) > maxGraph {
+		t.Errorf("graph is %d bytes", len(graph))
+	}
+	mustContain(t, "left", presets[base+"-left.txt"], "Preamp: -2.3 dB\n", "Filter 1: ON PK Fc 1000 Hz")
+	if strings.Contains(presets[base+"-left.txt"], "Filter 2") {
+		t.Error("the left ear got the right ear's filter")
+	}
+	mustContain(t, "right", presets[base+"-right.txt"], "Preamp: -2 dB\n", "Filter 2: ON LSC Fc 200 Hz Gain -1 dB Q 0.7\n")
+	if got := len(both.Filters); got != 1 {
+		t.Errorf("building the presets changed the entry: %d shared filters", got)
+	}
+
+	bad := `[{"id": "usb:1:2", "filters": [{"type": "PK", "fc": 1000, "gain": 2, "q": 1}],
+	          "right": {"filters": [{"type": "PK", "fc": 0, "gain": 1, "q": 1}]}}]`
+	if _, err := parseEQDB([]byte(bad), "test"); err == nil {
+		t.Error("a bad filter in a channel part must be rejected")
 	}
 }
 

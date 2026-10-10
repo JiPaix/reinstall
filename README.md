@@ -49,7 +49,9 @@ sound settings. A device whose model has a known correction EQ (an
 [AutoEq](https://autoeq.app/) preset that flattens what the manufacturer got
 wrong) also gets it automatically, before the voice equalizer. The known models
 are in [`audio/setup/eqdb.json`](audio/setup/eqdb.json); add your own in
-`~/.config/soundbar-setup/eqdb.json`, same format.
+`~/.config/soundbar-setup/eqdb.json`, same format. An entry can also correct one
+ear apart from the other (`left` / `right`: a preamp and filters added for that
+channel), for a headset whose two sides don't play at the same level.
 
 A small service on the local network reports whether one of the outputs (a
 soundbar, typically) is playing, and switches the equalizer on or off for every
