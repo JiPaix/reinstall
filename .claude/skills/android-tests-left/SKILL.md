@@ -27,6 +27,10 @@ Lenovo, an existing install then a re-run): every Android setting, sound, the se
 PC output and its measured latency; then for real `POST /display/moonlight` (stream up in
 ~3 s), `POST /display/homeassistant`, and the watcher (stream ordered, `systemctl --user
 restart sunshine` on the PC: Home Assistant back in front 7 s later, unasked).
+A tablet reboot with tablet-server (2026-10-12, `adb reboot`): SSH back after 106 s, then
+without a hand the player, PulseAudio and its TCP port, tablet-server (permissions still
+granted, battery protection still on), the dashboard in front ~2 min 20 after the reboot,
+this PC's output reconnected; both orders worked afterwards. adb was lost, as expected.
 
 ## Rules while testing
 
@@ -188,9 +192,3 @@ The allowed-IP prompts are JiPaix's to answer: ask him for both lists before sta
 Before the reset, save what a reset loses and the script doesn't put back: nothing on the
 tablet side is known to be in that case, but check `~/.termux/boot/10-dashboard` (the
 Home Assistant session's) and ask that session what it keeps there.
-
-## To do — after a tablet reboot
-
-Not done on 2026-10-12 (a reboot loses adb until Wireless debugging is switched on again
-by hand): check that `~/.termux/boot/20-tablet-server` brings tablet-server back, next to
-the player and sshd — `curl http://<tablet>:7923/state` from an allowed address.
