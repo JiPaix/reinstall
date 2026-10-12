@@ -1,6 +1,6 @@
 // Command soundbar-setup interactively picks what to do with each audio device
-// (hide it, default mic, output priority, per-output equalizer / channel swap /
-// keepalive) and renders the PipeWire/WirePlumber configs, the watcher service
+// (hide it, mic and output priority, per-output equalizer / channel swap /
+// keepalive and its tone) and renders the PipeWire/WirePlumber configs, the watcher service
 // and the status script from the embedded templates straight to their final
 // locations. A small vars.sh is staged for audio.sh to finish the install.
 package main
@@ -119,8 +119,8 @@ func confirmDevices(devs Devices, prev Choices) Devices {
 	}
 }
 
-// detected lists the outputs and mics found, plus the outputs only known from
-// the previous run.
+// detected lists the outputs and mics found, plus the ones only known from the
+// previous run.
 func detected(devs Devices, prev Choices) string {
 	var b strings.Builder
 	list := func(title string, items []string) {
@@ -143,6 +143,11 @@ func detected(devs Devices, prev Choices) string {
 	for _, p := range prev.Outputs {
 		if !hasDevice(devs.Sinks, p.Sink) {
 			absent = append(absent, p.Desc)
+		}
+	}
+	for _, p := range prev.Mics {
+		if !hasDevice(devs.Sources, p.Source) {
+			absent = append(absent, p.Desc+" (microphone)")
 		}
 	}
 	if len(absent) > 0 {
@@ -175,16 +180,24 @@ func runWizard(devs Devices, prev Choices) Choices {
 		}
 	}
 
-	// 2. Default microphone, among the sources still there.
+	// 2. Microphones, by priority, among the sources still there. As for the
+	// outputs below, one ranked last time but not connected now stays on offer.
 	var mics []Device
 	for _, s := range devs.Sources {
 		if !hidden[s.Card] {
 			mics = append(mics, s)
 		}
 	}
-	if mic, ok := pickDefaultSource(w, mics, prev); ok {
-		c.DefaultSource = mic.Name
-		c.DefaultDesc = mic.Desc
+	var micOrder []string
+	for _, p := range prev.Mics {
+		micOrder = append(micOrder, p.Source)
+		if !hasDevice(devs.Sources, p.Source) && !hidden[cardOf(p.Source, "")] {
+			mics = append(mics, Device{Name: p.Source, Desc: p.Desc, Absent: true})
+		}
+	}
+	for _, d := range rank(w, "Microphone priority",
+		"When several microphones are connected, the highest one is the default.", mics, micOrder) {
+		c.Mics = append(c.Mics, Mic{Source: d.Name, Desc: d.Desc})
 	}
 
 	// 3. Outputs, by priority.
@@ -204,16 +217,25 @@ func runWizard(devs Devices, prev Choices) Choices {
 	if len(outputs) == 0 {
 		fatalf("no output devices left after hiding")
 	}
-	for _, d := range rankOutputs(w, outputs, prev) {
+	var outputOrder []string
+	for _, p := range prev.Outputs {
+		outputOrder = append(outputOrder, p.Sink)
+	}
+	absent := map[string]bool{}
+	for _, d := range rank(w, "Output priority",
+		"When several outputs are connected, the highest one plays.", outputs, outputOrder) {
 		o := Output{Sink: d.Name, Desc: d.Desc, Model: d.Model, CardName: d.CardName}
 		if p, ok := prev.output(d.Name); ok {
 			o.EQ, o.Swap, o.Keepalive = p.EQ, p.Swap, p.Keepalive
+			o.ToneHz, o.ToneVol = p.ToneHz, p.ToneVol
 		}
+		absent[d.Name] = d.Absent
 		c.Outputs = append(c.Outputs, o)
 	}
 
-	// 4. Extras, then the curve the equalizers share.
+	// 4. Extras, each keepalive's tone, then the curve the equalizers share.
 	pickExtras(w, c.Outputs)
+	tuneKeepalive(w, c.Outputs, absent)
 	c.EQGains = prev.EQGains // kept for a later run even with no equalizer now
 	for _, o := range c.Outputs {
 		if o.EQ {
@@ -324,54 +346,26 @@ func deviceOptions(devs []Device) []huh.Option[string] {
 	return opts
 }
 
-// pickDefaultSource asks which mic becomes the default; apps that want another
-// one have to select it themselves. ok is false when there is nothing to pick
-// or the user leaves the choice to WirePlumber.
-func pickDefaultSource(w *wizard, mics []Device, prev Choices) (Device, bool) {
-	if len(mics) == 0 {
-		return Device{}, false
-	}
-	const none = "none"
-	v := "0"
-	if len(prev.Outputs) > 0 && prev.DefaultSource == "" {
-		v = none
-	}
-	for i, d := range mics {
-		if d.Name == prev.DefaultSource {
-			v = strconv.Itoa(i)
-		}
-	}
-	opts := append(deviceOptions(mics), huh.NewOption("No preference (leave it to WirePlumber)", none))
-	ask(huh.NewSelect[string]().
-		Title(w.title("Default microphone")).
-		Description("Apps use this one unless you pick another inside the app.").
-		Options(opts...).Value(&v))
-	if v == none {
-		return Device{}, false
-	}
-	return mics[atoi(v)], true
-}
-
-// rankOutputs orders the outputs, preferred first: the first one connected is
-// the one that plays.
-func rankOutputs(w *wizard, outputs []Device, prev Choices) []Device {
-	if len(outputs) == 1 {
-		return outputs
+// rank orders devices, preferred first: the first one connected is the one
+// that is used. prevOrder is the order of the previous run.
+func rank(w *wizard, title, hint string, devs []Device, prevOrder []string) []Device {
+	if len(devs) <= 1 {
+		return devs
 	}
 
-	// Same set of outputs as last time: offer to keep their order.
+	// Same set of devices as last time: offer to keep their order.
 	var kept []Device
-	for _, p := range prev.Outputs {
-		for _, d := range outputs {
-			if d.Name == p.Sink {
+	for _, name := range prevOrder {
+		for _, d := range devs {
+			if d.Name == name {
 				kept = append(kept, d)
 			}
 		}
 	}
-	if len(kept) == len(outputs) {
+	if len(kept) == len(devs) {
 		keep := true
 		ask(huh.NewConfirm().
-			Title(w.title("Output priority")).
+			Title(w.title(title)).
 			Description("Previous order, preferred first:\n" + numbered(deviceLabels(kept)) + "\nKeep it?").
 			Affirmative("Keep").Negative("Change").Value(&keep))
 		if keep {
@@ -380,12 +374,12 @@ func rankOutputs(w *wizard, outputs []Device, prev Choices) []Device {
 		w.step-- // the ranking below is the same step
 	}
 
-	title := w.title("Output priority")
-	remaining := append([]Device{}, outputs...)
+	title = w.title(title)
+	remaining := append([]Device{}, devs...)
 	var order []Device
 	for len(remaining) > 1 {
 		v := "0"
-		desc := "When several outputs are connected, the highest one plays."
+		desc := hint
 		if len(order) > 0 {
 			desc = "So far:\n" + numbered(deviceLabels(order))
 		}
@@ -525,12 +519,13 @@ func summary(c Choices) string {
 	for _, line := range outputLines(c) {
 		fmt.Fprintf(&b, "  %s\n", line)
 	}
-	mic := "left to WirePlumber"
-	if c.DefaultSource != "" {
-		mic = c.DefaultDesc
+	if len(c.Mics) > 0 {
+		b.WriteString("\nMicrophones, preferred first\n")
+		for i, m := range c.Mics {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, m.Desc)
+		}
 	}
-	fmt.Fprintf(&b, "\nDefault microphone: %s\n", mic)
-	fmt.Fprintf(&b, "Status server reports on: %s\n", c.StatusDesc)
+	fmt.Fprintf(&b, "\nStatus server reports on: %s\n", c.StatusDesc)
 	if n := len(c.DisabledCards) + len(c.DisabledBT); n > 0 {
 		fmt.Fprintf(&b, "Hidden devices: %d\n", n)
 	}

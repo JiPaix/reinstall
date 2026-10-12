@@ -9,16 +9,17 @@
 #   optional extras below, and the firewall.
 # - Each output picks its own extras in the wizard: equalizer, left/right swap
 #   (filter graphs on the device node itself, so no extra output shows up; a
-#   known model also gets its correction EQ that way) and keepalive tone
-#   (audio-watch.service, which also hands the default output back to the
-#   priority order whenever an output comes or goes).
+#   known model also gets its correction EQ that way) and keepalive tone, whose
+#   frequency and volume can be tuned by ear per output (audio-watch.service,
+#   which also hands the default output and microphone back to the priority
+#   order whenever one comes or goes).
 # - The equalizers are switched on and off together, at any time: `audio-eq
 #   on|off`, or POST /eq/on and /eq/off on the status server. Swaps stay.
 # - Optional: a root oneshot reconnects every paired Bluetooth device at boot.
 # - Optional MPD server on PipeWire, with a generated password.
 # - Microphones never suspend (no crackle at the start of a recording; the
-#   mic-wake unit opens them once per WirePlumber start), and the one picked in
-#   the wizard is pinned as the default source.
+#   mic-wake unit opens them once per WirePlumber start), and they are ranked
+#   in the wizard: the highest one connected is the default source.
 # =============================================================================
 
 set -e
@@ -730,7 +731,14 @@ echo -e "  Outputs, preferred first:"
 for line in "${OUTPUT_SUMMARY[@]}"; do
   echo -e "    ${CYAN}${line}${NC}"
 done
-if [ -n "${DEFAULT_SOURCE:-}" ]; then
+# A soundbar-setup from a Release that predates the mic ranking emits a single
+# DEFAULT_SOURCE instead of MIC_SUMMARY.
+if [ "${#MIC_SUMMARY[@]}" -gt 0 ]; then
+  echo -e "  Microphones, preferred first:"
+  for line in "${MIC_SUMMARY[@]}"; do
+    echo -e "    ${CYAN}${line}${NC}"
+  done
+elif [ -n "${DEFAULT_SOURCE:-}" ]; then
   echo -e "  Default mic:    ${CYAN}${DEFAULT_SOURCE_DESC}${NC} (${DEFAULT_SOURCE})"
 fi
 if [ "${HAS_EQ:-false}" = true ]; then

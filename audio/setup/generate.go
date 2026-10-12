@@ -37,10 +37,19 @@ type Output struct {
 	EQ        bool   `json:"eq"` // equalizable: follows `audio-eq on|off`
 	Swap      bool   `json:"swap"`
 	Keepalive bool   `json:"keepalive"`
+	// The keepalive tone, tuned by ear in the wizard; zero means the default.
+	ToneHz  int     `json:"tone_hz,omitempty"`
+	ToneVol float64 `json:"tone_vol,omitempty"` // percent, see toneVolume
 	// Model and CardName are kept so an output that is off during a re-run
 	// still gets its correction EQ (see eqdb.go).
 	Model    string `json:"model,omitempty"`
 	CardName string `json:"card_name,omitempty"`
+}
+
+// Mic is one ranked microphone.
+type Mic struct {
+	Source string `json:"source"`
+	Desc   string `json:"desc"`
 }
 
 // Effects names what was asked for the output, for the summaries.
@@ -64,8 +73,11 @@ type Choices struct {
 	StatusDesc    string   `json:"status_desc"`
 	DisabledBT    []string `json:"disabled_bt"`    // bluez_card.* names
 	DisabledCards []string `json:"disabled_cards"` // alsa_card.* names
-	DefaultSource string   `json:"default_source"` // pinned default mic, "" = leave it to WirePlumber
-	DefaultDesc   string   `json:"default_desc"`
+	Mics          []Mic    `json:"mics"`           // highest priority first
+	// Earlier versions pinned a single default mic; LoadChoices turns it into
+	// the first ranked one.
+	DefaultSource string `json:"default_source,omitempty"`
+	DefaultDesc   string `json:"default_desc,omitempty"`
 }
 
 func (c Choices) output(sink string) (Output, bool) {
@@ -88,25 +100,39 @@ func outputPrio(rank, count int) int {
 	return outputPrioBase + (count-1-rank)*outputPrioStep
 }
 
-// defaultSourcePrio outranks every source's stock priority.session (ALSA gives
-// USB mics ~2100), so the pinned mic wins whenever no default is configured.
-const defaultSourcePrio = 3000
+// micPrio spreads the ranked mics above every source's stock priority.session
+// (ALSA gives USB mics ~2100): the highest one connected is the default
+// whenever no default is configured.
+const (
+	micPrioBase = 3000
+	micPrioStep = 100
+)
 
-// EQBand, PriorityRule and Filter feed the templates.
+func micPrio(rank, count int) int {
+	return micPrioBase + (count-1-rank)*micPrioStep
+}
+
+// EQBand, PriorityRule and Tone feed the templates.
 type EQBand struct{ Label, Gain string }
 type PriorityRule struct {
 	Name string
 	Prio int
 }
+type Tone struct {
+	Sink   string
+	Hz     int
+	Volume string // ffmpeg volume factor
+}
 
 type tmplData struct {
 	ScriptsDir     string
 	MonitorSource  string
-	KeepaliveSinks []string
+	Keepalives     []Tone
 	EQSinks        []string // the equalized outputs, for audio-eq
 	EQParamsOn     string   // Props for pw-cli: the equalizer graph / none
 	EQParamsOff    string
 	RankedSinks    []string
+	RankedSources  []string
 	BTPriorities   []PriorityRule
 	ALSAPriorities []PriorityRule
 	DisabledBT     []string
@@ -139,6 +165,10 @@ func LoadChoices() Choices {
 	if json.Unmarshal(b, &c) != nil {
 		return Choices{}
 	}
+	if len(c.Mics) == 0 && c.DefaultSource != "" {
+		c.Mics = []Mic{{Source: c.DefaultSource, Desc: c.DefaultDesc}}
+	}
+	c.DefaultSource, c.DefaultDesc = "", ""
 	return c
 }
 
@@ -218,7 +248,7 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 			data.EQSinks = append(data.EQSinks, o.Sink)
 		}
 		if o.Keepalive {
-			data.KeepaliveSinks = append(data.KeepaliveSinks, o.Sink)
+			data.Keepalives = append(data.Keepalives, Tone{o.Sink, o.toneHz(), toneVolume(o.toneVol())})
 		}
 	}
 	if len(data.EQSinks) > 0 {
@@ -235,11 +265,15 @@ func Render(c Choices, stagingDir string) ([]string, error) {
 		}
 		data.EQParamsOn = eqProps(graph)
 	}
-	switch {
-	case strings.HasPrefix(c.DefaultSource, "bluez_input"):
-		data.BTPriorities = append(data.BTPriorities, PriorityRule{c.DefaultSource, defaultSourcePrio})
-	case strings.HasPrefix(c.DefaultSource, "alsa_input"):
-		data.ALSAPriorities = append(data.ALSAPriorities, PriorityRule{c.DefaultSource, defaultSourcePrio})
+	for i, m := range c.Mics {
+		rule := PriorityRule{m.Source, micPrio(i, len(c.Mics))}
+		switch {
+		case strings.HasPrefix(m.Source, "bluez_input"):
+			data.BTPriorities = append(data.BTPriorities, rule)
+		case strings.HasPrefix(m.Source, "alsa_input"):
+			data.ALSAPriorities = append(data.ALSAPriorities, rule)
+		}
+		data.RankedSources = append(data.RankedSources, m.Source)
 	}
 
 	jobs := []struct {
@@ -319,8 +353,11 @@ func writeVarsSh(path string, c Choices) error {
 	fmt.Fprintf(&b, "STATUS_DESC=%s\n", shQuote(c.StatusDesc))
 	fmt.Fprintf(&b, "HAS_BT=%t\n", hasBT)
 	fmt.Fprintf(&b, "HAS_EQ=%t\n", hasEQ)
-	fmt.Fprintf(&b, "DEFAULT_SOURCE=%s\n", shQuote(c.DefaultSource))
-	fmt.Fprintf(&b, "DEFAULT_SOURCE_DESC=%s\n", shQuote(c.DefaultDesc))
+	b.WriteString("MIC_SUMMARY=(")
+	for i, m := range c.Mics {
+		fmt.Fprintf(&b, " %s", shQuote(fmt.Sprintf("%d. %s", i+1, m.Desc)))
+	}
+	b.WriteString(" )\n")
 	b.WriteString("DISABLED_CARDS=(")
 	for _, card := range c.DisabledCards {
 		fmt.Fprintf(&b, " %s", shQuote(card))
@@ -347,7 +384,7 @@ func outputLines(c Choices) []string {
 			line += " (" + fx + ")"
 		}
 		if o.Keepalive {
-			line += " — keepalive"
+			line += " — keepalive " + toneLabel(o.toneHz(), o.toneVol())
 		}
 		lines[i] = fmt.Sprintf("%d. %s%s", i+1, line, correctionLabel(o))
 	}

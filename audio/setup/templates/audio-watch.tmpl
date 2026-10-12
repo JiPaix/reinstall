@@ -5,8 +5,11 @@
 #    equalizer lives on the device node, and goes with it);
 #  - plays the keepalive tone on the devices that asked for one, only while
 #    they are connected (some speakers power off after minutes of silence);
-#  - forgets a hand-picked default whenever a ranked output appears or
-#    disappears, so the priority order picks the output again.
+#  - forgets a hand-picked default whenever a ranked output or microphone
+#    appears or disappears, so the priority order picks again;
+#  - keeps the highest ranked microphone that is connected as the default one,
+#    at all times: a default picked by hand is put back at once (an app can
+#    still record from another microphone chosen in its own settings).
 
 export LC_ALL=C   # `pactl subscribe` is parsed below, and it is translated
 
@@ -16,36 +19,48 @@ EQ=(
 {{- end}}
 )
 KEEPALIVE=(
-{{- range .KeepaliveSinks}}
+{{- range .Keepalives}}
+  "{{.Sink}}"
+{{- end}}
+)
+# Each device's tone, as tuned in the wizard: frequency in Hz, ffmpeg volume.
+declare -A hz vol
+{{- range .Keepalives}}
+hz["{{.Sink}}"]={{.Hz}} vol["{{.Sink}}"]={{.Volume}}
+{{- end}}
+RANKED=(
+{{- range .RankedSinks}}
   "{{.}}"
 {{- end}}
 )
-RANKED=(
-{{- range .RankedSinks}}
+RANKED_MICS=(
+{{- range .RankedSources}}
   "{{.}}"
 {{- end}}
 )
 
 declare -A eq     # equalized devices there at the last pass
 declare -A tone   # device -> pid of its tone
-present=unset     # ranked outputs there at the last pass
+present=unset     # ranked outputs and mics there at the last pass
 
 alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
-# 18 kHz at 5%: enough signal to keep the device awake, nothing to hear.
-# dont-reconnect: the tone must never follow the streams to another output.
+# Enough signal to keep the device awake, nothing to hear (18 kHz at 5% unless
+# tuned). dont-reconnect: the tone must never follow the streams to another
+# output.
 start_tone() {
   pw-cat --playback --raw --format s16 --rate 44100 --channels 1 --target "$1" \
     -P '{ application.name = audio-keepalive node.name = audio-keepalive node.dont-reconnect = true }' - \
     < <(exec ffmpeg -nostdin -loglevel fatal \
-          -f lavfi -i "sine=frequency=18000:sample_rate=44100" -af volume=0.05 -f s16le -) &
+          -f lavfi -i "sine=frequency=${hz[$1]}:sample_rate=44100" -af "volume=${vol[$1]}" -f s16le -) &
   tone[$1]=$!
   echo "keepalive on $1"
 }
 
 reconcile() {
-  local sinks sink now=""
+  local sinks sources sink now=""
   sinks=$(pactl list short sinks | awk '{print $2}') || return
+  sources=$(pactl list short sources | awk '{print $2}') || return
 
   # Only a device that just appeared: setting the graph again on a playing one
   # reloads it.
@@ -73,10 +88,22 @@ reconcile() {
   for sink in "${RANKED[@]}"; do
     grep -qxF -- "$sink" <<<"$sinks" && now+="$sink "
   done
+  for sink in "${RANKED_MICS[@]}"; do
+    grep -qxF -- "$sink" <<<"$sources" && now+="$sink "
+  done
   if [ "$now" != "$present" ]; then
     wpctl clear-default
     present=$now
   fi
+
+  # RANKED_MICS is in priority order: the first one there is the default.
+  for sink in "${RANKED_MICS[@]}"; do
+    grep -qxF -- "$sink" <<<"$sources" || continue
+    if [ "$(pactl get-default-source)" != "$sink" ]; then
+      pactl set-default-source "$sink" && echo "default microphone: $sink"
+    fi
+    break
+  done
 }
 
 # Stopping the service must not leave a tone behind.
@@ -96,6 +123,8 @@ while :; do
   [ "$rc" -eq 0 ] || break   # event stream closed: pipewire-pulse went away
   case $line in
     *"'new' on sink #"*|*"'remove' on sink #"*) reconcile ;;
+    *"'new' on source #"*|*"'remove' on source #"*) reconcile ;;
+    *"'change' on server"*) reconcile ;;   # the default was changed
   esac
 done
 

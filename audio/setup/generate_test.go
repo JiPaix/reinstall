@@ -13,7 +13,7 @@ import (
 func sampleChoices() Choices {
 	return Choices{
 		Outputs: []Output{
-			{Sink: "bluez_output.AA_BB.1", Desc: `Sound "bar"`, EQ: true, Swap: true, Keepalive: true},
+			{Sink: "bluez_output.AA_BB.1", Desc: `Sound "bar"`, EQ: true, Swap: true, Keepalive: true, ToneHz: 12500, ToneVol: 2.5},
 			{Sink: "bluez_output.CC_DD.1", Desc: "Headset", Swap: true},
 			{Sink: "alsa_output.pci-0000_0b_00.1.analog-stereo", Desc: "Speakers"},
 		},
@@ -22,8 +22,10 @@ func sampleChoices() Choices {
 		StatusDesc:    `Sound "bar"`,
 		DisabledBT:    []string{"bluez_card.EE_FF"},
 		DisabledCards: []string{"alsa_card.usb-Webcam-02"},
-		DefaultSource: "alsa_input.usb-Mic-00.mono-fallback",
-		DefaultDesc:   "USB Mic's",
+		Mics: []Mic{
+			{Source: "alsa_input.usb-Mic-00.mono-fallback", Desc: "USB Mic's"},
+			{Source: "bluez_input.CC:DD", Desc: "Headset mic"},
+		},
 	}
 }
 
@@ -81,8 +83,9 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 		`device.profile = "off"`,
 		`node.name = "~alsa_input.*"`, // mics never suspend
 		`session.suspend-timeout-seconds = 0`,
-		`node.name = "alsa_input.usb-Mic-00.mono-fallback"`, // pinned default mic
-		`priority.session = 3000`,
+		// Mics are ranked like the outputs, above every stock priority.
+		"node.name = \"alsa_input.usb-Mic-00.mono-fallback\" }]\n    actions = { update-props = { priority.session = 3100 } }",
+		"node.name = \"bluez_input.CC:DD\" }]\n    actions = { update-props = { priority.session = 3000 } }",
 	)
 	if strings.Contains(wp, "default-policy.move") {
 		t.Error("default-policy.move is the WirePlumber 0.4 name; 0.5 ignores it")
@@ -113,6 +116,12 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 	mustContain(t, "audio-watch", watch,
 		"EQ=(\n  \"bluez_output.AA_BB.1\"\n)",
 		"KEEPALIVE=(\n  \"bluez_output.AA_BB.1\"\n)",
+		`hz["bluez_output.AA_BB.1"]=12500 vol["bluez_output.AA_BB.1"]=0.025`, // its own tone
+		`sine=frequency=${hz[$1]}:sample_rate=44100`,
+		"RANKED_MICS=(\n  \"alsa_input.usb-Mic-00.mono-fallback\"\n  \"bluez_input.CC:DD\"\n)",
+		`'new' on source #`,
+		`pactl set-default-source "$sink"`, // the top ranked mic there is forced
+		`'change' on server`,
 		"RANKED=(\n  \"bluez_output.AA_BB.1\"\n  \"bluez_output.CC_DD.1\"\n  \"alsa_output.pci-0000_0b_00.1.analog-stereo\"\n)",
 		`/.local/bin/audio-eq apply "$sink"`,
 	)
@@ -139,12 +148,11 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 		`HAS_EQ=true`,
 		`STATUS_SINK='bluez_output.AA_BB.1'`,
 		`STATUS_DESC='Sound "bar"'`,
-		`'1. Sound "bar" (EQ + L/R swapped) — keepalive'`,
+		`'1. Sound "bar" (EQ + L/R swapped) — keepalive 12.5 kHz at 2.5 %'`,
 		`'2. Headset (L/R swapped)'`,
 		`'3. Speakers'`,
 		`DISABLED_CARDS=( 'alsa_card.usb-Webcam-02' )`,
-		`DEFAULT_SOURCE='alsa_input.usb-Mic-00.mono-fallback'`,
-		`DEFAULT_SOURCE_DESC='USB Mic'\''s'`,
+		`MIC_SUMMARY=( '1. USB Mic'\''s' '2. Headset mic' )`,
 	)
 }
 
@@ -162,7 +170,7 @@ func TestRenderPlainOutput(t *testing.T) {
 	}
 	mustContain(t, "audio-watch", home(".local/bin/audio-watch"), "EQ=(\n)", "KEEPALIVE=(\n)")
 	mustContain(t, "audio-eq", home(".local/bin/audio-eq"), "OUTPUTS=(\n)")
-	mustContain(t, "vars.sh", staged("vars.sh"), `HAS_BT=false`, `HAS_EQ=false`, `DISABLED_CARDS=( )`, `DEFAULT_SOURCE=''`)
+	mustContain(t, "vars.sh", staged("vars.sh"), `HAS_BT=false`, `HAS_EQ=false`, `DISABLED_CARDS=( )`, `MIC_SUMMARY=( )`)
 
 	wp := home(".config/wireplumber/wireplumber.conf.d/99-device-priorities.conf")
 	mustContain(t, "wireplumber", wp, `node.name = "~alsa_input.*"`, `priority.session = 2000`)
@@ -240,11 +248,25 @@ func TestChoicesRoundTrip(t *testing.T) {
 
 	got := LoadChoices()
 	if len(got.Outputs) != len(c.Outputs) || got.StatusSink != c.StatusSink ||
-		got.DefaultSource != c.DefaultSource || len(got.DisabledBT) != 1 {
+		len(got.Mics) != 2 || got.Mics[0] != c.Mics[0] || len(got.DisabledBT) != 1 {
 		t.Fatalf("round trip lost data: %+v", got)
 	}
-	if o, ok := got.output("bluez_output.AA_BB.1"); !ok || !o.EQ || !o.Swap || !o.Keepalive || len(got.EQGains) != len(eqBandLabels) {
+	if o, ok := got.output("bluez_output.AA_BB.1"); !ok || !o.EQ || !o.Swap || !o.Keepalive || len(got.EQGains) != len(eqBandLabels) ||
+		o.ToneHz != 12500 || o.ToneVol != 2.5 {
 		t.Errorf("soundbar extras not restored: %+v", o)
+	}
+
+	// The single default mic of earlier versions becomes the first ranked one.
+	if err := os.WriteFile(choicesPath(), []byte(`{"outputs":[{"sink":"s","keepalive":true}],"default_source":"alsa_input.x","default_desc":"Old mic"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := LoadChoices()
+	if len(old.Mics) != 1 || old.Mics[0] != (Mic{"alsa_input.x", "Old mic"}) || old.DefaultSource != "" {
+		t.Errorf("default mic not migrated: %+v", old)
+	}
+	// …and an output that was never tuned plays the default tone.
+	if o := old.Outputs[0]; o.toneHz() != defaultToneHz || o.toneVol() != defaultToneVol {
+		t.Errorf("untuned output: got %d Hz at %g %%", o.toneHz(), o.toneVol())
 	}
 
 	t.Setenv("HOME", t.TempDir())
