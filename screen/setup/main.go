@@ -91,15 +91,39 @@ func detect(backend string) []Connector {
 // confirmScreens shows what was detected before any question depends on it,
 // and looks again on request: a TV that is off (and not pinned) isn't listed,
 // and can be switched on without starting over.
+//
+// A single screen is refused: there is nothing to switch between, and the
+// engine tells the modes apart by which primary is lit, so with the same
+// screen in both it would report "tv" whatever is applied. Looking again stays
+// possible, the second screen often being that TV. The default is to quit: at
+// end of input a prompt takes its default, and "look again" would loop forever.
 func confirmScreens(backend string, conns []Connector) []Connector {
 	const (
 		cont = "continue"
 		scan = "scan"
+		quit = "quit"
 	)
 	for {
 		var b strings.Builder
 		for _, c := range conns {
 			fmt.Fprintf(&b, "  • %s — %s\n", c.Label(), c.DefaultMode().Spec())
+		}
+		if len(conns) < 2 {
+			b.WriteString("\nswapscreen switches between screens and needs at least two.\n" +
+				"A screen that is off may be missing: switch it on, then look again.")
+			v := quit
+			ask(huh.NewSelect[string]().
+				Title("Only one screen detected").
+				Description(b.String()).
+				Options(
+					huh.NewOption("Look again (after switching on or plugging in a screen)", scan),
+					huh.NewOption("Quit", quit),
+				).Value(&v))
+			if v == quit {
+				fatalf("only one screen detected — at least two are needed")
+			}
+			conns = detect(backend)
+			continue
 		}
 		b.WriteString("\nA screen that is off may be missing: switch it on, then look again.")
 		v := cont
