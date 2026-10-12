@@ -217,15 +217,49 @@ gotchas below.
 
 ### Android tablet
 
-- `android.sh` has no Release download and no Go: adb and ssh against a tablet (F-Droid,
-  then Termux + Termux:Boot installed over adb with `-i org.fdroid.fdroid` so they count as
-  F-Droid installs, squeezelite + PulseAudio on TCP 4713; the KISS launcher becomes the home
-  screen only when the script is what installs it), then a PC-side
-  `tablet-sink@<slug>.service` (`pipewire -c ~/.config/tablet-sink/<slug>.conf`, a pulse-tunnel
-  client of its own so the session's PipeWire is never restarted). On the tablet it owns
-  only `~/.termux/boot/start-squeezelite` and `$PREFIX/etc/pulse/default.pa.d/50-reinstall.pa`;
-  `00-sshd` is created only when missing. `10-dashboard`, the Home Assistant app and what
-  switches apps on the tablet belong to the Home Assistant session's config — never touch.
+- `android.sh` works by adb and ssh against a tablet, and has no wizard. What the tablet
+  does is chosen per run, four components: music player (squeezelite), network audio
+  (PulseAudio on TCP 4713), Home Assistant, Moonlight. Over adb it installs F-Droid, then
+  Termux, Termux:Boot and Termux:API with `-i org.fdroid.fdroid` so they count as F-Droid
+  installs; the KISS launcher becomes the home screen only when the script is what installs
+  it. PC side: `tablet-sink@<slug>.service` (`pipewire -c ~/.config/tablet-sink/<slug>.conf`,
+  a pulse-tunnel client of its own so the session's PipeWire is never restarted), only with
+  network audio and asked. On the tablet it owns `~/.termux/boot/start-squeezelite` (also the
+  boot script when there is no player: PulseAudio and its watchdog),
+  `$PREFIX/etc/pulse/default.pa.d/50-reinstall.pa`, `~/.termux/boot/20-tablet-server`,
+  `~/.local/bin/tablet-server{,-run}` and `~/.config/tablet-server/server.env` (its own
+  answers, read back as the next run's defaults); `00-sshd` is created only when missing.
+  `10-dashboard` and the Home Assistant app's own settings belong to the Home Assistant
+  session's config — never touch. Home Assistant and Moonlight themselves are installed and
+  signed in by hand (Play Store, accounts, the Sunshine PIN): a prerequisite, not a step.
+- `tablet-server` (`tablet/`, stdlib-only like `power/`, built `GOOS=android GOARCH=arm64`
+  with no cgo — the `linux` build doesn't answer in Termux) is the one Release asset of
+  `android.sh`, or built with `--local`. Port 7923, same `ALLOWED_IPS`/`AUTH_TOKEN`
+  middleware as the PC's three; the script sets an allowlist only (Home Assistant is to need
+  nothing but the address) and adds 127.0.0.1 to check it from the tablet. `GET
+  /capabilities`, `GET /state` (display / screen / battery), `POST
+  /display/{homeassistant,moonlight}`. It runs as Termux, which sees nothing of the screen
+  until adb grants it `DUMP` **and** `PACKAGE_USAGE_STATS` (`dumpsys activity activities`
+  wants both; `window` and `battery` stay unreachable, hence Termux:API for the battery).
+  "moonlight" means the stream: `com.limelight/.Game` on top *and* focused — Moonlight's
+  error box ("connection terminated", after any Sunshine restart) sits on that same activity
+  and only the focus tells. Its watcher brings Home Assistant back when a stream ends unasked
+  or an ordered one never comes up (45 s); a focus lost for under ~8 s is ignored (system
+  panels). Nothing in it talks to the PC, and the Sunshine session is left paused on purpose
+  (closing it on a client's departure would cut other clients). Termux traps: `am start`
+  exits 1 with a stack trace after starting the activity all right — judge by the screen;
+  `pkill -x` compares with the command as typed, so the server is started by its bare name;
+  a boot script must return (the server's loop is a script of its own, started with
+  `setsid`); Termux can't wake the screen, stop another app or read `/sys` power files.
+- Moonlight on command needs the PC's id and the app's: `sunshine_uuid` reads
+  `~/.config/sunshine/sunshine_state.json`, `sunshine_app_id` computes Sunshine's own id
+  (CRC32 of the name + the SHA-256 of its image, as a positive int32 — `gzip | tail -c8` for
+  the CRC). Both extras go to `ShortcutTrampoline` as strings; without `AppId` Moonlight
+  opens its app list. Moonlight has no intent or setting to quit a stream.
+- The tablet's name is asked once and is its player, its PC output and its page in Home
+  Assistant (`<dashboard>/<slug>`; `HA_PAGE=…` in the environment points elsewhere).
+  `TABLET_ID` is its serial number where adb reads it, kept across runs. `--rename` still
+  renames the player or the PC output alone, not that name.
 - Channels: adb can't reach Termux's files (`run-as` fails) nor send `RUN_COMMAND` (the shell
   user lacks the permission), so a fresh install pushes a script to `/sdcard/Download` and
   *types* `sh …` into the Termux window; everything after goes over SSH (8022). That
@@ -238,9 +272,14 @@ gotchas below.
   one. An unpaired PC gets a plain "failed to connect", never "unauthorized": when the port
   is announced yet refuses, `pair_adb` finds the pairing port the same way and asks for the
   code. A re-run without adb only skips
-  the Android settings step.
-- `android.sh` without an option opens on a menu of its four modes (`--full`, `--add-pc`,
-  `--pc-only`, `--rename` skip it; end of input at the menu quits). Its main flow is the
+  the Android settings step. `pkg install` can fail on a tablet whose Termux mirror
+  throttles (429): `tablet_pkg` then installs from `packages.termux.dev` for that once,
+  without touching `sources.list`.
+- `android.sh` without an option opens on a menu by category — on a tablet: install or
+  reconfigure, rename its player; on this PC: use a tablet as output, rename that output
+  (`--full`, `--this-pc`, `--add-pc`, `--pc-only`, `--rename` skip it; end of input at the
+  menu quits). `--this-pc` is `--add-pc` when the tablet answers on SSH, else `--pc-only`.
+  A full run asks everything (`choose_setup`) before it changes anything. Its main flow is the
   body of `setup_one_tablet`, left at the margin, so that the end of the script can offer
   another tablet; an `exit` anywhere in it still ends the run. Every mode that writes
   the PC-side output ends by measuring `pulse.latency` itself (STEP 9), no ear needed: a

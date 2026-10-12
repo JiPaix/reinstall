@@ -2,8 +2,8 @@
 
 Personal setup scripts to get a freshly installed machine back to my preferred
 display, audio and session configuration in one command each — plus one that
-sets up an Android tablet as a network speaker. Built for Arch-based
-systems (pacman / paru / yay) running PipeWire.
+sets up an Android tablet as a network speaker and a Home Assistant screen.
+Built for Arch-based systems (pacman / paru / yay) running PipeWire.
 
 Each command walks you through a short interactive setup. Screen and audio also
 download a prebuilt helper and install a small background service. No toolchain
@@ -117,9 +117,13 @@ it after every boot.
 > fixed IP in your router. The script starts by listing these steps, and pairs
 > with Android's Wireless debugging itself: you only read it the code. No root.
 
-Turns an Android tablet into a network speaker. Over adb, with nothing to tap on
-the tablet, it installs F-Droid, then [Termux](https://termux.dev/) and
-Termux:Boot as F-Droid apps, and the light KISS launcher as home screen. It then starts
+Sets up an Android tablet that stays on its charger: a network speaker, and a
+screen Home Assistant can switch between its dashboard and a stream of your PC.
+You choose what it does: music player, network audio, Home Assistant, Moonlight.
+
+Over adb, with nothing to tap on the tablet, it installs F-Droid, then
+[Termux](https://termux.dev/), Termux:Boot and Termux:API as F-Droid apps, and
+the light KISS launcher as home screen. As a music player, it starts
 [squeezelite](https://github.com/ralph-irving/squeezelite) at every boot, so the
 tablet shows up as a player in Lyrion or Music Assistant. It also sets a few
 things on the tablet so the player isn't put to sleep.
@@ -134,24 +138,35 @@ holds without dropping out more than a long one does.
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/android.sh)
 ```
 
-Run like this it opens on a menu: full install, add this PC, this PC only,
-rename. The options below go straight to one of them (`--full` for the first).
-When a tablet is done, it offers to set up another one.
+Run like this it opens on a menu: on a tablet, install or reconfigure it, or
+rename its music player; on this PC, use a tablet as an audio output, or rename
+that output. When a tablet is done, it offers to set up another one.
 
-To use a tablet that is already set up from another PC — it asks which addresses
-to add to the tablet's allowed ones, then adds the output on that PC:
+For Home Assistant and Moonlight, install both apps on the tablet yourself and
+sign in (Moonlight connected once to your PC): the setup does the rest. It
+leaves a small server on the tablet for Home Assistant to talk to, port 7923:
+
+| Request | Answer |
+| --- | --- |
+| `GET /capabilities` | the tablet's name, model, id and what it was set up to do |
+| `GET /state` | `{ "display": "homeassistant", "screen_on": true, "battery": { "level": 48, … } }` |
+| `POST /display/moonlight` | starts the stream of your PC's desktop |
+| `POST /display/homeassistant` | back to the tablet's page of your dashboard |
+
+`display` is `homeassistant`, `moonlight` (the stream is running) or `other`.
+When a stream stops on its own — the PC restarted its streaming server, say —
+the tablet goes back to Home Assistant by itself. You choose which addresses may
+give it orders.
+
+On another PC, for a tablet that is already set up — it allows that PC on the
+tablet if needed, then adds the output there:
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/android.sh) --add-pc
+bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/android.sh) --this-pc
 ```
 
-That PC reaches the tablet over SSH; if its key isn't known there yet, it needs
-adb once, like a first install. With `--pc-only` instead, the tablet isn't
-touched at all (the PC must already be allowed).
-
-To rename a tablet, on the PC, as a player in your music server, or both, add
-`--rename`: it lists the installed tablets and loops until you exit. Without a
-terminal: `--rename <tablet IP or current name> <local|player|both> <new name>`.
+To rename without the menu: `--rename <tablet IP or current name>
+<local|player|both> <new name>`.
 
 Running it again starts from the tablet's current settings, and works over SSH
 when adb is no longer connected.

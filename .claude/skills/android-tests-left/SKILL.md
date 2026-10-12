@@ -22,7 +22,11 @@ network audio, sshd, Android settings all come back), the Wireless-debugging por
 the Bluetooth-off fallback to the local output, the audio wizard hiding network outputs.
 Wireless-debugging pairing (2026-10-12, on a phone that had been unpaired: connection port
 and pairing port found over mDNS, `adb pair`, then connected — only the final `adb tcpip`
-was held back).
+was held back). The component-based full run with tablet-server (2026-10-12, twice on the
+Lenovo, an existing install then a re-run): every Android setting, sound, the server, the
+PC output and its measured latency; then for real `POST /display/moonlight` (stream up in
+~3 s), `POST /display/homeassistant`, and the watcher (stream ordered, `systemctl --user
+restart sunshine` on the PC: Home Assistant back in front 7 s later, unasked).
 
 ## Rules while testing
 
@@ -37,13 +41,20 @@ was held back).
   write. That is how `soundbar-setup` once rewrote the real audio config during a test.
   To stop a run early, feed the explicit "Stop" answer, or test a copy with an `exit`
   inserted before the first write.
-- To answer prompts from a pipe: `printf 'a\nb\n' | ./android.sh --full`. Without an option
-  the script opens on a menu (1 full, 2 add this PC, 3 this PC only, 4 rename, 0 quit).
+- To answer prompts from a pipe: `printf 'a\nb\n' | ./android.sh --full --local`
+  (`--local` builds tablet-server from the checkout; without it the Release must have it).
+  Without an option the script opens on a menu (1 install or reconfigure, 2 rename the
+  player, 3 use a tablet as output of this PC, 4 rename that output, 0 quit).
   Order for a full run: Enter (prerequisites screen), tablet IP, reconfigure/stop (only if
-  something is installed), player name, music server, MAC, allowed IPs. The latency
-  measurement at the end asks nothing (silent, a few minutes; `TUNNEL_LATENCY_MS=<ms>`
-  skips it). Last prompt of every run: "Set up another tablet?" — `n`, or end of input,
-  quits; `y` starts over (at the menu when no option was given).
+  something is installed), components (Enter = what is there), tablet name, then per
+  component — music server and MAC; network audio's allowed IPs; the dashboard (not asked
+  with `HA_PAGE=…` set); Enter at the Moonlight pairing prompt (first time only) — then
+  tablet-server's allowed IPs, and "output of this PC?" (Enter = yes). The latency
+  measurement asks nothing (silent, a few minutes; `TUNNEL_LATENCY_MS=<ms>` skips it).
+  Last prompt of every run: "Set up another tablet?" — `n`, or end of input, quits.
+  The two real runs of 2026-10-12 on the Lenovo used:
+  `printf '\n\n1\n\n\n\n\n<audio IPs>\n\n<server IPs>\n\nn\n' | HA_PAGE=… ./android.sh --full --local`
+  (one `\n` less on a re-run: no pairing prompt).
 
 ## 1. First install on a fresh tablet
 
@@ -154,3 +165,32 @@ and 4 GB as the Lenovo, Android 14, MagicOS 8):
   Assistant app must be exempt or the player and the orders stop. Whether adb can set it is
   unknown: look for the setting first, else tell the user to do it in "Before You Start".
 
+## To do — a full run from a factory-reset tablet
+
+Wanted by JiPaix (2026-10-12): reset the Lenovo, then install it from A to Z, to prove the
+first-install path (section 1) and that nothing depends on what was set up by hand before.
+It wipes the tablet: his decision, and his to start.
+
+What needs him, at the tablet, for about a quarter of an hour:
+- Android's own first-boot setup (Wi-Fi, Google account), no lock screen;
+- Developer options, Wireless debugging on — then reading out the pairing code when the
+  script asks for it (the only thing the script can't see);
+- the router's DHCP reservation: Android draws a new random MAC for the network after a
+  reset, so the tablet's address changes unless the reservation is redone (the script
+  prints the new MAC once adb is connected);
+- Home Assistant and Moonlight from the Play Store, signed in, the wake word switched on,
+  and Moonlight paired with Sunshine (PIN typed in Sunshine's web page on the PC).
+
+What Claude can then do alone, tablet untouched: run `./android.sh --full --local` with
+the answers above, watch "Installing Termux" through adb screenshots (`adb exec-out
+screencap -p`), and run the checks of the 2026-10-12 runs (both orders, the watcher).
+The allowed-IP prompts are JiPaix's to answer: ask him for both lists before starting.
+Before the reset, save what a reset loses and the script doesn't put back: nothing on the
+tablet side is known to be in that case, but check `~/.termux/boot/10-dashboard` (the
+Home Assistant session's) and ask that session what it keeps there.
+
+## To do — after a tablet reboot
+
+Not done on 2026-10-12 (a reboot loses adb until Wireless debugging is switched on again
+by hand): check that `~/.termux/boot/20-tablet-server` brings tablet-server back, next to
+the player and sshd — `curl http://<tablet>:7923/state` from an allowed address.
