@@ -2,7 +2,8 @@
 # =============================================================================
 # Android Tablet Audio Player Setup Script
 # - Turns an Android tablet (adb debugging on, no root) into a network audio
-#   player: Termux + Termux:Boot from F-Droid, squeezelite started at boot
+#   player: F-Droid, then Termux + Termux:Boot as F-Droid installs (over adb,
+#   nothing to tap), the KISS launcher as home screen, squeezelite started at boot
 #   towards a Lyrion / Music Assistant server, and the tablet's PulseAudio
 #   opened on TCP so a PC can use the tablet as an audio output.
 # - Then makes the tablet an output of THIS PC: a small PipeWire client
@@ -16,6 +17,10 @@
 # - SSH: this PC's public key (~/.ssh/id_ed25519.pub, else id_rsa.pub) is
 #   authorized in Termux by the first-install step, whenever SSH doesn't
 #   answer yet — including on a tablet another PC set up.
+# - A run ends by offering to set up another tablet (back to the menu).
+# - Run without an option, it opens on a menu of the four things it can do; an
+#   option skips the menu:
+# - `--full`: everything above.
 # - `--add-pc`: for another PC, on a tablet that is already set up: asks which
 #   addresses to add to the tablet's allowlist (duplicates ignored, nothing
 #   else on the tablet is touched), then makes it an output of this PC.
@@ -24,6 +29,9 @@
 #   --rename <tablet IP or current name> <local|player|both> <new name>.
 # - `--pc-only`: don't touch the tablet at all (this PC must already be
 #   allowed), only make it an output of this PC.
+# - Whenever it makes the tablet an output of this PC, it ends by measuring
+#   the shortest delay the link holds without a dropout (each PC has its own).
+#   Nothing to listen to: silence is played and the link counts its dropouts.
 # =============================================================================
 
 set -e
@@ -32,8 +40,11 @@ PC_ONLY=false
 ADD_PC=false
 RENAME=false
 RENAME_ARGS=()
+MODE_GIVEN=false   # no option: the menu asks
 while [ $# -gt 0 ]; do
+  MODE_GIVEN=true
   case "$1" in
+    --full) ;;
     --pc-only) PC_ONLY=true ;;
     --add-pc) ADD_PC=true ;;
     --rename) RENAME=true; shift; RENAME_ARGS=("$@"); break ;;
@@ -56,9 +67,16 @@ SINK_CONFIG_DIR="$HOME/.config/tablet-sink"
 ADB_PORT="${ADB_PORT:-5555}"
 SSH_PORT=8022     # Termux's sshd default
 PULSE_PORT=4713   # module-native-protocol-tcp default
-# End-to-end buffer the tunnel aims for. 20 ms played clean on Wi-Fi in a short
-# test; 40 leaves some margin. Raise it if the sound crackles.
-TUNNEL_LATENCY_MS="${TUNNEL_LATENCY_MS:-40}"
+# Buffer the tunnel aims for, in ms: what absorbs the Wi-Fi's jitter between
+# this PC and the tablet. Too low and the sound crackles. STEP 9 measures the
+# shortest one the link holds, among LATENCY_STEPS; set TUNNEL_LATENCY_MS to
+# impose a value instead. (The tablet's own buffer, ~16 ms, comes on top and
+# has no setting: the AAudio sink already asks Android for its low-latency
+# mode, and its latency= option only changes what it reports.)
+DEFAULT_LATENCY_MS=40
+LATENCY_STEPS=(20 30 40 60 80 100 150 200)
+TUNNEL_LATENCY_MS="${TUNNEL_LATENCY_MS:-}"
+PROBE_SECS=60
 
 TERMUX_PREFIX=/data/data/com.termux/files/usr
 BOOTSTRAP_SCRIPT=/sdcard/Download/reinstall-bootstrap.sh
@@ -116,6 +134,49 @@ tablet_ssh_in() {
   ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
     -p "$SSH_PORT" "$TABLET_IP" "$@"
 }
+
+# Charge protection per tablet model: the `settings` writes that keep a tablet
+# left on its charger from sitting at 100 % (each maker has its own, none is
+# standard Android). Add a model: one more case, after reading its settings
+# with `settings list global|system|secure`.
+battery_protection() {  # $1 = ro.product.model
+  case "$1" in
+    # Holds the battery around 50 %; obeyed within seconds (dumpsys battery
+    # goes from "charging" to "not charging").
+    "Lenovo TB128FU") echo "settings put global battery_protected_charge 1" ;;
+  esac
+}
+
+# Installs a package from F-Droid's repository over adb, unless `$installed`
+# (the tablet's package list) already has it: 0 = installed now, 1 = was there.
+# Nothing is tapped on the tablet. Everything but F-Droid itself is recorded as
+# installed by F-Droid (`-i`), which is all that picking it in the F-Droid app
+# would have left behind: same APK, same signature, and F-Droid lists it and
+# offers its updates.
+FDROID=org.fdroid.fdroid
+fdroid_install() {  # $1 = package
+  local pkg="$1" code flags=()
+  if grep -qx "package:$pkg" <<<"$installed"; then
+    print_ok "$pkg already installed"
+    return 1
+  fi
+  code="$(curl -fsSL --proto '=https' --tlsv1.2 "https://f-droid.org/api/v1/packages/$pkg" |
+    sed -n 's/.*"suggestedVersionCode":\([0-9]*\).*/\1/p')"
+  if [ -z "$code" ]; then
+    print_error "Couldn't read $pkg's version from F-Droid."
+    exit 1
+  fi
+  print_info "Downloading $pkg ($code) from F-Droid"
+  curl -fSL --proto '=https' --tlsv1.2 "https://f-droid.org/repo/${pkg}_${code}.apk" -o "$WORK/$pkg.apk" || exit 1
+  [ "$pkg" = "$FDROID" ] || flags=(-i "$FDROID")
+  adb_ install "${flags[@]}" "$WORK/$pkg.apk" >/dev/null || { print_error "adb couldn't install $pkg"; exit 1; }
+  print_ok "Installed $pkg"
+}
+
+# The launcher a tablet that only does this gets: KISS, a search box and
+# nothing else to draw or keep in memory.
+LAUNCHER=fr.neamar.kiss
+LAUNCHER_HOME="$LAUNCHER/.MainActivity"
 
 # Apps disabled per tablet model (`pm disable-user`: reversible with `pm enable`,
 # data kept). Preloads plus apps their owner doesn't use there; a package that
@@ -187,31 +248,92 @@ EOF
 # that instead of failing, whatever the route (first install or --add-pc).
 adb_state() { adb devices | awk -v d="$1" '$1 == d { print $2 }'; }
 
+# Android's Wireless debugging announces itself on the network (mDNS): its
+# connection port, and its pairing port for as long as the pairing dialog is
+# open. Echoes that port, or nothing (no avahi-browse, nothing announced).
+adb_mdns_port() {  # $1 = connect|pairing
+  command -v avahi-browse &>/dev/null || return 0
+  timeout 8 avahi-browse -rtp "_adb-tls-$1._tcp" 2>/dev/null |
+    awk -F';' -v ip="$TABLET_IP" '$1 == "=" && $8 == ip { print $9; exit }'
+}
+
+# Wireless debugging only talks to a PC it was paired with, and refuses the
+# others outright (no dialog, no "unauthorized"). Pairing takes a code the
+# tablet shows: the one thing here that has to be read on its screen.
+pair_adb() {  # → 0 once paired
+  local port="" code out waited=0 try
+  print_warn "Wireless debugging is on, but this PC was never paired with the tablet"
+  print_info "On the tablet: Developer options > Wireless debugging > Pair device with pairing code."
+  print_info "Leave that dialog open: it shows a 6-digit code, and an address ending in :<port>."
+  if command -v avahi-browse &>/dev/null; then
+    print_info "Waiting for the dialog…"
+    while [ -z "$port" ] && [ "$waited" -lt 90 ]; do
+      port="$(adb_mdns_port pairing)"
+      [ -n "$port" ] || { sleep 2; waited=$((waited + 10)); }
+    done
+  fi
+  if [ -n "$port" ]; then
+    print_ok "Pairing dialog found (port $port)"
+  else
+    read -rp "Pairing port shown on the tablet (blank = give up): " port || return 1
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  for try in 1 2 3; do
+    read -rp "Pairing code (blank = give up): " code || return 1
+    code="${code//[^0-9]/}"
+    [ -n "$code" ] || return 1
+    out="$(timeout 30 adb pair "$TABLET_IP:$port" "$code" 2>&1)" || true
+    if [[ "$out" == *"Successfully paired"* ]]; then
+      print_ok "Paired with the tablet"
+      return 0
+    fi
+    print_warn "Pairing failed: $(tail -n 1 <<<"$out")"
+  done
+  return 1
+}
+
 connect_adb() {
-  local target="$TABLET_IP:$ADB_PORT" state waited=0 port
+  local target="$TABLET_IP:$ADB_PORT" state waited=0 port ports tls_port
   adb connect "$target" &>/dev/null || true
   state="$(adb_state "$target")"
 
   # Nothing on the fixed port: after a tablet reboot only Android's "Wireless
-  # debugging" may be on, and it listens on a random port each time. Look for
-  # it among the open high ports (a few seconds), then use it to put adb back
-  # on the fixed port.
+  # debugging" may be on, and it listens on a random port each time. It
+  # announces that port; without the announcement, look for it among the open
+  # high ports (a few seconds). Then use it to put adb back on the fixed port.
   if [ "$state" != device ] && [ "$state" != unauthorized ]; then
     adb disconnect "$target" &>/dev/null || true
     # A tablet that is off would cost over a minute of connection timeouts.
     ping -c 1 -W 2 "$TABLET_IP" &>/dev/null || return
     print_info "adb doesn't answer on port $ADB_PORT — looking for Wireless debugging…"
-    for port in $(seq 30000 60999 | xargs -P 200 -I{} bash -c \
-        "timeout 0.5 bash -c '</dev/tcp/$TABLET_IP/{}' 2>/dev/null && echo {}"); do
-      timeout 10 adb connect "$TABLET_IP:$port" &>/dev/null || true
-      state="$(adb_state "$TABLET_IP:$port")"
-      if [ "$state" = device ] || [ "$state" = unauthorized ]; then
-        target="$TABLET_IP:$port"
-        print_ok "Wireless debugging found on port $port"
-        break
+    tls_port="$(adb_mdns_port connect)"
+    ports="$tls_port"
+    [ -n "$ports" ] || ports="$(seq 30000 60999 | xargs -P 200 -I{} bash -c \
+        "timeout 0.5 bash -c '</dev/tcp/$TABLET_IP/{}' 2>/dev/null && echo {}")"
+    try_ports() {
+      for port in $ports; do
+        timeout 10 adb connect "$TABLET_IP:$port" &>/dev/null || true
+        state="$(adb_state "$TABLET_IP:$port")"
+        if [ "$state" = device ] || [ "$state" = unauthorized ]; then
+          target="$TABLET_IP:$port"
+          print_ok "Wireless debugging found on port $port"
+          return 0
+        fi
+        adb disconnect "$TABLET_IP:$port" &>/dev/null || true
+      done
+      return 1
+    }
+    # Announced, yet it refuses this PC: it was never paired. Without the
+    # announcement there is no telling, so ask.
+    if ! try_ports && [ -n "$ports" ]; then
+      if [ -z "$tls_port" ]; then
+        ask "Is Wireless debugging on, on a tablet this PC was never paired with? [y/N]"
+        read -rp "Choice: " port || port=n
+        case "${port,,}" in y|yes) ;; *) return ;; esac
       fi
-      adb disconnect "$TABLET_IP:$port" &>/dev/null || true
-    done
+      pair_adb || return
+      try_ports || return
+    fi
   fi
 
   while :; do
@@ -615,6 +737,37 @@ EOF
   fi
 }
 
+# One tablet from the menu to the summary. A function only so that the end of
+# the script can run it again for the next tablet: its body is the script's
+# main flow and stays at the margin (the heredocs in it can't be indented).
+# Every `exit` in it still ends the whole run.
+setup_one_tablet() {
+# No option: ask what to do. An option (--full, --add-pc, …) skips this.
+if [ "$MODE_GIVEN" = false ]; then
+  PC_ONLY=false; ADD_PC=false; RENAME=false
+  print_header "Android Tablet"
+  ask "What do you want to do?"
+  echo "  1) Full install   Set up the tablet (Termux, music player, network audio),"
+  echo "                    then make it an audio output of this PC. Also the way to"
+  echo "                    reconfigure a tablet that is already installed."
+  echo "  2) Add this PC    The tablet was set up from another PC: allow this one to"
+  echo "                    play on it, then make it an output here. Music keeps playing."
+  echo "  3) This PC only   Touch nothing on the tablet (this PC is already allowed"
+  echo "                    there): only make it an output of this PC."
+  echo "  4) Rename         Rename an installed tablet: its output on this PC, its"
+  echo "                    music player, or both."
+  echo "  0) Quit"
+  read -rp "Choice [0-4]: " mode_choice || exit 0
+  case "$mode_choice" in
+    1) ;;
+    2) ADD_PC=true ;;
+    3) PC_ONLY=true ;;
+    4) RENAME=true ;;
+    0|"") exit 0 ;;
+    *) print_error "Invalid choice"; exit 1 ;;
+  esac
+fi
+
 if [ "$RENAME" = true ]; then
   rename_main
   exit 0
@@ -627,9 +780,9 @@ if [ "$PC_ONLY" = false ] && [ "$ADD_PC" = false ]; then
   print_header "Before You Start"
   echo "On the tablet (a first install only — skip what is already done):"
   echo ""
-  echo "  1. Install F-Droid (https://f-droid.org), then Termux and Termux:Boot"
-  echo "     from it — both from F-Droid, never one of them from the Play Store."
-  echo "     (Missing ones are installed by this script, without F-Droid's updates.)"
+  echo "  1. Nothing to install by hand: this script puts F-Droid, Termux,"
+  echo "     Termux:Boot and the KISS launcher on the tablet itself. If Termux is"
+  echo "     already there, it must come from F-Droid, not from the Play Store."
   echo "  2. Settings > About tablet: tap 'Build number' 7 times, then in"
   echo "     Developer options turn on USB debugging."
   echo "  3. Debugging over Wi-Fi, one of:"
@@ -642,6 +795,10 @@ if [ "$PC_ONLY" = false ] && [ "$ADD_PC" = false ]; then
   echo "     prints it once connected."
   echo "  5. Remove the lock screen (or the player only starts after the first"
   echo "     unlock following a reboot)."
+  echo "  6. Install Home Assistant and Moonlight from the Play Store, and sign in"
+  echo "     to both: Home Assistant to your server, Moonlight paired with your PC"
+  echo "     (it shows a PIN to enter in Sunshine). This script doesn't do it: both"
+  echo "     need your accounts."
   echo ""
   read -rp "Press Enter when the tablet is ready… " _
 fi
@@ -654,6 +811,11 @@ print_header "Checking Tools"
 if ! command -v pipewire &>/dev/null || ! command -v pactl &>/dev/null; then
   print_error "pipewire and pactl (pipewire-pulse) are needed on this PC."
   exit 1
+fi
+# The latency probe generates its silence with ffmpeg and plays it with pw-cat.
+if ! command -v ffmpeg &>/dev/null; then
+  print_warn "ffmpeg not found"
+  install_with_pkg_manager ffmpeg
 fi
 
 if [ "$PC_ONLY" = false ]; then
@@ -713,6 +875,15 @@ if [ "$PC_ONLY" = false ]; then
     # Android uses one random MAC per Wi-Fi network: this is the one the router sees.
     WIFI_MAC="$(adb_sh cmd wifi status 2>/dev/null | grep -io -m1 'MAC: [0-9a-f:]*' | cut -d' ' -f2)"
     [ -n "$WIFI_MAC" ] && print_info "Wi-Fi MAC for the router's DHCP reservation: $WIFI_MAC"
+    # Step 6 of "Before You Start": whether they are signed in can't be seen
+    # from here, only whether they are there.
+    if [ "$ADD_PC" = false ]; then
+      apps="$(adb_sh pm list packages | tr -d '\r')"
+      grep -q '^package:io\.homeassistant\.companion\.android' <<<"$apps" ||
+        print_warn "Home Assistant isn't installed on the tablet (step 6 above)"
+      grep -qx 'package:com.limelight' <<<"$apps" ||
+        print_warn "Moonlight isn't installed on the tablet (step 6 above)"
+    fi
   elif [ "$HAVE_SSH" = true ]; then
     if [ "$ADD_PC" = false ]; then
       print_warn "adb not connected — the Android settings step will be skipped"
@@ -732,27 +903,17 @@ if [ "$PC_ONLY" = false ]; then
   if [ "$HAVE_SSH" = false ]; then
     print_header "Installing Termux"
 
-    # Both from F-Droid: Termux:Boot only works with a Termux signed by the
-    # same key, so a Play Store Termux + F-Droid Termux:Boot does not.
+    # F-Droid first, then Termux and Termux:Boot as F-Droid installs — both
+    # from there: Termux:Boot only works with a Termux signed by the same key,
+    # so a Play Store Termux + F-Droid Termux:Boot does not.
     FRESH_BOOT_APP=false
-    installed="$(adb_sh pm list packages)"
-    for pkg in com.termux com.termux.boot; do
-      if grep -qx "package:$pkg" <<<"$installed"; then
-        print_ok "$pkg already installed"
-        continue
-      fi
-      code="$(curl -fsSL --proto '=https' --tlsv1.2 "https://f-droid.org/api/v1/packages/$pkg" |
-        sed -n 's/.*"suggestedVersionCode":\([0-9]*\).*/\1/p')"
-      if [ -z "$code" ]; then
-        print_error "Couldn't read $pkg's version from F-Droid."
-        exit 1
-      fi
-      print_info "Downloading $pkg ($code) from F-Droid"
-      curl -fSL --proto '=https' --tlsv1.2 "https://f-droid.org/repo/${pkg}_${code}.apk" -o "$WORK/$pkg.apk"
-      adb_ install "$WORK/$pkg.apk"
-      print_ok "Installed $pkg"
-      [ "$pkg" = com.termux.boot ] && FRESH_BOOT_APP=true
-    done
+    installed="$(adb_sh pm list packages | tr -d '\r')"
+    fdroid_install "$FDROID" || true
+    # Lets F-Droid install the updates it finds without a detour through
+    # Android's "unknown sources" screen.
+    adb_sh "appops set $FDROID REQUEST_INSTALL_PACKAGES allow" || true
+    fdroid_install com.termux || true
+    if fdroid_install com.termux.boot; then FRESH_BOOT_APP=true; fi
 
     # adb can't write Termux's private files and can't send it a RUN_COMMAND
     # intent (the shell user lacks the permission), so the first commands go
@@ -828,13 +989,45 @@ EOF
 
     # "Display over other apps": what lets a boot script start an activity.
     adb_sh 'appops set com.termux SYSTEM_ALERT_WINDOW allow'
-    adb_sh 'settings put global window_animation_scale 0.5
-settings put global transition_animation_scale 0.5
-settings put global animator_duration_scale 0.5
+    # A tablet that only does this has no use for animations.
+    adb_sh 'settings put global window_animation_scale 0
+settings put global transition_animation_scale 0
+settings put global animator_duration_scale 0
 settings put global stay_on_while_plugged_in 7'
-    print_ok "Animations at 0.5, screen stays on while charging"
+    print_ok "Animations off, screen stays on while charging"
+
+    # The launcher: installed and made the home screen on a tablet that doesn't
+    # have it. One that has it keeps whatever home screen was chosen since.
+    installed="$(adb_sh pm list packages | tr -d '\r')"
+    if fdroid_install "$LAUNCHER"; then
+      if adb_sh "cmd package set-home-activity $LAUNCHER_HOME" | grep -q Success; then
+        print_ok "Home screen: KISS launcher"
+      else
+        print_warn "Couldn't make KISS the home screen — pick it once when the tablet asks"
+      fi
+    fi
+
+    # Home Assistant as the tablet's voice assistant (the long press on Home,
+    # and what its wake word answers to). The wake word itself is switched on
+    # in the app, by hand.
+    ha_app="$(grep -o -m1 'io\.homeassistant\.companion\.android[.a-z]*' <<<"$installed" || true)"
+    if [ -n "$ha_app" ]; then
+      if adb_sh "cmd role add-role-holder android.app.role.ASSISTANT $ha_app" &>/dev/null &&
+         [ "$(adb_sh cmd role get-role-holders android.app.role.ASSISTANT | tr -d '\r' | tail -n1)" = "$ha_app" ]; then
+        print_ok "Voice assistant: Home Assistant"
+      else
+        print_warn "Couldn't make Home Assistant the voice assistant — set it in Settings > Apps > Default apps"
+      fi
+    fi
 
     MODEL="$(adb_sh getprop ro.product.model | tr -d '\r')"
+    # The tablet lives on its charger.
+    if [ -n "$(battery_protection "$MODEL")" ]; then
+      adb_sh "$(battery_protection "$MODEL")"
+      print_ok "Battery charge protection on"
+    else
+      print_info "No known charge protection setting for model '$MODEL' — set it by hand in the battery settings if there is one"
+    fi
     if [ -n "$(debloat_list "$MODEL")" ]; then
       enabled="$(adb_sh pm list packages -e | tr -d '\r')"
       count=0
@@ -879,17 +1072,25 @@ fi
 
 # Remove what this PC already has for this tablet — under this name or an older
 # one (a renamed tablet would stay listed twice) — keeping the priority audio.sh
-# gave it.
+# gave it and the latency measured by a previous run.
 PRIO_LINE=""
+PREV_LATENCY=""
 for old in "$SINK_CONFIG_DIR"/*.conf; do
   [ -f "$old" ] || continue
   old_slug="$(basename "$old" .conf)"
   grep -q "pulse.server.address = \"tcp:$TABLET_IP:" "$old" || continue
   [ -n "$PRIO_LINE" ] || PRIO_LINE="$(grep -m1 '^ *priority\.session = ' "$old" || true)"
+  [ -n "$PREV_LATENCY" ] || PREV_LATENCY="$(sed -n 's/^ *pulse\.latency = \([0-9]\{1,\}\) *$/\1/p' "$old" | head -n1)"
   systemctl --user disable --now "tablet-sink@$old_slug.service" 2>/dev/null || true
   rm -f "$old"
   print_ok "Removed this tablet's previous output ($old_slug)"
 done
+
+LATENCY="${TUNNEL_LATENCY_MS:-${PREV_LATENCY:-$DEFAULT_LATENCY_MS}}"
+if ! [[ "$LATENCY" =~ ^[0-9]+$ ]] || [ "$LATENCY" -lt 1 ]; then
+  print_error "TUNNEL_LATENCY_MS must be a number of milliseconds: '$LATENCY'"
+  exit 1
+fi
 
 # A PipeWire client of its own rather than a module of the session's PipeWire:
 # nothing to restart (a PipeWire restart drops every Bluetooth device), and the
@@ -917,7 +1118,7 @@ context.modules = [
         args = {
             tunnel.mode = sink
             pulse.server.address = "tcp:$TABLET_IP:$PULSE_PORT"
-            pulse.latency = $TUNNEL_LATENCY_MS
+            pulse.latency = $LATENCY
             reconnect.interval.ms = 5000
             target.object = "tablet"
             audio.rate = 48000
@@ -952,16 +1153,118 @@ systemctl --user daemon-reload
 systemctl --user enable "tablet-sink@$SLUG.service" 2>/dev/null && print_ok "Enabled tablet-sink@$SLUG" || true
 systemctl --user restart "tablet-sink@$SLUG.service"
 
+wait_for_output() {
+  local _
+  for _ in $(seq 10); do
+    if pactl list short sinks 2>/dev/null | grep -q "tablet_$SLUG"; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
 found=false
-for _ in $(seq 10); do
-  if pactl list short sinks 2>/dev/null | grep -q "tablet_$SLUG"; then found=true; break; fi
-  sleep 1
-done
-if [ "$found" = true ]; then
+if wait_for_output; then
+  found=true
   print_ok "Output '$PLAYER_NAME' is available (pick it in your sound settings)"
 else
   print_warn "Output '$PLAYER_NAME' not there yet — it appears once the tablet answers on TCP $PULSE_PORT"
   print_info "Is this PC in the tablet's allowed IPs? Log: journalctl --user -u tablet-sink@$SLUG"
+fi
+
+# =============================================================================
+# STEP 9 — The shortest delay this PC's link to the tablet holds
+# =============================================================================
+# The tunnel keeps LATENCY ms of sound in reserve on the tablet. Wi-Fi jitter
+# that outlasts it empties the buffer: a crackle, or a cut. The right value
+# depends on this PC's and the tablet's reception, and nobody has to listen for
+# it: the tunnel logs each time the buffer ran dry ("underflow"), and it does
+# so for silence as for sound. Measured on a Lenovo TB128FU over Wi-Fi: every
+# ~4 s at 10 ms, far less from 20 up. Below 20 the tablet's own buffer no
+# longer shrinks anyway (13-17 ms held, whatever is asked), hence the first
+# step. The counts vary a lot from one minute to the next: this picks a value
+# that is no worse than a long buffer, not one that is proven clean.
+#
+# Each value is probed on a second client beside the installed one — its own
+# log to read, and the output in use is restarted once, at the end.
+
+# Plays PROBE_SECS of silence through a probe output at $1 ms and echoes how
+# many times the link ran dry meanwhile. Fails when the probe never comes up.
+probe_latency() {  # $1 = ms
+  local conf="$WORK/probe.conf" log="$WORK/probe.log" name="tablet_${SLUG}_probe" pid seen upto _
+  sed -e "s/^\\( *pulse\\.latency = \\).*/\\1$1/" \
+      -e "s/^\\( *node\\.name = \\).*/\\1\"$name\"/" \
+      -e '/priority\.session/d' "$SINK_CONFIG_DIR/$SLUG.conf" > "$conf"
+  timeout $((PROBE_SECS + 40)) pipewire -c "$conf" > "$log" 2>&1 &
+  pid=$!
+  for _ in $(seq 10); do
+    pactl list short sinks 2>/dev/null | grep -q "$name" && break
+    sleep 1
+  done
+  if ! pactl list short sinks 2>/dev/null | grep -q "$name"; then
+    kill "$pid" 2>/dev/null || true
+    return 1
+  fi
+  sleep 2   # a stream that starts underflows once: not a dropout
+  seen="$(wc -l < "$log")"
+  # dont-reconnect: with the probe gone, nothing must land on another output.
+  ffmpeg -nostdin -loglevel fatal -f lavfi -i "anullsrc=r=48000:cl=stereo:d=$PROBE_SECS" \
+      -f s16le - 2>/dev/null |
+    timeout $((PROBE_SECS + 10)) pw-cat --playback --raw --format s16 --rate 48000 --channels 2 \
+      --target "$name" -P '{ node.dont-reconnect = true }' - &>/dev/null || true
+  upto="$(wc -l < "$log")"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  # One line per burst, "underflow (N suppressed)": the suppressed ones count too.
+  sed -n "$((seen + 1)),${upto}p" "$log" |
+    awk '/underflow/ { n++; if (match($0, /[0-9]+ suppressed/)) n += substr($0, RSTART, RLENGTH) + 0 }
+         END { print n + 0 }'
+}
+
+print_header "Link Latency"
+if [ -n "$TUNNEL_LATENCY_MS" ]; then
+  print_info "$LATENCY ms, as asked with TUNNEL_LATENCY_MS — not measured."
+elif [ "$found" = false ]; then
+  print_warn "No output to measure — latency left at $LATENCY ms. Run this again once the tablet answers."
+else
+  print_info "Looking for the shortest delay the link from this PC holds."
+  print_info "Nothing to hear: silence is played, and the link counts each time it runs dry."
+  print_info "Leave the tablet where it normally lives. A minute per value tried, a few at most."
+  # The longest buffer first, as the reference: what still runs dry there is
+  # not for want of buffer (it happens: 2-3 times a minute were measured at
+  # 100 ms as at 20), and a shorter one is only held against what it adds.
+  chosen="${LATENCY_STEPS[-1]}"
+  if ! base="$(probe_latency "$chosen")"; then
+    print_warn "Couldn't measure (the probe output didn't come up) — latency left at $LATENCY ms"
+    chosen="$LATENCY"
+  else
+    if [ "$base" -gt 0 ]; then
+      print_info "$chosen ms: ran dry $base time(s) in ${PROBE_SECS} s — whatever the buffer, then"
+    else
+      print_ok "$chosen ms: no dropout"
+    fi
+    # Dropouts come in bursts: one or two more in a minute say nothing.
+    allowed=$((base + (base > 4 ? base / 2 : 2)))
+    for step in "${LATENCY_STEPS[@]}"; do
+      [ "$step" -lt "$chosen" ] || break
+      drops="$(probe_latency "$step")" || break
+      if [ "$drops" -le "$allowed" ]; then
+        print_ok "$step ms: $drops dropout(s) in ${PROBE_SECS} s — no worse"
+        chosen="$step"
+        break
+      fi
+      print_info "$step ms: ran dry $drops time(s) in ${PROBE_SECS} s — too short"
+    done
+    if [ "$base" -gt 6 ]; then
+      print_warn "The link drops out often whatever the buffer: look at the Wi-Fi between this PC and the tablet"
+    fi
+  fi
+  if [ "$chosen" != "$LATENCY" ]; then
+    LATENCY="$chosen"
+    sed -i "s/^\\( *pulse\\.latency = \\).*/\\1$LATENCY/" "$SINK_CONFIG_DIR/$SLUG.conf"
+    systemctl --user restart "tablet-sink@$SLUG.service"
+    wait_for_output || print_warn "The output didn't come back — check: journalctl --user -u tablet-sink@$SLUG"
+  fi
+  print_ok "Latency of this PC's link: $LATENCY ms"
 fi
 
 # =============================================================================
@@ -970,8 +1273,22 @@ fi
 print_header "Setup Complete"
 echo -e "${GREEN}${BOLD}All done!${NC}"
 echo ""
-echo -e "  Output on this PC:  ${CYAN}$PLAYER_NAME${NC} (tablet-sink@$SLUG.service)"
+echo -e "  Output on this PC:  ${CYAN}$PLAYER_NAME${NC} (tablet-sink@$SLUG.service, $LATENCY ms)"
 echo -e "  On another PC:      ${CYAN}android.sh --add-pc${NC}"
 if [ "$PC_ONLY" = false ]; then
   echo -e "  Tablet shell:       ${CYAN}ssh -p $SSH_PORT $TABLET_IP${NC}"
 fi
+}
+
+# A tablet at a time, for as long as there is another one to set up. End of
+# input quits.
+while :; do
+  setup_one_tablet
+  echo ""
+  ask "Set up another tablet? [y/N]"
+  read -rp "Choice: " again || break
+  case "${again,,}" in
+    y|yes) ;;
+    *) break ;;
+  esac
+done
