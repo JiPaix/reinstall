@@ -24,11 +24,19 @@ Lets you flip your display setup between layouts on demand — for example your
 desktop monitors versus the TV — instead of fiddling with display settings each
 time. The setup detects your monitors and builds the layouts; a small service
 then lets you switch (including remotely over the local network, which pairs
-nicely with game streaming).
+nicely with game streaming). It needs at least two screens: with a single one
+the setup stops and leaves any previous install as it was.
 
 If Sunshine is installed, it's also enabled so it starts with every session. On
 AMD graphics cards it writes a small ddcutil config too: ddcutil 3.0 probes
 monitors in parallel, which freezes the GPU right after login.
+
+If one of your screens is an Android TV, the setup can also install Input Home
+on it: a tiny app that makes the TV's Home button, its wake from standby and
+its boot open the HDMI input instead of the home screen (a long press on Home
+still opens that one). The setup asks first, then for the TV's address; the TV
+needs USB/network debugging turned on in its developer options. It finds the
+input your PC is plugged into by itself when it is the only one with a signal.
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen.sh)
@@ -42,7 +50,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen
 
 Sets up your audio outputs: you rank them, and the highest one connected is the
 one that plays. Each device can get a voice-clarity equalizer, swapped
-left/right channels, and a keepalive that stops it dozing off mid-silence.
+left/right channels, and a keepalive that stops it dozing off mid-silence: an
+inaudible tone, whose pitch and volume you can tune by ear for each device (it
+plays while you type, until it suits that speaker).
 
 All of it is applied on the device itself: no extra output shows up in your
 sound settings. A device whose model has a known correction EQ (an
@@ -67,8 +77,9 @@ The same switch from a terminal: `audio-eq on`, `audio-eq off`. It survives a
 reboot, and leaves the swapped channels alone.
 
 It also keeps your microphones awake, so recordings don't start with a second of
-crackle, and asks which microphone should always be the default. Apps can still
-use the other one if you pick it inside the app.
+crackle, and has you rank them like the outputs: the highest one connected is
+the default, and stays it: a default picked by hand is put back. Apps can still
+use another one if you pick it inside the app.
 
 You can have every paired Bluetooth device reconnect automatically at boot.
 
@@ -103,21 +114,29 @@ it after every boot.
 
 > [!NOTE]
 > The tablet needs USB debugging on, `adb` reachable over the network and a
-> fixed IP in your router. The script starts by listing these steps. No root.
+> fixed IP in your router. The script starts by listing these steps, and pairs
+> with Android's Wireless debugging itself: you only read it the code. No root.
 
-Turns an Android tablet into a network speaker. It installs
-[Termux](https://termux.dev/) and Termux:Boot from F-Droid, then starts
+Turns an Android tablet into a network speaker. Over adb, with nothing to tap on
+the tablet, it installs F-Droid, then [Termux](https://termux.dev/) and
+Termux:Boot as F-Droid apps, and the light KISS launcher as home screen. It then starts
 [squeezelite](https://github.com/ralph-irving/squeezelite) at every boot, so the
 tablet shows up as a player in Lyrion or Music Assistant. It also sets a few
 things on the tablet so the player isn't put to sleep.
 
 The tablet then becomes an audio output of your PC, listed with the others in
 your sound settings whenever it is reachable. It is never picked by default.
-You choose which addresses may play on it.
+You choose which addresses may play on it. The setup ends by measuring, on its
+own and in silence, the shortest delay the link between the PC and the tablet
+holds without dropping out more than a long one does.
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/android.sh)
 ```
+
+Run like this it opens on a menu: full install, add this PC, this PC only,
+rename. The options below go straight to one of them (`--full` for the first).
+When a tablet is done, it offers to set up another one.
 
 To use a tablet that is already set up from another PC — it asks which addresses
 to add to the tablet's allowed ones, then adds the output on that PC:

@@ -76,7 +76,9 @@ gotchas below.
   `ACCESSIBLE=1` turns the TUI into line prompts: feed answers slowly, descriptions are not
   printed, a select needs its number (Enter does not pick the default).
 - `screen.sh` touches nothing of the previous install until the wizard is confirmed (cleanup
-  is STEP 4): a cancelled wizard must leave a working machine. The engine's KDE apply is
+  is STEP 4): a cancelled wizard must leave a working machine. The wizard refuses a single
+  screen (look again or quit): the engine tells the modes apart by which primary is lit, so
+  one screen in both layouts would always read "tv". The engine's KDE apply is
   deliberately two `kscreen-doctor` calls with a propagation gate between them (kscreen
   submits full-state configs from possibly stale snapshots): don't merge or re-order them.
 - `swapscreen-login.service` forces monitor mode at login and its `ExecStart` MUST keep
@@ -99,6 +101,19 @@ gotchas below.
   --version`/`--help`: they start a second instance that truncates
   `~/.config/sunshine/sunshine.log`. The package doesn't enable its user unit: `screen.sh`
   enables then restarts it, so `global_prep_cmd` applies at once.
+- Input Home (`screen/inputhome/`, an Android TV app: Home key, wake and boot open the HDMI
+  input) is `screen.sh`'s last step, asked only when a TV is configured, and never aborts the
+  run. It is the one non-Go Release asset: `build.sh` (no Gradle, nothing to install) builds
+  `inputhome.apk`, in `release.yml` or with `screen.sh --local`, with a toolchain it downloads
+  itself into the gitignored `screen/inputhome/.sdk/` — build-tools, platform and JDK pinned
+  by URL and sha256 at the top of the script. Signed with
+  `~/.local/share/inputhome/debug.keystore`, created only when missing; an APK from another
+  key can't update the installed one, so the installer then uninstalls it first and redoes
+  every setting. `enabled_accessibility_services` is a `:` list shared with the TV's other
+  services: append, never overwrite. The pinned input is the only HDMI input in state 0 of
+  `dumpsys tv_input` (else asked); setting it means starting `TvActivity`, which opens that
+  input on the TV at once. `adb shell input keyevent` goes past the accessibility filter:
+  only a real remote tests the Home key.
 - ddcutil ≥ 3.0.0 probes I2C buses in parallel, which on amdgpu hangs the GPU ring seconds
   after powerdevil starts at login (`Fence fallback timer expired` → `device lost from bus`).
   It looks like a hardware or kernel fault; it isn't (rockowitz/ddcutil#629). `screen.sh`
@@ -161,10 +176,13 @@ gotchas below.
   again reloads the graph on a playing device).
 - `audio-watch.service` (generated `~/.local/bin/audio-watch`) follows `pactl subscribe` under
   `LC_ALL=C` (the output is translated). It hands the EQ state to devices as they appear,
-  plays the 18 kHz keepalive tone on the devices that want one while they are connected (and
+  plays the keepalive tone on the devices that want one while they are connected (and
   kills it itself: a `pw-cat` with `node.dont-reconnect` whose target is gone just sits
-  there), and runs `wpctl clear-default` whenever a ranked output comes or goes so the
-  priority order decides again. It replaced a udev rule and the
+  there), and runs `wpctl clear-default` whenever a ranked output or mic comes or goes so
+  the priority order decides again. The tone is per output (18 kHz at 5 % unless tuned;
+  `tone_hz`/`tone_vol` in `choices.json`): the wizard's tuner (`audio/setup/tone.go`) plays
+  it live on the device while "kHz-percent" is typed. 100 % is ffmpeg's sine at 1/8 of full
+  scale, so a typo can't blast a speaker. It replaced a udev rule and the
   `soundbar-keepalive`/`soundbar-loopback` units, which `audio.sh`'s cleanup removes.
 - Restarting PipeWire/WirePlumber disconnects every Bluetooth audio device and they don't
   come back on their own. So `audio.sh` restarts before the wizard only when it removed a
@@ -183,9 +201,14 @@ gotchas below.
   `alsa_input.*` (a USB mic resumed by a new recording crackles for 1–2 s). That only stops
   an *idle* node from suspending — nodes still come up `suspended` at every WirePlumber start,
   so `mic-wake.service` opens each mic for 1 s with `pw-record`. Check with `pw-cli info
-  <node> | grep state:` (`idle`, not `suspended`). The wizard's default mic gets
-  `priority.session = 3000` (stock ALSA mics sit around 2100); it wins only when
-  `default-nodes` has no configured source, which is why the cleanup deletes that state file.
+  <node> | grep state:` (`idle`, not `suspended`). The mics are ranked in the wizard
+  like the outputs (`priority.session` 3000 and up, by `micPrio`; stock ALSA mics sit around
+  2100): the highest one connected wins only when `default-nodes` has no configured source,
+  which is why the cleanup deletes that state file. On top of that `audio-watch` forces it:
+  at every pass, and on every `'change' on server` event (a default changed), the first
+  ranked mic that is connected is set as default source if it isn't. Outputs are not forced
+  that way: a hand-picked one lasts until a ranked output comes or goes. A `choices.json`
+  from before the ranking has a single `default_source`: it becomes the first ranked mic.
 - `bt-autoconnect` (optional) is a root system unit, like `poweroff-server`: it must run
   before anyone logs in. It keeps no device list (`bluetoothctl devices Paired`) and retries
   12×10 s within a 240 s budget that must stay under the unit's `TimeoutStartSec`; each
@@ -194,8 +217,10 @@ gotchas below.
 
 ### Android tablet
 
-- `android.sh` has no Release download and no Go: adb and ssh against a tablet (Termux +
-  Termux:Boot + squeezelite + PulseAudio on TCP 4713), then a PC-side
+- `android.sh` has no Release download and no Go: adb and ssh against a tablet (F-Droid,
+  then Termux + Termux:Boot installed over adb with `-i org.fdroid.fdroid` so they count as
+  F-Droid installs, squeezelite + PulseAudio on TCP 4713; the KISS launcher becomes the home
+  screen only when the script is what installs it), then a PC-side
   `tablet-sink@<slug>.service` (`pipewire -c ~/.config/tablet-sink/<slug>.conf`, a pulse-tunnel
   client of its own so the session's PipeWire is never restarted). On the tablet it owns
   only `~/.termux/boot/start-squeezelite` and `$PREFIX/etc/pulse/default.pa.d/50-reinstall.pa`;
@@ -208,9 +233,25 @@ gotchas below.
   SSH survives a tablet reboot, `adb tcpip` doesn't, and nothing root-free brings it back
   unattended (`persist.adb.tcp.port` is refused; the `settings` command is refused to app
   uids on Android 13 even with `WRITE_SECURE_SETTINGS`). By hand: Wireless debugging on, then
-  `connect_adb` finds its random port by probing 30000–60999 and runs `adb tcpip` to return
-  to the fixed one (no pairing for a PC already authorized). A re-run without adb only skips
+  `connect_adb` finds its random port (mDNS through `avahi-browse`: this adb build has no
+  mdns of its own; else by probing 30000–60999) and runs `adb tcpip` to return to the fixed
+  one. An unpaired PC gets a plain "failed to connect", never "unauthorized": when the port
+  is announced yet refuses, `pair_adb` finds the pairing port the same way and asks for the
+  code. A re-run without adb only skips
   the Android settings step.
+- `android.sh` without an option opens on a menu of its four modes (`--full`, `--add-pc`,
+  `--pc-only`, `--rename` skip it; end of input at the menu quits). Its main flow is the
+  body of `setup_one_tablet`, left at the margin, so that the end of the script can offer
+  another tablet; an `exit` anywhere in it still ends the run. Every mode that writes
+  the PC-side output ends by measuring `pulse.latency` itself (STEP 9), no ear needed: a
+  probe client beside the installed one plays 60 s of silence per value and counts the
+  tunnel's `underflow` lines (silence underflows like sound; an *idle* tunnel is corked and
+  never does). The longest step is the reference, then the shortest step that is no worse
+  wins; `TUNNEL_LATENCY_MS` imposes a value instead. Counts swing from one minute to the
+  next (20 ms: 0 to 5 per 30 s the same night), so the result can move by a step between
+  runs. Don't query the tablet (`pactl` over SSH) during a probe: that alone causes an
+  underflow. The tablet's own ~16 ms buffer has no knob: `module-aaudio-sink`'s `latency=`
+  only changes what it reports, and it already opens AAudio in low-latency mode.
 - Tablet audio: the `module-aaudio-sink` sink (`tablet`) has ~20 ms of buffer against ~150 for
   the stock OpenSL ES one, but **deadlocks the whole PulseAudio daemon when it suspends**
   (intermittent; the log ends on "Sink … idle for too long, suspending"). So the config
@@ -233,7 +274,8 @@ gotchas below.
   `module-native-protocol-tcp` live (music keeps playing, tunnels reconnect in ~3 s).
   `--rename … player` must restart the boot *script*, not just squeezelite (the running
   loop already read the old name), and leaves PulseAudio up. The PC-side and player names
-  are independent. The debloat list is per `ro.product.model`: another tablet, another case.
+  are independent. The debloat list and the charge-protection setting are per
+  `ro.product.model`: another tablet, another case (Lenovo: `battery_protected_charge`).
 - Bash traps in `android.sh`: every `tablet_ssh` closes stdin (`ssh -n`), or ssh swallows the
   answers typed ahead for the next prompt (`tablet_ssh_in` is for heredoc-fed calls); and a
   `pkill -f` pattern must not appear literally anywhere on the same remote command line —

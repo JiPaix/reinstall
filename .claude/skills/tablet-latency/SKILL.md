@@ -56,9 +56,29 @@ The floor is the lowest setting with no underflow after the first second **and**
 heard. Recommend one step above it (a 30 s run sees less jitter than an evening of music).
 Report a table: setting, buffer measured on the tablet, underflows, what the user heard.
 
-To apply: `TUNNEL_LATENCY_MS=<value> ./android.sh --pc-only`, or edit `pulse.latency` in
-`~/.config/tablet-sink/<slug>.conf` and `systemctl --user restart tablet-sink@<slug>`.
-Each PC has its own value.
+To apply: edit `pulse.latency` in `~/.config/tablet-sink/<slug>.conf` and
+`systemctl --user restart tablet-sink@<slug>`. Each PC has its own value, and a later run of
+`android.sh` keeps it.
+
+`android.sh` ends on an automatic version of this (STEP 9): a probe client beside the
+installed one, 60 s of silence per value, the longest step as reference, then the shortest
+step that underflows no more than it. This procedure is the thorough one: longer runs,
+a tone to listen to, the buffer read on the tablet.
+
+Measured on 2026-10-12 (Lenovo TB128FU, PC on Ethernet, tablet on 5 GHz Wi-Fi), worth
+knowing before a new sweep:
+
+- Silence and a tone underflow alike, so a sweep can be silent. An idle tunnel is corked
+  on the tablet and logs nothing: something has to play.
+- Reading "Buffer Latency" over SSH **during** a run causes an underflow by itself (the
+  `pactl` call stalls the tablet's daemon): read it in a separate run.
+- The buffer the tablet really holds barely follows the setting: 13-17 ms at 5-20, 18 at
+  40, 27 at 60, 36 at 100.
+- 5 and 10 ms: a burst every ~4 s. From 20 up the counts are low but swing with the
+  minute: 20 ms gave 0, 0, 5 (per 30 s) and 2, 4 (per 60 s); 40 ms 1, 0, 3, 1; 100 ms 2 per
+  60 s; 200 ms 0. Some underflows therefore remain at every usual value; their cause was
+  not established (the PC's graph clock against the tablet's is the untested suspect).
+  STEP 9 settled on 40 for this PC.
 
 squeezelite is not affected by this setting: it plays into the same `tablet` sink locally,
 and the server compensates each player's delay when syncing a group.

@@ -20,6 +20,9 @@ one-shot; Music Assistant shows a player rename at once), existing-install detec
 SSH and over adb alone, name-collision guards with two tablets, tablet reboot (player,
 network audio, sshd, Android settings all come back), the Wireless-debugging port search,
 the Bluetooth-off fallback to the local output, the audio wizard hiding network outputs.
+Wireless-debugging pairing (2026-10-12, on a phone that had been unpaired: connection port
+and pairing port found over mDNS, `adb pair`, then connected — only the final `adb tcpip`
+was held back).
 
 ## Rules while testing
 
@@ -34,21 +37,29 @@ the Bluetooth-off fallback to the local output, the audio wizard hiding network 
   write. That is how `soundbar-setup` once rewrote the real audio config during a test.
   To stop a run early, feed the explicit "Stop" answer, or test a copy with an `exit`
   inserted before the first write.
-- To answer prompts from a pipe: `printf 'a\nb\n' | ./android.sh …`. Order for a full run:
-  Enter (prerequisites screen), tablet IP, reconfigure/stop (only if something is
-  installed), player name, music server, MAC, allowed IPs.
+- To answer prompts from a pipe: `printf 'a\nb\n' | ./android.sh --full`. Without an option
+  the script opens on a menu (1 full, 2 add this PC, 3 this PC only, 4 rename, 0 quit).
+  Order for a full run: Enter (prerequisites screen), tablet IP, reconfigure/stop (only if
+  something is installed), player name, music server, MAC, allowed IPs. The latency
+  measurement at the end asks nothing (silent, a few minutes; `TUNNEL_LATENCY_MS=<ms>`
+  skips it). Last prompt of every run: "Set up another tablet?" — `n`, or end of input,
+  quits; `y` starts over (at the menu when no option was given).
 
 ## 1. First install on a fresh tablet
 
 Needs a tablet without Termux (a second tablet; or, only if the user asks, uninstalling
 Termux and Termux:Boot on the first one — that wipes its player setup).
 
-Never run so far: the F-Droid downloads and `adb install`; the typed bootstrap (script
-pushed to `/sdcard/Download`, `sh …` typed into the Termux window with `input text`); the
-SSH key being authorized; Termux:Boot being opened once; the debloat list on another model
-(none unless a `debloat_list` case is added); a real "unauthorized" wait or `adb pair`.
+Never run so far: the F-Droid downloads and `adb install` of F-Droid, Termux, Termux:Boot
+and the KISS launcher (checked on 2026-10-12, on the Lenovo: `adb install -i
+org.fdroid.fdroid` records F-Droid as the installer, with a throwaway APK removed after;
+`cmd package set-home-activity` answers Success where KISS already was the home screen);
+the typed bootstrap (script pushed to `/sdcard/Download`,
+`sh …` typed into the Termux window with `input text`); the SSH key being authorized;
+Termux:Boot being opened once; the debloat list on another model (none unless a
+`debloat_list` case is added); a real "unauthorized" wait.
 
-Steps: follow the script's "Before You Start" screen with the user, run `./android.sh`,
+Steps: follow the script's "Before You Start" screen with the user, run `./android.sh --full`,
 watch the tablet's screen during "Installing Termux".
 
 Likely trouble spots: the fixed `sleep 20` before typing (Termux's first start may take
@@ -94,7 +105,7 @@ tablet installed (`~/.config/tablet-sink` empty or absent) the step must print n
 
 ## 4. Rename through a full run
 
-Run `./android.sh` (full), choose Reconfigure, and give a different player name.
+Run `./android.sh --full`, choose Reconfigure, and give a different player name.
 
 Pass: "Removed this tablet's previous output (<old slug>)", a single output for that tablet
 on the PC under the new name with its `priority.session` kept, the player renamed in Music
@@ -106,3 +117,40 @@ Separate skills: `tablet-latency` (sweep, plays tones, needs the user's ears) an
 `tablet-audio-health` (did PulseAudio hang again — meaningful after a few days of use).
 On 2026-10-04 the tunnel's journal showed a few underflows at the default 40 ms with no
 test running; if the user hears crackles when playing from a PC, run the sweep.
+
+## To do — dropouts that remain on the PC link at every latency
+
+Not a test of `android.sh`: an open problem found on 2026-10-12 while measuring the link
+(numbers in the `tablet-latency` skill). From 20 ms up, the tunnel still underflows a few
+times a minute on some minutes — 2 per minute at 100 ms, 0 at 200 — so no usual
+`pulse.latency` is clean, and STEP 9 can only pick "no worse than a long buffer". Nobody
+has listened for it yet: JiPaix asked to leave it until he has time to stand in the kitchen.
+
+To do, with him next to the tablet and something playing from the PC through the tablet
+output:
+
+- Does he hear a click when `journalctl --user -u tablet-sink@<slug> -f` logs an
+  `underflow`? If nothing is audible, close this.
+- If it is: find the cause before touching the latency. Untested suspect: the tunnel node
+  follows the PC's graph clock (`node.want-driver`, Dummy-Driver or the Bluetooth output)
+  while the tablet consumes at its own audio clock, and `module-pulse-tunnel`'s rate
+  matching lets the buffer drift until it runs dry. Compare the underflow rate with the
+  Bluetooth output playing and not playing, and over Ethernet-only pings for Wi-Fi bursts.
+
+## To do — a tablet of another make
+
+Everything so far ran on one Lenovo TB128FU. Three things are per make and can only be
+found with the tablet in hand (JiPaix is looking at an HONOR Pad X8a: same Snapdragon 680
+and 4 GB as the Lenovo, Android 14, MagicOS 8):
+
+- **Charge protection**: add a `battery_protection` case. Find the key with
+  `adb shell settings list global|system|secure | grep -iE 'charg|batter|protect'`, then
+  prove it: flip it and watch `dumpsys battery` go from status 2 (charging) to 4 (not
+  charging) within seconds, as the Lenovo's `battery_protected_charge` did.
+- **Preloaded apps**: add a `debloat_list` case (`pm list packages`, then `pm disable-user`
+  — reversible — for what the owner doesn't use there).
+- **Background killing**: MagicOS stops background apps beyond stock Android (Settings >
+  App launch > manage manually > Run in background). Termux, Termux:Boot and the Home
+  Assistant app must be exempt or the player and the orders stop. Whether adb can set it is
+  unknown: look for the setting first, else tell the user to do it in "Before You Start".
+
