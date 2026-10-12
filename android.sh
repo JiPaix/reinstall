@@ -1,57 +1,76 @@
 #!/bin/bash
 # =============================================================================
-# Android Tablet Audio Player Setup Script
-# - Turns an Android tablet (adb debugging on, no root) into a network audio
-#   player: F-Droid, then Termux + Termux:Boot as F-Droid installs (over adb,
-#   nothing to tap), the KISS launcher as home screen, squeezelite started at boot
-#   towards a Lyrion / Music Assistant server, and the tablet's PulseAudio
-#   opened on TCP so a PC can use the tablet as an audio output.
-# - Then makes the tablet an output of THIS PC: a small PipeWire client
-#   (tablet-sink@<name>.service) holding a PulseAudio tunnel to it.
-# - The output gets no priority here: audio.sh, when used, ranks these network
-#   outputs under every local device.
-# - Downloads nothing from the GitHub Release and has no Go side: adb and ssh
-#   do the work. adb is only needed for the first install and the Android
-#   settings; once Termux has sshd, a re-run works over SSH alone (adb over
-#   Wi-Fi does not survive a tablet reboot, SSH does).
+# Android Tablet Setup Script
+# - Sets up an Android tablet that lives on its charger (adb debugging on, no
+#   root), for any of four things, chosen at each run:
+#     music player    squeezelite, started at boot towards a Lyrion / Music
+#                     Assistant server
+#     network audio   the tablet's PulseAudio opened on TCP, so a PC can use
+#                     the tablet as an audio output
+#     Home Assistant  its app brought to the front, on the tablet's own page
+#     Moonlight       the stream of this PC's screen started on command
+#   Home Assistant drives the last two through tablet-server (tablet/), a small
+#   HTTP server left on the tablet: what is on screen, the battery, two orders.
+#   It also brings Home Assistant back by itself when a stream ends.
+# - Over adb, nothing to tap: F-Droid, then Termux, Termux:Boot and Termux:API
+#   as F-Droid installs, the KISS launcher as home screen, the permissions and
+#   Android settings it takes. Home Assistant and Moonlight themselves are the
+#   user's to install and sign in.
+# - With network audio, offers to make the tablet an output of THIS PC: a
+#   small PipeWire client (tablet-sink@<name>.service) holding a PulseAudio
+#   tunnel to it, whose latency is then measured (silence is played and the
+#   link counts its dropouts: nothing to listen to). The output gets no
+#   priority here: audio.sh, when used, ranks these network outputs under
+#   every local device.
+# - tablet-server comes from the GitHub Release, or is built from this
+#   checkout with --local. Everything else is adb and ssh. adb is only needed
+#   for the first install and the Android settings; once Termux has sshd, a
+#   re-run works over SSH alone (adb over Wi-Fi does not survive a tablet
+#   reboot, SSH does).
 # - SSH: this PC's public key (~/.ssh/id_ed25519.pub, else id_rsa.pub) is
 #   authorized in Termux by the first-install step, whenever SSH doesn't
 #   answer yet — including on a tablet another PC set up.
-# - A run ends by offering to set up another tablet (back to the menu).
-# - Run without an option, it opens on a menu of the four things it can do; an
-#   option skips the menu:
-# - `--full`: everything above.
-# - `--add-pc`: for another PC, on a tablet that is already set up: asks which
-#   addresses to add to the tablet's allowlist (duplicates ignored, nothing
-#   else on the tablet is touched), then makes it an output of this PC.
-# - `--rename`: rename installed tablets, on this PC and/or as squeezelite
-#   players — from a menu, or in one go without a terminal:
-#   --rename <tablet IP or current name> <local|player|both> <new name>.
-# - `--pc-only`: don't touch the tablet at all (this PC must already be
-#   allowed), only make it an output of this PC.
-# - Whenever it makes the tablet an output of this PC, it ends by measuring
-#   the shortest delay the link holds without a dropout (each PC has its own).
-#   Nothing to listen to: silence is played and the link counts its dropouts.
+# - Run without an option, it opens on a menu and ends by offering another
+#   tablet. An option skips the menu:
+#     --full       install or reconfigure a tablet
+#     --this-pc    use a tablet that is already set up as an output of this
+#                  PC: --add-pc when it answers on SSH, else --pc-only
+#     --add-pc     asks which addresses to add to the tablet's allowlist
+#                  (duplicates ignored, nothing else on it is touched), then
+#                  makes it an output of this PC
+#     --pc-only    doesn't touch the tablet at all (this PC must already be
+#                  allowed), only makes it an output of this PC
+#     --rename     rename installed tablets, on this PC and/or as squeezelite
+#                  players — from a menu, or in one go without a terminal:
+#                  --rename <tablet IP or current name> <local|player|both> <new name>
 # =============================================================================
 
 set -e
 
 PC_ONLY=false
 ADD_PC=false
+THIS_PC=false      # --this-pc: --add-pc when the tablet answers on SSH, else --pc-only
 RENAME=false
 RENAME_ARGS=()
+RENAME_SCOPE=""    # the menu's "rename the player" / "rename the output": no scope question
 MODE_GIVEN=false   # no option: the menu asks
+LOCAL=false
 while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) LOCAL=true; shift; continue ;;
+  esac
   MODE_GIVEN=true
   case "$1" in
     --full) ;;
     --pc-only) PC_ONLY=true ;;
     --add-pc) ADD_PC=true ;;
+    --this-pc) THIS_PC=true ;;
     --rename) RENAME=true; shift; RENAME_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
   shift
 done
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors
 RED='\033[0;31m'
@@ -82,8 +101,30 @@ TERMUX_PREFIX=/data/data/com.termux/files/usr
 BOOTSTRAP_SCRIPT=/sdcard/Download/reinstall-bootstrap.sh
 BOOTSTRAP_DONE=/sdcard/Download/reinstall-bootstrap.done
 
+# tablet-server: what Home Assistant talks to on the tablet (tablet/main.go).
+# Built by GitHub Actions and downloaded from the Release, or built from this
+# checkout with --local. Override REPO or pin RELEASE_TAG as for the others.
+REPO="${REPO:-JiPaix/reinstall}"
+RELEASE_TAG="${RELEASE_TAG:-latest}"
+SERVER_PORT=7923   # after the PC's 7920 (screen), 7921 (audio), 7922 (power)
+HA_APP=io.homeassistant.companion.android
+MOONLIGHT_APP=com.limelight
+# The Sunshine app Moonlight streams on command.
+MOONLIGHT_STREAM="${MOONLIGHT_STREAM:-Desktop}"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# fetch <asset> <dest> — download one asset from the GitHub Release.
+fetch() {
+  local asset="$1" dest="$2" url
+  if [ "$RELEASE_TAG" = latest ]; then
+    url="https://github.com/$REPO/releases/latest/download/$asset"
+  else
+    url="https://github.com/$REPO/releases/download/$RELEASE_TAG/$asset"
+  fi
+  curl -fSL --proto '=https' --tlsv1.2 "$url" -o "$dest"
+}
 
 print_header() { echo -e "\n${BOLD}${BLUE}=== $1 ===${NC}\n"; }
 print_ok()     { echo -e "${GREEN}✓${NC} $1"; }
@@ -133,6 +174,58 @@ tablet_ssh() { tablet_ssh_in -n "$@"; }
 tablet_ssh_in() {
   ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
     -p "$SSH_PORT" "$TABLET_IP" "$@"
+}
+
+slugify() { tr '[:upper:] ' '[:lower:]_' <<<"$1" | tr -cd 'a-z0-9_'; }
+
+# Installs Termux packages on the tablet. A Termux whose configured mirror
+# refuses (429 from a throttling mirror, met on the first tablet) gets them
+# from Termux's main repository for this once; its sources.list is left alone.
+tablet_pkg() {  # $@ = packages
+  tablet_ssh "pkg install -y $* >/dev/null 2>&1 || {
+    echo 'deb https://packages.termux.dev/apt/termux-main stable main' > \$TMPDIR/reinstall-main.list
+    o=\"-o Dir::Etc::sourcelist=\$TMPDIR/reinstall-main.list -o Dir::Etc::sourceparts=/dev/null\"
+    apt-get \$o update >/dev/null 2>&1 && apt-get \$o install -y $* >/dev/null 2>&1
+    rc=\$?; rm -f \$TMPDIR/reinstall-main.list; exit \$rc
+  }"
+}
+
+# One value of the tablet's server.env (read once into $SERVER_ENV), without
+# its quotes; empty when the tablet has none.
+SERVER_ENV=""
+prev_env() {  # $1 = key
+  sed -n "s/^$1='\\(.*\\)'\$/\\1/p" <<<"$SERVER_ENV" | head -n1
+}
+
+# Sunshine's id for one of its apps on this PC, the way Sunshine computes it:
+# CRC32 of the name followed by the SHA-256 of its image (none for the default
+# image), as a positive 32-bit number. Moonlight needs it to start a stream on
+# command; it is what "View details" shows there. Nothing when it can't be
+# worked out here (Sunshine isn't on this PC, or doesn't have that app).
+sunshine_app_id() {  # $1 = app name
+  local apps="$HOME/.config/sunshine/apps.json" image file input crc
+  [ -f "$apps" ] && command -v jq &>/dev/null || return 0
+  jq -e --arg n "$1" '.apps[] | select(.name == $n)' "$apps" &>/dev/null || return 0
+  image="$(jq -r --arg n "$1" '[.apps[] | select(.name == $n)][0]."image-path" // ""' "$apps")"
+  input="$1"
+  if [ -n "$image" ] && [ "$(basename "$image")" != box.png ]; then
+    case "$image" in
+      /*) file="$image" ;;
+      *)  file="/usr/share/sunshine/$image" ;;
+    esac
+    [ -f "$file" ] && input+="$(sha256sum "$file" | cut -d' ' -f1)"
+  fi
+  # A gzip stream ends on the CRC32 of its content.
+  crc="$(printf '%s' "$input" | gzip -c | tail -c 8 | od -An -N4 -tu4 | tr -d ' ')"
+  [ "$crc" -ge 2147483648 ] && crc=$((4294967296 - crc))
+  echo "$crc"
+}
+
+# This PC's id as a Sunshine host: what Moonlight calls the PC's UUID.
+sunshine_uuid() {
+  local state="$HOME/.config/sunshine/sunshine_state.json"
+  [ -f "$state" ] && command -v jq &>/dev/null || return 0
+  jq -r '.root.uniqueid // .uniqueid // empty' "$state" 2>/dev/null
 }
 
 # Charge protection per tablet model: the `settings` writes that keep a tablet
@@ -408,6 +501,8 @@ detect_existing() {
       sed -n 's/^load-module module-native-protocol-tcp.*auth-ip-acl=\([^ ]*\).*/acl=\1/p; s/^load-module module-native-protocol-tcp.*auth-anonymous.*/acl=any/p' $TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa 2>/dev/null
       pgrep -x squeezelite >/dev/null && echo run_squeezelite=yes
       pgrep -x pulseaudio >/dev/null && echo run_pulseaudio=yes
+      sed -n \"s/^TABLET_NAME='\\(.*\\)'\$/server=\\1/p; s/^COMPONENTS='\\(.*\\)'\$/components=\\1/p\" ~/.config/tablet-server/server.env 2>/dev/null
+      pgrep -x tablet-server >/dev/null && echo run_server=yes
     " || true)"
     line="$(sed -n 's/^player=//p' <<<"$info")"
     if [ -n "$line" ]; then
@@ -425,6 +520,14 @@ detect_existing() {
     esac
     grep -q '^run_squeezelite=yes' <<<"$info" && state=running || state=stopped
     print_info "Tablet: squeezelite $state, PulseAudio $(grep -q '^run_pulseaudio=yes' <<<"$info" && echo running || echo stopped)"
+    line="$(sed -n 's/^server=//p' <<<"$info")"
+    if [ -n "$line" ]; then
+      desc="$(sed -n 's/^components=//p' <<<"$info")"
+      print_info "Tablet: tablet-server as '$line' (${desc:-nothing to show on command}), $(grep -q '^run_server=yes' <<<"$info" && echo running || echo stopped)"
+      found=true
+    else
+      print_info "Tablet: no tablet-server (what Home Assistant talks to)"
+    fi
   elif [ "$HAVE_ADB" = true ]; then
     # SSH doesn't answer (new tablet, or one that only knows another PC's key).
     info="$(adb_sh 'pm list packages com.termux; ps -A -o ARGS' | tr -d '\r')"
@@ -556,17 +659,21 @@ rename_main() {
     fi
     conf="${RENAME_CONFS[$((choice - 1))]}"
 
-    ask "What should be renamed?"
-    echo "  1) The output on this PC"
-    echo "  2) The player in squeezelite (the name the music server shows)"
-    echo "  3) Both"
-    read -rp "Choice [1-3]: " scope || exit 0
-    case $scope in
-      1) scope=local ;;
-      2) scope=player ;;
-      3) scope=both ;;
-      *) print_error "Invalid choice"; continue ;;
-    esac
+    if [ -n "$RENAME_SCOPE" ]; then
+      scope="$RENAME_SCOPE"
+    else
+      ask "What should be renamed?"
+      echo "  1) The output on this PC"
+      echo "  2) The player in squeezelite (the name the music server shows)"
+      echo "  3) Both"
+      read -rp "Choice [1-3]: " scope || exit 0
+      case $scope in
+        1) scope=local ;;
+        2) scope=player ;;
+        3) scope=both ;;
+        *) print_error "Invalid choice"; continue ;;
+      esac
+    fi
     read -rp "New name: " new || exit 0
     rename_apply "$conf" "$scope" "$new" || true
     rename_list
@@ -586,7 +693,8 @@ add_allowed_ips() {
     exit 1
   fi
   cur_line="$(tablet_ssh 'grep -m1 "^ *squeezelite " ~/.termux/boot/start-squeezelite 2>/dev/null' || true)"
-  PLAYER_NAME="$(sed -n 's/.* -n "\([^"]*\)".*/\1/p' <<<"$cur_line")"
+  PLAYER_NAME="$(tablet_ssh "sed -n \"s/^TABLET_NAME='\\(.*\\)'\$/\\1/p\" ~/.config/tablet-server/server.env 2>/dev/null" || true)"
+  [ -n "$PLAYER_NAME" ] || PLAYER_NAME="$(sed -n 's/.* -n "\([^"]*\)".*/\1/p' <<<"$cur_line")"
   PLAYER_NAME="${PLAYER_NAME:-Tablet}"
 
   acl="$(sed -n 's/.*auth-ip-acl=\([^ ]*\).*/\1/p' <<<"$tcp_line")"
@@ -621,82 +729,252 @@ timeout 10 pactl load-module module-native-protocol-tcp port=$PULSE_PORT 'auth-i
   print_ok "Added:$added"
 }
 
-# STEPS 5 to 7 of a full run (everything but --add-pc and --pc-only).
-setup_player() {
-  # ===========================================================================
-  # STEP 5 — Player settings
-  # ===========================================================================
-  print_header "Player"
+# A full run in three parts: choose_setup asks everything, then apply_audio and
+# apply_server write to the tablet. Nothing is changed before the last question.
 
-  # Defaults come from the boot script already on the tablet, if any.
+# What the tablet is to do and under which name; fills the WANT_* switches and
+# every setting the other two need.
+choose_setup() {
+  local pa_conf="$TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa"
+  local cur_line cur_name cur_server cur_mac cur_tcp apps defaults choice n dash answer serial
+
+  # What the tablet has now: the defaults of every question below.
+  SERVER_ENV="$(tablet_ssh 'cat ~/.config/tablet-server/server.env 2>/dev/null' || true)"
   cur_line="$(tablet_ssh 'grep -m1 "^ *squeezelite " ~/.termux/boot/start-squeezelite 2>/dev/null' || true)"
   cur_name="$(sed -n 's/.* -n "\([^"]*\)".*/\1/p' <<<"$cur_line")"
   cur_server="$(sed -n 's/.* -s \([^ ]*\).*/\1/p' <<<"$cur_line")"
   cur_mac="$(sed -n 's/.* -m \([^ ]*\).*/\1/p' <<<"$cur_line")"
-  # Android hides the real MAC and the server keys the player on it, so each
-  # tablet gets a fixed made-up one (02: = locally administered).
-  [ -n "$cur_mac" ] || cur_mac="$(od -An -N5 -tx1 /dev/urandom | sed 's/^ */02:/; s/ /:/g')"
+  cur_tcp="$(tablet_ssh "grep -m1 '^load-module module-native-protocol-tcp' $pa_conf 2>/dev/null" || true)"
+  # Termux can tell which apps are there (not adb's job: a re-run has none).
+  apps="$(tablet_ssh "for p in $HA_APP $HA_APP.minimal $MOONLIGHT_APP; do pm path \$p >/dev/null 2>&1 && echo \$p; done" || true)"
+  HA_PKG="$(grep -m1 "^$HA_APP" <<<"$apps" || true)"
+  TABLET_MODEL="$(tablet_ssh '/system/bin/getprop ro.product.model' 2>/dev/null | tr -d "\r'" || true)"
 
-  PLAYER_NAME="$(ask_default "Player name" "${cur_name:-Tablet}")"
-  if ! [[ "$PLAYER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9\ _-]*$ ]]; then
+  # ── components ──
+  print_header "What This Tablet Does"
+  if [ -n "$SERVER_ENV" ]; then
+    defaults=""
+    case ",$(prev_env COMPONENTS)," in *,squeezelite,*) defaults+="1 " ;; esac
+    [ -n "$cur_tcp" ] && defaults+="2 "
+    case ",$(prev_env COMPONENTS)," in *,homeassistant,*) defaults+="3 " ;; esac
+    case ",$(prev_env COMPONENTS)," in *,moonlight,*) defaults+="4 " ;; esac
+  else
+    # First run of this version: what an earlier one set up, and both apps
+    # when they are there. A tablet with nothing yet gets everything it can.
+    defaults=""
+    if [ -n "$cur_line" ] || [ -z "$cur_tcp" ]; then defaults+="1 "; fi
+    if [ -n "$cur_tcp" ] || [ -z "$cur_line" ]; then defaults+="2 "; fi
+    [ -n "$HA_PKG" ] && defaults+="3 "
+    grep -qx "$MOONLIGHT_APP" <<<"$apps" && defaults+="4 "
+  fi
+  defaults="${defaults% }"
+  ask "What should this tablet do?"
+  echo "  1) Music player     squeezelite: a player for Lyrion / Music Assistant"
+  echo "  2) Network audio    PCs can use the tablet as an audio output"
+  echo "  3) Home Assistant   show its dashboard on command$([ -n "$HA_PKG" ] || echo '  (app not installed)')"
+  echo "  4) Moonlight        stream this PC's screen on command$(grep -qx "$MOONLIGHT_APP" <<<"$apps" || echo '  (app not installed)')"
+  print_info "Several numbers, separated by spaces. 0 = none of them."
+  read -rp "Choice [${defaults:-0}]: " choice || exit 0
+  choice="${choice:-${defaults:-0}}"
+  if ! [[ "$choice" =~ ^[0-4](\ +[0-4])*$ ]]; then
+    print_error "Numbers from 0 to 4, separated by spaces."
+    exit 1
+  fi
+  WANT_PLAYER=false; WANT_AUDIO=false; WANT_HA=false; WANT_MOONLIGHT=false
+  for n in $choice; do
+    case "$n" in
+      1) WANT_PLAYER=true ;;
+      2) WANT_AUDIO=true ;;
+      3) WANT_HA=true ;;
+      4) WANT_MOONLIGHT=true ;;
+    esac
+  done
+  if [ "$WANT_HA" = true ] && [ -z "$HA_PKG" ]; then
+    print_warn "Home Assistant isn't installed on the tablet — left out (install it, sign in, run this again)"
+    WANT_HA=false
+  fi
+  if [ "$WANT_MOONLIGHT" = true ] && ! grep -qx "$MOONLIGHT_APP" <<<"$apps"; then
+    print_warn "Moonlight isn't installed on the tablet — left out (install it, pair it, run this again)"
+    WANT_MOONLIGHT=false
+  fi
+
+  # ── the tablet's name: its player, its output on a PC, its page in Home
+  # Assistant all go by it ──
+  print_header "Tablet Name"
+  TABLET_NAME="$(prev_env TABLET_NAME)"
+  TABLET_NAME="$(ask_default "Name of this tablet" "${TABLET_NAME:-${cur_name:-${TABLET_MODEL:-Tablet}}}")"
+  if ! [[ "$TABLET_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9\ _-]*$ ]]; then
     print_error "Use letters, digits, spaces, - and _ only."
     exit 1
   fi
-  print_info "The Lyrion / Music Assistant host (Music Assistant: its Squeezelite provider must be enabled)."
-  SERVER="$(ask_default "Music server address" "$cur_server")"
-  if ! [[ "$SERVER" =~ ^[A-Za-z0-9.:-]+$ ]]; then
-    print_error "Not a host name or address: '$SERVER'"
-    exit 1
+  TABLET_SLUG="$(slugify "$TABLET_NAME")"
+  PLAYER_NAME="$TABLET_NAME"
+  # An id that survives a rename: the serial number where adb can read it.
+  TABLET_ID="$(prev_env TABLET_ID)"
+  if [ -z "$TABLET_ID" ] && [ "$HAVE_ADB" = true ]; then
+    serial="$(adb_sh getprop ro.serialno | tr -cd 'A-Za-z0-9')"
+    [ -n "$serial" ] && TABLET_ID="$serial"
   fi
-  PLAYER_MAC="$(ask_default "Player MAC" "$cur_mac")"
-  if ! [[ "$PLAYER_MAC" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]]; then
-    print_error "Not a MAC address: '$PLAYER_MAC'"
-    exit 1
+  [ -n "$TABLET_ID" ] || TABLET_ID="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+
+  # ── music player ──
+  if [ "$WANT_PLAYER" = true ]; then
+    print_header "Music Player"
+    # Android hides the real MAC and the server keys the player on it, so each
+    # tablet gets a fixed made-up one (02: = locally administered).
+    [ -n "$cur_mac" ] || cur_mac="$(od -An -N5 -tx1 /dev/urandom | sed 's/^ */02:/; s/ /:/g')"
+    print_info "The Lyrion / Music Assistant host (Music Assistant: its Squeezelite provider must be enabled)."
+    SERVER="$(ask_default "Music server address" "$cur_server")"
+    if ! [[ "$SERVER" =~ ^[A-Za-z0-9.:-]+$ ]]; then
+      print_error "Not a host name or address: '$SERVER'"
+      exit 1
+    fi
+    PLAYER_MAC="$(ask_default "Player MAC" "$cur_mac")"
+    if ! [[ "$PLAYER_MAC" =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]]; then
+      print_error "Not a MAC address: '$PLAYER_MAC'"
+      exit 1
+    fi
   fi
 
-  # ===========================================================================
-  # STEP 6 — Network audio access control
-  # ===========================================================================
-  print_header "Network Audio Access Control"
+  # ── network audio ──
+  TCP_AUTH=""
+  if [ "$WANT_AUDIO" = true ]; then
+    print_header "Network Audio Access Control"
+    ask "Restrict who can play on the tablet (PulseAudio, TCP $PULSE_PORT) by IP?"
+    print_info "Comma-separated IPs and/or CIDRs — every PC that will use the tablet as an output."
+    read -rp "Allowed IPs (blank = no restriction): " ALLOWED_IPS
+    ALLOWED_IPS="${ALLOWED_IPS// /}"
+    if ! [[ "$ALLOWED_IPS" =~ ^[0-9A-Fa-f.:/,]*$ ]]; then
+      print_error "Only IPs and CIDRs, comma-separated."
+      exit 1
+    fi
+    if [ -n "$ALLOWED_IPS" ]; then
+      TCP_AUTH="auth-ip-acl=127.0.0.1;${ALLOWED_IPS//,/;}"
+      print_ok "Restricting access to: $ALLOWED_IPS"
+    else
+      TCP_AUTH="auth-anonymous=1"
+      print_warn "No IP restriction set — any host that can reach the tablet can play on it"
+    fi
+  fi
 
-  ask "Restrict who can play on the tablet (PulseAudio, TCP $PULSE_PORT) by IP?"
-  print_info "Comma-separated IPs and/or CIDRs — every PC that will use the tablet as an output."
-  read -rp "Allowed IPs (blank = no restriction): " ALLOWED_IPS
-  ALLOWED_IPS="${ALLOWED_IPS// /}"
-  if ! [[ "$ALLOWED_IPS" =~ ^[0-9A-Fa-f.:/,]*$ ]]; then
+  # ── Home Assistant: the page it shows ──
+  HA_PAGE_VALUE=""
+  if [ "$WANT_HA" = true ]; then
+    print_header "Home Assistant"
+    if [ -n "${HA_PAGE:-}" ]; then
+      HA_PAGE_VALUE="$HA_PAGE"
+    else
+      # <dashboard>/<the tablet's name>: one page per tablet, found by its name.
+      dash="$(prev_env HA_PAGE)"
+      dash="${dash%/*}"
+      [ -n "$dash" ] || dash="$(tablet_ssh "sed -n 's|.*homeassistant://navigate/\([^\"/]*\)/.*|\1|p' ~/.termux/boot/10-dashboard 2>/dev/null" | head -n1 || true)"
+      dash="$(ask_default "Dashboard that holds this tablet's page" "${dash:-lovelace}")"
+      if ! [[ "$dash" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        print_error "A dashboard's address: letters, digits, - and _ only."
+        exit 1
+      fi
+      HA_PAGE_VALUE="$dash/$TABLET_SLUG"
+    fi
+    print_info "The tablet will show the page $HA_PAGE_VALUE (set HA_PAGE to point elsewhere)"
+  fi
+
+  # ── Moonlight: which PC, which app ──
+  ML_UUID=""; ML_APPID=""
+  if [ "$WANT_MOONLIGHT" = true ]; then
+    print_header "Moonlight"
+    if [ -z "$(prev_env MOONLIGHT_UUID)" ]; then
+      print_info "Moonlight on the tablet must have connected to this PC once: open it there,"
+      print_info "pick the PC, and enter the PIN it shows in Sunshine's web page."
+      read -rp "Press Enter when that is done, or type 'skip' to leave Moonlight out: " answer || exit 0
+      if [ "${answer,,}" = skip ]; then
+        WANT_MOONLIGHT=false
+      fi
+    fi
+  fi
+  if [ "$WANT_MOONLIGHT" = true ]; then
+    # Starting a stream on command takes the PC's id and the app's, as Sunshine
+    # knows them. Sunshine being on this PC, both are read here; elsewhere they
+    # are what Moonlight shows under "View details".
+    if [ -f "$HOME/.config/sunshine/apps.json" ] && ! command -v jq &>/dev/null; then
+      print_warn "jq not found (reads Sunshine's files)"
+      install_with_pkg_manager jq
+    fi
+    ML_UUID="$(sunshine_uuid)"
+    ML_APPID="$(sunshine_app_id "$MOONLIGHT_STREAM")"
+    [ -n "$ML_UUID" ] || ML_UUID="$(prev_env MOONLIGHT_UUID)"
+    [ -n "$ML_APPID" ] || ML_APPID="$(prev_env MOONLIGHT_APP_ID)"
+    if [ -n "$ML_UUID" ] && [ -n "$ML_APPID" ]; then
+      print_ok "Stream: '$MOONLIGHT_STREAM' of PC $ML_UUID (app id $ML_APPID)"
+    else
+      print_warn "Sunshine's '$MOONLIGHT_STREAM' app wasn't found on this PC."
+      print_info "In Moonlight on the tablet: long press on the PC, then on the app > View details."
+      ML_UUID="$(ask_default "PC UUID" "$ML_UUID")"
+      ML_APPID="$(ask_default "App id" "$ML_APPID")"
+      if ! [[ "$ML_UUID" =~ ^[0-9A-Fa-f-]+$ ]] || ! [[ "$ML_APPID" =~ ^[0-9]+$ ]]; then
+        print_error "A UUID (hex digits and dashes) and a number are expected."
+        exit 1
+      fi
+    fi
+  fi
+
+  # ── who may give the tablet orders ──
+  print_header "Tablet Server Access Control"
+  ask "Restrict who can give orders to the tablet (HTTP, TCP $SERVER_PORT) by IP?"
+  print_info "Comma-separated IPs and/or CIDRs — your Home Assistant server."
+  read -rp "Allowed IPs (blank = no restriction): " SERVER_ALLOWED
+  SERVER_ALLOWED="${SERVER_ALLOWED// /}"
+  if ! [[ "$SERVER_ALLOWED" =~ ^[0-9A-Fa-f.:/,]*$ ]]; then
     print_error "Only IPs and CIDRs, comma-separated."
     exit 1
   fi
-  if [ -n "$ALLOWED_IPS" ]; then
-    TCP_AUTH="auth-ip-acl=127.0.0.1;${ALLOWED_IPS//,/;}"
-    print_ok "Restricting access to: $ALLOWED_IPS"
+  if [ -n "$SERVER_ALLOWED" ]; then
+    print_ok "Restricting access to: $SERVER_ALLOWED"
+    SERVER_ALLOWED="127.0.0.1,$SERVER_ALLOWED"   # this script checks it from the tablet itself
   else
-    TCP_AUTH="auth-anonymous=1"
-    print_warn "No IP restriction set — any host that can reach the tablet can play on it"
+    print_warn "No IP restriction set — any host that can reach the tablet can change what it shows"
   fi
+}
 
+# The tablet's sound: PulseAudio for the player and for the PCs, squeezelite.
+apply_audio() {
+  local pa_conf="$TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa" pkgs=(pulseaudio)
   # ===========================================================================
   # STEP 7 — Tablet: PulseAudio config, boot script, (re)start
   # ===========================================================================
-  print_header "Configuring the Tablet"
+  print_header "Tablet Sound"
 
-  # The previous player goes first (two calls: see the [s] note below).
+  # What was there goes first (two calls: see the [s] note below).
   tablet_ssh 'pkill -f "boot/[s]tart-squeezelite"; pkill -x squeezelite; pkill -9 -x pulseaudio' || true
-  tablet_ssh "rm -f ~/.termux/boot/start-squeezelite $TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa"
+  tablet_ssh "rm -f ~/.termux/boot/start-squeezelite $pa_conf"
+  if [ "$WANT_PLAYER" = false ] && [ "$WANT_AUDIO" = false ]; then
+    print_info "Neither a music player nor network audio: nothing left running for sound"
+    return 0
+  fi
 
-  tablet_ssh 'for p in pulseaudio squeezelite; do command -v $p >/dev/null || pkg install -y $p; done'
+  [ "$WANT_PLAYER" = true ] && pkgs+=(squeezelite)
+  if ! tablet_ssh "for p in ${pkgs[*]}; do command -v \$p >/dev/null || exit 1; done"; then
+    print_info "Installing ${pkgs[*]} in Termux…"
+    if ! tablet_pkg "${pkgs[@]}"; then
+      print_error "Termux couldn't install ${pkgs[*]} — check on the tablet: pkg install ${pkgs[*]}"
+      exit 1
+    fi
+  fi
 
   # Stock default.pa includes default.pa.d/ and only offers the OpenSL ES sink.
   # AAudio is Android's low-latency path (~20 ms of buffer against ~150).
   # Suspend-on-idle has to go: the AAudio sink sometimes deadlocks the whole
   # daemon while suspending after 5 s of silence.
-  tablet_ssh_in "mkdir -p $TERMUX_PREFIX/etc/pulse/default.pa.d && cat > $TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa" <<EOF
+  tablet_ssh_in "mkdir -p $TERMUX_PREFIX/etc/pulse/default.pa.d && cat > $pa_conf" <<EOF
 # Written by android.sh (reinstall) — rewritten at every run.
 load-module module-aaudio-sink sink_name=tablet
 unload-module module-suspend-on-idle
-load-module module-native-protocol-tcp port=$PULSE_PORT $TCP_AUTH
+$([ "$WANT_AUDIO" = true ] && echo "load-module module-native-protocol-tcp port=$PULSE_PORT $TCP_AUTH")
 EOF
-  print_ok "PulseAudio: AAudio sink 'tablet', TCP $PULSE_PORT"
+  if [ "$WANT_AUDIO" = true ]; then
+    print_ok "PulseAudio: AAudio sink 'tablet', TCP $PULSE_PORT"
+  else
+    print_ok "PulseAudio: AAudio sink 'tablet', not open to the network"
+  fi
 
   tablet_ssh_in 'mkdir -p ~/.termux/boot && cat > ~/.termux/boot/start-squeezelite && chmod 700 ~/.termux/boot/start-squeezelite' <<EOF
 #!$TERMUX_PREFIX/bin/sh
@@ -717,10 +995,14 @@ while sleep 30; do
     pkill -x squeezelite
 done &
 
+$(if [ "$WANT_PLAYER" = true ]; then cat <<PLAYER
 while true; do
     squeezelite -n "$PLAYER_NAME" -o tablet -s $SERVER -m $PLAYER_MAC
     sleep 5
 done
+PLAYER
+else echo "# No music player on this tablet: only the watchdog above keeps running.
+wait"; fi)
 EOF
   print_ok "Boot script ~/.termux/boot/start-squeezelite"
 
@@ -729,12 +1011,107 @@ EOF
   tablet_ssh 'pkill -f "boot/[s]tart-squeezelite"; pkill -x squeezelite; pkill -9 -x pulseaudio; sleep 1' || true
   tablet_ssh 'setsid nohup ~/.termux/boot/start-squeezelite >/dev/null 2>&1 &'
   sleep 6
-  if tablet_ssh 'timeout 10 pactl list short sinks | grep -q "tablet.*aaudio" && pgrep -x squeezelite >/dev/null'; then
-    print_ok "PulseAudio and squeezelite running — '$PLAYER_NAME' should appear on $SERVER"
-  else
-    print_error "PulseAudio or squeezelite didn't come up — check on the tablet: pactl list short sinks"
+  if ! tablet_ssh 'timeout 10 pactl list short sinks | grep -q "tablet.*aaudio"'; then
+    print_error "PulseAudio didn't come up — check on the tablet: pactl list short sinks"
     exit 1
   fi
+  if [ "$WANT_PLAYER" = true ]; then
+    if tablet_ssh 'pgrep -x squeezelite >/dev/null'; then
+      print_ok "PulseAudio and squeezelite running — '$PLAYER_NAME' should appear on $SERVER"
+    else
+      print_error "squeezelite didn't come up — check on the tablet: squeezelite -n test -o tablet -s $SERVER"
+      exit 1
+    fi
+  else
+    print_ok "PulseAudio running"
+  fi
+}
+
+# The server Home Assistant talks to (tablet/main.go). A missing binary, or a
+# tablet it can't run on, is no reason to stop: sound doesn't depend on it.
+apply_server() {
+  local bin="$WORK/tablet-server" components="" state
+  print_header "Tablet Server"
+
+  if [ "$LOCAL" = true ]; then
+    if ! command -v go &>/dev/null || [ ! -f "$SCRIPT_DIR/tablet/go.mod" ]; then
+      print_error "--local needs the Go toolchain and a checkout of $REPO (tablet/)."
+      exit 1
+    fi
+    print_info "Building tablet-server from $SCRIPT_DIR/tablet"
+    ( cd "$SCRIPT_DIR/tablet" && GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "$bin" . )
+  elif ! fetch tablet-server "$bin" 2>/dev/null; then
+    print_warn "The $RELEASE_TAG Release of $REPO has no tablet-server — Home Assistant can't reach this tablet yet"
+    print_info "Run this again after the next release, or with --local from a checkout."
+    return 0
+  fi
+  if [ "$(tablet_ssh 'uname -m')" != aarch64 ]; then
+    print_warn "tablet-server is built for 64-bit ARM tablets only — not installed on this one"
+    return 0
+  fi
+  # termux-battery-status: the command side of the Termux:API app.
+  if ! tablet_ssh 'command -v termux-battery-status >/dev/null'; then
+    tablet_pkg termux-api || print_warn "Termux couldn't install termux-api — the battery won't be reported"
+  fi
+
+  [ "$WANT_HA" = true ] && components+="homeassistant,"
+  [ "$WANT_MOONLIGHT" = true ] && components+="moonlight,"
+  [ "$WANT_PLAYER" = true ] && components+="squeezelite,"
+
+  # Termux's pkill -x compares with the command as it was typed: the server is
+  # started by its bare name for that. (-f for one started by its full path,
+  # as a first version of this script did.)
+  tablet_ssh 'pkill -f "bin/[t]ablet-server-run"; pkill -f "bin/[t]ablet-server\$"; pkill -x tablet-server' || true
+  tablet_ssh_in 'mkdir -p ~/.local/bin ~/.config/tablet-server ~/.termux/boot && cat > ~/.local/bin/tablet-server.new && chmod 700 ~/.local/bin/tablet-server.new && mv ~/.local/bin/tablet-server.new ~/.local/bin/tablet-server' < "$bin"
+  tablet_ssh_in 'cat > ~/.config/tablet-server/server.env && chmod 600 ~/.config/tablet-server/server.env' <<EOF
+# Written by android.sh (reinstall) — rewritten at every run, and read back by it.
+PORT='$SERVER_PORT'
+ALLOWED_IPS='$SERVER_ALLOWED'
+TABLET_ID='$TABLET_ID'
+TABLET_NAME='$TABLET_NAME'
+TABLET_MODEL='$TABLET_MODEL'
+COMPONENTS='${components%,}'
+HA_PACKAGE='$([ "$WANT_HA" = true ] && echo "$HA_PKG")'
+HA_PAGE='$HA_PAGE_VALUE'
+MOONLIGHT_UUID='$ML_UUID'
+MOONLIGHT_APP_ID='$ML_APPID'
+EOF
+  # The loop lives in a script of its own, started in the background: a boot
+  # script that never returned could hold back the ones after it.
+  tablet_ssh_in 'cat > ~/.local/bin/tablet-server-run && chmod 700 ~/.local/bin/tablet-server-run' <<EOF
+#!$TERMUX_PREFIX/bin/sh
+# Written by android.sh (reinstall): tablet-server with its settings, restarted
+# if it exits.
+set -a
+. ~/.config/tablet-server/server.env
+set +a
+PATH="\$HOME/.local/bin:\$PATH"
+: > ~/tablet-server.log
+while true; do
+    tablet-server >> ~/tablet-server.log 2>&1
+    sleep 5
+done
+EOF
+  tablet_ssh_in 'cat > ~/.termux/boot/20-tablet-server && chmod 700 ~/.termux/boot/20-tablet-server' <<EOF
+#!$TERMUX_PREFIX/bin/sh
+# Written by android.sh (reinstall). Termux:Boot runs this at boot: the server
+# Home Assistant talks to (port $SERVER_PORT).
+termux-wake-lock
+setsid nohup ~/.local/bin/tablet-server-run >/dev/null 2>&1 &
+EOF
+  tablet_ssh 'setsid nohup ~/.local/bin/tablet-server-run >/dev/null 2>&1 &'
+  sleep 3
+
+  state="$(tablet_ssh "curl -s -m 15 http://127.0.0.1:$SERVER_PORT/state" || true)"
+  case "$state" in
+    *'"display":"unknown"'*)
+      print_warn "tablet-server runs, but can't see the screen: Termux lacks two permissions only adb can grant"
+      print_info "Run this again with adb connected (Wireless debugging on)." ;;
+    *'"display":'*)
+      print_ok "tablet-server running on port $SERVER_PORT — $state" ;;
+    *)
+      print_warn "tablet-server doesn't answer — check on the tablet: cat ~/tablet-server.log" ;;
+  esac
 }
 
 # One tablet from the menu to the summary. A function only so that the end of
@@ -742,27 +1119,26 @@ EOF
 # main flow and stays at the margin (the heredocs in it can't be indented).
 # Every `exit` in it still ends the whole run.
 setup_one_tablet() {
-# No option: ask what to do. An option (--full, --add-pc, …) skips this.
+# No option: ask what to do. An option (--full, --this-pc, …) skips this.
 if [ "$MODE_GIVEN" = false ]; then
-  PC_ONLY=false; ADD_PC=false; RENAME=false
+  PC_ONLY=false; ADD_PC=false; THIS_PC=false; RENAME=false; RENAME_SCOPE=""
   print_header "Android Tablet"
   ask "What do you want to do?"
-  echo "  1) Full install   Set up the tablet (Termux, music player, network audio),"
-  echo "                    then make it an audio output of this PC. Also the way to"
-  echo "                    reconfigure a tablet that is already installed."
-  echo "  2) Add this PC    The tablet was set up from another PC: allow this one to"
-  echo "                    play on it, then make it an output here. Music keeps playing."
-  echo "  3) This PC only   Touch nothing on the tablet (this PC is already allowed"
-  echo "                    there): only make it an output of this PC."
-  echo "  4) Rename         Rename an installed tablet: its output on this PC, its"
-  echo "                    music player, or both."
-  echo "  0) Quit"
+  echo "  On a tablet"
+  echo "    1) Install or reconfigure   Choose what it does — music player, network audio,"
+  echo "                                Home Assistant, Moonlight — and set it up."
+  echo "    2) Rename its music player  The name the music server shows."
+  echo "  On this PC"
+  echo "    3) Use a tablet as an audio output   For a tablet that is already set up."
+  echo "                                Allows this PC on it if it has to; music keeps playing."
+  echo "    4) Rename a tablet's output The name in this PC's sound settings."
+  echo "    0) Quit"
   read -rp "Choice [0-4]: " mode_choice || exit 0
   case "$mode_choice" in
     1) ;;
-    2) ADD_PC=true ;;
-    3) PC_ONLY=true ;;
-    4) RENAME=true ;;
+    2) RENAME=true; RENAME_SCOPE=player ;;
+    3) THIS_PC=true ;;
+    4) RENAME=true; RENAME_SCOPE=local ;;
     0|"") exit 0 ;;
     *) print_error "Invalid choice"; exit 1 ;;
   esac
@@ -776,29 +1152,29 @@ fi
 # =============================================================================
 # STEP 0 — What to do on the tablet first
 # =============================================================================
-if [ "$PC_ONLY" = false ] && [ "$ADD_PC" = false ]; then
+if [ "$PC_ONLY" = false ] && [ "$ADD_PC" = false ] && [ "$THIS_PC" = false ]; then
   print_header "Before You Start"
   echo "On the tablet (a first install only — skip what is already done):"
   echo ""
-  echo "  1. Nothing to install by hand: this script puts F-Droid, Termux,"
-  echo "     Termux:Boot and the KISS launcher on the tablet itself. If Termux is"
-  echo "     already there, it must come from F-Droid, not from the Play Store."
+  echo "  1. Nothing to install by hand for the basics: this script puts F-Droid,"
+  echo "     Termux, Termux:Boot, Termux:API and the KISS launcher on the tablet. If"
+  echo "     Termux is already there, it must come from F-Droid, not the Play Store."
   echo "  2. Settings > About tablet: tap 'Build number' 7 times, then in"
   echo "     Developer options turn on USB debugging."
   echo "  3. Debugging over Wi-Fi, one of:"
   echo "       - plug the tablet in over USB, accept the dialog, run: adb tcpip 5555"
   echo "       - Developer options > Wireless debugging on. A PC the tablet has never"
-  echo "         seen must be paired first: Pair device with pairing code, then run"
-  echo "         adb pair <ip>:<pairing port>. This script finds the port itself."
+  echo "         seen is paired by this script: it only asks for the code the tablet"
+  echo "         shows under 'Pair device with pairing code'."
   echo "  4. Give the tablet a fixed IP in your router (DHCP reservation). Its"
   echo "     Wi-Fi MAC is under Settings > Wi-Fi > your network; this script also"
   echo "     prints it once connected."
   echo "  5. Remove the lock screen (or the player only starts after the first"
   echo "     unlock following a reboot)."
-  echo "  6. Install Home Assistant and Moonlight from the Play Store, and sign in"
-  echo "     to both: Home Assistant to your server, Moonlight paired with your PC"
-  echo "     (it shows a PIN to enter in Sunshine). This script doesn't do it: both"
-  echo "     need your accounts."
+  echo "  6. Only for a tablet that is to show Home Assistant or Moonlight: install"
+  echo "     them from the Play Store and sign in — Home Assistant to your server,"
+  echo "     Moonlight connected once to your PC (it shows a PIN to enter in"
+  echo "     Sunshine). This script doesn't do it: both need your accounts."
   echo ""
   read -rp "Press Enter when the tablet is ready… " _
 fi
@@ -829,7 +1205,8 @@ if [ "$PC_ONLY" = false ]; then
   for f in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
     [ -f "$f" ] && { PUBKEY_FILE="$f"; break; }
   done
-  if [ -z "$PUBKEY_FILE" ]; then
+  # --this-pc gets by without one: it then only adds the output on this PC.
+  if [ -z "$PUBKEY_FILE" ] && [ "$THIS_PC" = false ]; then
     print_error "No SSH key (~/.ssh/id_ed25519.pub or id_rsa.pub) — run ssh-keygen, then retry."
     exit 1
   fi
@@ -857,6 +1234,19 @@ if ! [[ "$TABLET_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   exit 1
 fi
 
+# "Use a tablet as an audio output": with SSH access, this PC is added to the
+# tablet's allowlist first (--add-pc); without, the tablet isn't touched
+# (--pc-only) and this PC has to be allowed there already.
+if [ "$THIS_PC" = true ]; then
+  if tablet_ssh true &>/dev/null; then
+    ADD_PC=true
+  else
+    PC_ONLY=true
+    print_info "No SSH access to this tablet from this PC: only its output is added here."
+  fi
+fi
+
+WANT_PC_OUTPUT=true   # a full run asks; the PC-side modes are about nothing else
 if [ "$PC_ONLY" = false ]; then
   HAVE_SSH=false
   HAVE_ADB=false
@@ -875,15 +1265,6 @@ if [ "$PC_ONLY" = false ]; then
     # Android uses one random MAC per Wi-Fi network: this is the one the router sees.
     WIFI_MAC="$(adb_sh cmd wifi status 2>/dev/null | grep -io -m1 'MAC: [0-9a-f:]*' | cut -d' ' -f2)"
     [ -n "$WIFI_MAC" ] && print_info "Wi-Fi MAC for the router's DHCP reservation: $WIFI_MAC"
-    # Step 6 of "Before You Start": whether they are signed in can't be seen
-    # from here, only whether they are there.
-    if [ "$ADD_PC" = false ]; then
-      apps="$(adb_sh pm list packages | tr -d '\r')"
-      grep -q '^package:io\.homeassistant\.companion\.android' <<<"$apps" ||
-        print_warn "Home Assistant isn't installed on the tablet (step 6 above)"
-      grep -qx 'package:com.limelight' <<<"$apps" ||
-        print_warn "Moonlight isn't installed on the tablet (step 6 above)"
-    fi
   elif [ "$HAVE_SSH" = true ]; then
     if [ "$ADD_PC" = false ]; then
       print_warn "adb not connected — the Android settings step will be skipped"
@@ -926,7 +1307,12 @@ pm grant com.termux android.permission.WRITE_EXTERNAL_STORAGE' || true
 #!$TERMUX_PREFIX/bin/sh
 # Written by android.sh (reinstall): packages, then key-only sshd at boot.
 rm -f $BOOTSTRAP_DONE
-pkg install -y openssh pulseaudio squeezelite || { echo failed > $BOOTSTRAP_DONE; exit 1; }
+# The mirror Termux picked may refuse: then its main repository, for this once.
+pkg install -y openssh || {
+  echo 'deb https://packages.termux.dev/apt/termux-main stable main' > \$TMPDIR/reinstall-main.list
+  o="-o Dir::Etc::sourcelist=\$TMPDIR/reinstall-main.list -o Dir::Etc::sourceparts=/dev/null"
+  apt-get \$o update && apt-get \$o install -y openssh
+} || { echo failed > $BOOTSTRAP_DONE; exit 1; }
 mkdir -p ~/.ssh ~/.termux/boot $TERMUX_PREFIX/etc/ssh/sshd_config.d
 chmod 700 ~/.ssh
 key='$(cat "$PUBKEY_FILE")'
@@ -978,10 +1364,25 @@ EOF
   fi
 
   # ===========================================================================
+  # STEPS 5 and 6 — What the tablet does, its name, who may use it
+  # ===========================================================================
+  if [ "$ADD_PC" = false ]; then
+    choose_setup
+  fi
+
+  # ===========================================================================
   # STEP 4 — Android settings (adb only)
   # ===========================================================================
   if [ "$HAVE_ADB" = true ] && [ "$ADD_PC" = false ]; then
     print_header "Android Settings"
+
+    # What tablet-server needs: the app behind termux-battery-status, and the
+    # two permissions without which Termux can't tell what is on screen
+    # (`dumpsys activity` asks for both).
+    installed="$(adb_sh pm list packages | tr -d '\r')"
+    fdroid_install com.termux.api || true
+    adb_sh 'pm grant com.termux android.permission.DUMP; pm grant com.termux android.permission.PACKAGE_USAGE_STATS'
+    print_ok "Termux may read what the tablet shows"
 
     # Without the exemption Android stops Termux in the background.
     adb_sh 'for p in com.termux com.termux.boot; do dumpsys deviceidle whitelist +$p; done' >/dev/null
@@ -1010,14 +1411,17 @@ settings put global stay_on_while_plugged_in 7'
     # Home Assistant as the tablet's voice assistant (the long press on Home,
     # and what its wake word answers to). The wake word itself is switched on
     # in the app, by hand.
-    ha_app="$(grep -o -m1 'io\.homeassistant\.companion\.android[.a-z]*' <<<"$installed" || true)"
-    if [ -n "$ha_app" ]; then
-      if adb_sh "cmd role add-role-holder android.app.role.ASSISTANT $ha_app" &>/dev/null &&
-         [ "$(adb_sh cmd role get-role-holders android.app.role.ASSISTANT | tr -d '\r' | tail -n1)" = "$ha_app" ]; then
+    if [ "$WANT_HA" = true ]; then
+      if adb_sh "cmd role add-role-holder android.app.role.ASSISTANT $HA_PKG" &>/dev/null &&
+         [ "$(adb_sh cmd role get-role-holders android.app.role.ASSISTANT | tr -d '\r' | tail -n1)" = "$HA_PKG" ]; then
         print_ok "Voice assistant: Home Assistant"
       else
         print_warn "Couldn't make Home Assistant the voice assistant — set it in Settings > Apps > Default apps"
       fi
+      # Its app must stay alive in the background, and be allowed to come to
+      # the front when it isn't the one showing.
+      adb_sh "dumpsys deviceidle whitelist +$HA_PKG; appops set $HA_PKG SYSTEM_ALERT_WINDOW allow" >/dev/null
+      print_ok "Home Assistant app: battery optimisation off, may display over other apps"
     fi
 
     MODEL="$(adb_sh getprop ro.product.model | tr -d '\r')"
@@ -1044,7 +1448,31 @@ settings put global stay_on_while_plugged_in 7'
   if [ "$ADD_PC" = true ]; then
     add_allowed_ips
   else
-    setup_player
+    apply_audio
+    apply_server
+
+    # The tablet as an output of this PC: only with network audio, and asked.
+    WANT_PC_OUTPUT=false
+    if [ "$WANT_AUDIO" = true ]; then
+      echo ""
+      ask "Make the tablet an audio output of this PC? [Y/n]"
+      read -rp "Choice: " answer || answer=n
+      case "${answer,,}" in
+        n|no) ;;
+        *) WANT_PC_OUTPUT=true ;;
+      esac
+    fi
+    if [ "$WANT_PC_OUTPUT" = false ]; then
+      # No network audio any more, or not wanted here: an output left from an
+      # earlier run would only show a dead entry.
+      for old in "$SINK_CONFIG_DIR"/*.conf; do
+        [ -f "$old" ] || continue
+        grep -q "pulse.server.address = \"tcp:$TABLET_IP:" "$old" || continue
+        systemctl --user disable --now "tablet-sink@$(basename "$old" .conf).service" 2>/dev/null || true
+        rm -f "$old"
+        print_ok "Removed this tablet's output from this PC"
+      done
+    fi
   fi
 else
   detect_existing
@@ -1055,6 +1483,7 @@ else
   fi
 fi
 
+if [ "$WANT_PC_OUTPUT" = true ]; then
 # =============================================================================
 # STEP 8 — This PC: the tablet as an audio output
 # =============================================================================
@@ -1266,6 +1695,7 @@ else
   fi
   print_ok "Latency of this PC's link: $LATENCY ms"
 fi
+fi   # WANT_PC_OUTPUT
 
 # =============================================================================
 # Done
@@ -1273,8 +1703,20 @@ fi
 print_header "Setup Complete"
 echo -e "${GREEN}${BOLD}All done!${NC}"
 echo ""
-echo -e "  Output on this PC:  ${CYAN}$PLAYER_NAME${NC} (tablet-sink@$SLUG.service, $LATENCY ms)"
-echo -e "  On another PC:      ${CYAN}android.sh --add-pc${NC}"
+if [ "$PC_ONLY" = false ] && [ "$ADD_PC" = false ]; then
+  does=""
+  [ "$WANT_PLAYER" = true ] && does+="music player, "
+  [ "$WANT_AUDIO" = true ] && does+="network audio, "
+  [ "$WANT_HA" = true ] && does+="Home Assistant, "
+  [ "$WANT_MOONLIGHT" = true ] && does+="Moonlight, "
+  echo -e "  Tablet:             ${CYAN}$TABLET_NAME${NC} (${does%, })"
+  echo -e "  For Home Assistant: ${CYAN}http://$TABLET_IP:$SERVER_PORT${NC} (/capabilities, /state, POST /display/…)"
+  [ "$WANT_HA" = true ] && echo -e "  Its page there:     ${CYAN}$HA_PAGE_VALUE${NC}"
+fi
+if [ "$WANT_PC_OUTPUT" = true ]; then
+  echo -e "  Output on this PC:  ${CYAN}$PLAYER_NAME${NC} (tablet-sink@$SLUG.service, $LATENCY ms)"
+  echo -e "  On another PC:      ${CYAN}android.sh --this-pc${NC}"
+fi
 if [ "$PC_ONLY" = false ]; then
   echo -e "  Tablet shell:       ${CYAN}ssh -p $SSH_PORT $TABLET_IP${NC}"
 fi
