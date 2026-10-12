@@ -238,6 +238,22 @@ func TestWatcher(t *testing.T) {
 	}
 }
 
+// TestBetweenTwoApps: while one app gives way to another nothing is resumed.
+// Seen on the tablet right after a reboot, at the first Moonlight order: the
+// dump is readable, so this is "other", not a tablet whose screen can't be read.
+func TestBetweenTwoApps(t *testing.T) {
+	const transition = "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n    topResumedActivity=null\n  mCurrentFocus=null\n"
+	if activity, _ := parseFront(transition); activity != "" || !readable(transition) {
+		t.Fatalf("a readable dump with nothing resumed: activity %q, readable %v", activity, readable(transition))
+	}
+	if readable("Permission Denial: can't dump ActivityManager from from pid=1, uid=10237 without permission android.permission.DUMP") {
+		t.Error("a refusal is not a readable dump")
+	}
+	if got := displayOf("none", "", "io.homeassistant.companion.android"); got != displayOther {
+		t.Errorf("nothing resumed: %q, want other", got)
+	}
+}
+
 func TestStateWithoutPermissions(t *testing.T) {
 	s := newServer(&fake{frontErr: http.ErrAbortHandler})
 	if got := s.display(); got != displayUnknown {

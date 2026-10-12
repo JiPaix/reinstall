@@ -173,7 +173,7 @@ func (s *server) display() string {
 // whatever holds the focus.
 func (s *server) look() (display string, streamScreen bool) {
 	activity, focus, err := s.sys.front()
-	if err != nil || activity == "" {
+	if err != nil {
 		return displayUnknown, false
 	}
 	return displayOf(activity, focus, s.cfg.HAPackage), activity == moonlightStream
@@ -367,11 +367,20 @@ func (android) front() (string, string, error) {
 		return "", "", err
 	}
 	activity, focus := parseFront(string(out))
-	if activity == "" {
+	if activity == "" && !readable(string(out)) {
 		// Without DUMP and PACKAGE_USAGE_STATS dumpsys prints nothing useful.
-		return "", "", errors.New("no activity in dumpsys output: are DUMP and PACKAGE_USAGE_STATS granted to Termux?")
+		return "", "", errors.New("dumpsys refused: are DUMP and PACKAGE_USAGE_STATS granted to Termux?")
+	}
+	if activity == "" {
+		// Between two apps nothing is resumed for a moment: not a failure.
+		activity = "none"
 	}
 	return activity, focus, nil
+}
+
+// readable tells a dump Termux was allowed to get from a refusal.
+func readable(dump string) bool {
+	return strings.Contains(dump, "ACTIVITY MANAGER ACTIVITIES")
 }
 
 func (android) screenOn() (bool, error) {
