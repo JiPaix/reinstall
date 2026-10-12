@@ -131,6 +131,10 @@ restart_pipewire() {
   systemctl --user start pipewire
   systemctl --user start wireplumber
   systemctl --user start pipewire-pulse
+  # The tablets' outputs (android.sh) are PipeWire clients of their own. They are
+  # PartOf=pipewire.service, but a kill and a start are no restart job, and a
+  # client that lost its daemon doesn't exit: it stays "active", its output gone.
+  systemctl --user try-restart 'tablet-sink@*.service' 2>/dev/null || true
   sleep "$1"
 
   [ -n "$macs" ] || return 0

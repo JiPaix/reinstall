@@ -1,13 +1,15 @@
 ---
 name: android-tests-left
-description: The tests of android.sh (Android tablet as squeezelite player + network audio output) that were still to run when it was written, with steps and pass criteria. Use when the user wants to continue testing android.sh, has a second PC or a second/fresh tablet available, or asks what is left to test on the tablet setup.
+description: The tests of android.sh (an Android tablet as music player, network audio output, Home Assistant and Moonlight screen, with its tablet-server) that are still to run, with steps and pass criteria, plus the open to-dos on the tablet. Use when the user wants to continue testing android.sh, has a second PC or a second/fresh tablet available, or asks what is left to test on the tablet setup.
 ---
 
 # android.sh — tests still to run
 
 `android.sh` was written and tested on 2026-10-04 against one tablet (Lenovo TB128FU,
-Android 13, already set up by hand) from one PC. Read the `android.sh` gotchas at the end
-of `CLAUDE.md` first: they hold the design and every trap met so far.
+Android 13, already set up by hand) from one PC, then reworked on 2026-10-12 (components,
+tablet-server, menu by category). Read the `android.sh` gotchas at the end of `CLAUDE.md`
+first: they hold the design and every trap met so far. Tests outside the tablet (screen,
+audio, release) are in the `tests-left` skill.
 
 When a test below passes, delete its section here (and tell the user); when it fails, fix
 `android.sh` and note the trap in `CLAUDE.md`.
@@ -34,7 +36,10 @@ this PC's output reconnected; both orders worked afterwards. adb was lost, as ex
 
 ## Rules while testing
 
-- Find the tablet's address in `~/.config/tablet-sink/*.conf`; Termux answers on SSH 8022.
+- Find the tablet's address in `~/.config/tablet-sink/*.conf`; Termux answers on SSH 8022,
+  tablet-server on 7923 (from an allowed address). adb has been off on the Lenovo since its
+  reboot of 2026-10-12: what needs it (first install, Android settings, a reboot by command)
+  waits for Wireless debugging to be switched on by hand.
 - Ask before anything the user would hear or lose: restarting the player while music
   plays, test tones, a PipeWire restart (drops Bluetooth), a tablet reboot (adb is lost
   until Wireless debugging is switched on again by hand).
@@ -65,8 +70,8 @@ this PC's output reconnected; both orders worked afterwards. adb was lost, as ex
 Needs a tablet without Termux (a second tablet; or, only if the user asks, uninstalling
 Termux and Termux:Boot on the first one — that wipes its player setup).
 
-Never run so far: the F-Droid downloads and `adb install` of F-Droid, Termux, Termux:Boot
-and the KISS launcher (checked on 2026-10-12, on the Lenovo: `adb install -i
+Never run so far: the F-Droid downloads and `adb install` of F-Droid, Termux, Termux:Boot,
+Termux:API and the KISS launcher (checked on 2026-10-12, on the Lenovo: `adb install -i
 org.fdroid.fdroid` records F-Droid as the installer, with a throwaway APK removed after;
 `cmd package set-home-activity` answers Success where KISS already was the home screen);
 the typed bootstrap (script pushed to `/sdcard/Download`,
@@ -74,17 +79,20 @@ the typed bootstrap (script pushed to `/sdcard/Download`,
 Termux:Boot being opened once; the debloat list on another model (none unless a
 `debloat_list` case is added); a real "unauthorized" wait.
 
-Steps: follow the script's "Before You Start" screen with the user, run `./android.sh --full`,
-watch the tablet's screen during "Installing Termux".
+Steps: follow the script's "Before You Start" screen with the user, run `./android.sh --full`
+(`--local` as long as no Release has `tablet-server`), watch the tablet's screen during
+"Installing Termux".
 
 Likely trouble spots: the fixed `sleep 20` before typing (Termux's first start may take
 longer — then the typed line lands nowhere; the script prints the command to type by hand);
-`pkg install` asking a question despite `-y`; the storage permission grant on a newer
-Termux/Android; `input keycombination` missing on older Android (it is allowed to fail).
+`pkg install` asking a question despite `-y`, or its mirror refusing (the bootstrap then
+falls back to Termux's main repository — that fallback only ran over SSH so far); the
+storage permission grant on a newer Termux/Android; `input keycombination` missing on older Android (it is allowed to fail).
 
 Pass: "Termux packages installed, SSH up", then the run ends like on an existing tablet;
 `ssh -p 8022 <ip> true` works; the player shows up in Music Assistant; the output appears
-on the PC. Then reboot the tablet and check the player comes back within ~1 minute.
+on the PC; `curl http://<ip>:7923/state` answers with a `display` that isn't `unknown`.
+Then reboot the tablet and check the player and the server come back by themselves.
 
 ## 2. `--add-pc` from a second PC
 
@@ -94,7 +102,9 @@ Needs another Linux PC with PipeWire (`pipewire`, `pactl`), on the same network.
   (this goes through the same typed bootstrap as test 1 — untested). adb must be reachable:
   port 5555, or Wireless debugging on (the script finds the port; a PC the tablet has never
   seen must first be paired with `adb pair`, or authorized over USB).
-- Run `./android.sh --add-pc`, give the second PC's address at "IPs to add".
+- Run `./android.sh --add-pc` (or `--this-pc`, the menu's "use a tablet as an audio
+  output": it must pick `--add-pc` once SSH works), give the second PC's address at
+  "IPs to add".
 
 Pass: the detection screen describes the tablet through adb ("a player … is running"), the
 key gets authorized, the address is appended to the allowlist (check
@@ -114,17 +124,22 @@ is what carries the network-output filter.
 Pass: no tablet anywhere in the wizard's lists; at "Reloading Services" one line per tablet,
 "Network output <name>: priority 100" (99, 98… for further ones); afterwards
 `pw-dump | jq -r '.[] | select(.info.props["node.network"]==true) | .info.props | "\(.["priority.session"]) \(.["node.name"])"'`
-shows those values, the tablet units are active again (`systemctl --user list-units
-'tablet-sink@*'`), and the default output is the highest-ranked local device. With no
+shows those values, the tablet's output is back in `pactl list short sinks` (not only its
+unit "active": on 2026-10-10 the unit stayed active with its output gone after
+`restart_pipewire` — it now restarts `tablet-sink@*` itself; that line was run alone and
+brings the output back, but never inside a real `audio.sh` run), and
+the default output is the highest-ranked local device. With no
 tablet installed (`~/.config/tablet-sink` empty or absent) the step must print nothing.
 
 ## 4. Rename through a full run
 
-Run `./android.sh --full`, choose Reconfigure, and give a different player name.
+Run `./android.sh --full`, choose Reconfigure, and give a different tablet name.
 
 Pass: "Removed this tablet's previous output (<old slug>)", a single output for that tablet
 on the PC under the new name with its `priority.session` kept, the player renamed in Music
-Assistant. Rename it back afterwards (`./android.sh --rename <ip> both "<old name>"`).
+Assistant, the new name in `GET /capabilities`. The tablet's page in Home Assistant follows
+the name (`<dashboard>/<slug>`): the view must exist under the new path first, or run with
+`HA_PAGE=<the current page>`. Rename it back afterwards with a second full run.
 
 ## 5. Latency floor, and the hang fix over time
 

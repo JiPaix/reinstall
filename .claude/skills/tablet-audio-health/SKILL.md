@@ -87,3 +87,11 @@ Tablet rebooted at 21:44 with the fix in place and the logging watchdog running:
 PulseAudio (AAudio sink, TCP 4713, no suspend-on-idle) and sshd all came back by
 themselves within about a minute. No hang and no watchdog log at that point. Any
 `~/audio-watchdog.log`, or a PulseAudio younger than the boot script, dates from after that.
+
+## Checkpoint (2026-10-12)
+
+After 7 days up since that reboot, `~/audio-watchdog.log` didn't exist: no hang caught by
+the watchdog over that week. That night `android.sh` then reconfigured the tablet three
+times (PulseAudio and the boot script restarted each time) and the tablet was rebooted at
+03:15: process ages restart from there, and a tablet without a music player now runs the
+same boot script (PulseAudio and the watchdog only).

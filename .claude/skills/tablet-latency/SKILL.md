@@ -7,8 +7,9 @@ description: Find the lowest tunnel latency an Android tablet set up by android.
 
 `android.sh` makes a tablet an audio output of this PC: a PipeWire client
 (`tablet-sink@<slug>.service`, config `~/.config/tablet-sink/<slug>.conf`) holds a PulseAudio
-tunnel to the tablet's AAudio sink `tablet` on TCP 4713. `pulse.latency` in that config (ms,
-from `TUNNEL_LATENCY_MS`, default 40) is the buffer the tunnel aims for. Too low and Wi-Fi
+tunnel to the tablet's AAudio sink `tablet` on TCP 4713. `pulse.latency` in that config (ms;
+measured by `android.sh`'s STEP 9 since 2026-10-12, or imposed with `TUNNEL_LATENCY_MS`) is
+the buffer the tunnel aims for. Too low and Wi-Fi
 jitter empties it: dropouts. This procedure finds the floor.
 
 What it measures: dropouts per setting, as the tablet reports them (stream underflows).
@@ -78,7 +79,8 @@ knowing before a new sweep:
   minute: 20 ms gave 0, 0, 5 (per 30 s) and 2, 4 (per 60 s); 40 ms 1, 0, 3, 1; 100 ms 2 per
   60 s; 200 ms 0. Some underflows therefore remain at every usual value; their cause was
   not established (the PC's graph clock against the tablet's is the untested suspect).
-  STEP 9 settled on 40 for this PC.
+  STEP 9 settled on 40 for this PC, then on 20 at the next run two hours later: 20 is what
+  the config holds.
 
 squeezelite is not affected by this setting: it plays into the same `tablet` sink locally,
 and the server compensates each player's delay when syncing a group.

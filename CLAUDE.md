@@ -4,7 +4,8 @@ Personal dotfiles-style toolkit. Each top-level `*.sh` (`screen.sh`, `audio.sh`)
 prebuilt Go binaries from the latest GitHub Release, runs an interactive TUI setup, generates
 a final shell script + systemd units from templates, and installs everything to `~/.local/bin`
 / `~/.config/systemd/user`. `power.sh`, `session.sh` and `android.sh` are the exceptions — see their
-gotchas below.
+gotchas below. What was written but never run for real is listed in two skills: `tests-left`
+(screen, audio, release) and `android-tests-left` (the tablet).
 
 ## Gotchas
 
@@ -19,14 +20,17 @@ gotchas below.
   of the `#__PROFILES__` marker plus hand-built builders. `jq` is fine for bash-side JSON in a
   top-level installer, gated with `command -v` + the `install_with_pkg_manager` helper (don't
   re-inline the pacman/paru/yay prompt).
-- Go modules are per tool (`screen/`, `audio/`, `power/`), never at the root: from the root
-  `go vet`/`go test` silently do nothing. `cd screen && go vet ./setup/ && go test ./setup/`.
-  `go build ./setup/` fails (output name collides with the dir): `go build -o <path> ./setup/`.
-  `power` is a stdlib-only `main.go` with no `setup/` and no wizard.
-- The `*.sh` run from the checkout, but everything Go-built — including the engine template,
-  `//go:embed`ded into `swapscreen-setup` — comes from the latest GitHub Release. A change
-  under `screen/`/`audio/`/`power/` reaches a reinstall only after an annotated `v*` tag
-  (`vX.Y.0: summary`) is pushed (`release.yml`); pushing to main is not enough.
+- Go modules are per tool (`screen/`, `audio/`, `power/`, `tablet/`), never at the root: from
+  the root `go vet`/`go test` silently do nothing. `cd screen && go vet ./setup/ && go test
+  ./setup/`. `go build ./setup/` fails (output name collides with the dir): `go build -o
+  <path> ./setup/`. `power` and `tablet` are a stdlib-only `main.go` with no `setup/` and no
+  wizard (`cd tablet && go vet . && go test .`; it is built for `android/arm64`).
+- The `*.sh` run from the checkout, but everything built — the Go binaries, including the
+  engine template `//go:embed`ded into `swapscreen-setup`, `tablet-server`, and the Input Home
+  APK — comes from the latest GitHub Release. A change under `screen/`/`audio/`/`power/`/
+  `tablet/` reaches a reinstall only after an annotated `v*` tag (`vX.Y.0: summary`) is
+  pushed (`release.yml`); pushing to main is not enough. `screen.sh`, `audio.sh` and
+  `android.sh` take `--local` to build from the checkout instead.
 - Installers can't run end-to-end outside a graphical session. To test engine logic: replace
   the `#__PROFILES__` line with a `BACKEND=` + `TV_CONNECTORS=(…)` + profile-array block (what
   `generate.go` does), `bash -n`, then stub `gdctl`/`kscreen-doctor`/`sudo`/`systemctl` on
@@ -46,6 +50,8 @@ gotchas below.
   `audio.sh` keep theirs (delete `server.env` to rotate). Same rule for the optional MPD
   server (`audio.sh` step 8b): the password in `~/.config/mpd/mpd.conf` is kept, and
   `default_permissions ""` means a wrong password is silently refused everything.
+  A fourth one, `tablet-server` :7923, runs on each tablet (see "Android tablet"): same
+  middleware, allowlist only, its `server.env` in Termux.
 
 ### Screen
 
@@ -301,7 +307,10 @@ gotchas below.
   wizard (`isNetwork` in `audio/setup/pactl.go`). Their `priority.session` can't come from a
   WirePlumber rule — the node belongs to its own `pipewire -c` client — so `audio.sh`
   rewrites it in `~/.config/tablet-sink/*.conf` (100, 99, … in file order) just before its
-  PipeWire restart, which restarts the units (`PartOf=pipewire.service`). `android.sh`
+  PipeWire restart. `restart_pipewire` restarts the `tablet-sink@*` units itself: it kills
+  and starts PipeWire, which is no restart job, so `PartOf=pipewire.service` doesn't carry
+  over — and a tunnel client that lost its daemon doesn't exit, it stays "active" with its
+  sink gone (seen on 2026-10-10, before that line existed). `android.sh`
   writes none (none = ranks last) and keeps the line `audio.sh` put there. The tunnel's
   remote sink goes in the module args (`target.object = "tablet"`); in `stream.props` it is
   ignored and the stream lands on the tablet's default sink.
@@ -312,8 +321,10 @@ gotchas below.
   replaces the allowlist; `--add-pc` only merges into it and reloads
   `module-native-protocol-tcp` live (music keeps playing, tunnels reconnect in ~3 s).
   `--rename … player` must restart the boot *script*, not just squeezelite (the running
-  loop already read the old name), and leaves PulseAudio up. The PC-side and player names
-  are independent. The debloat list and the charge-protection setting are per
+  loop already read the old name), and leaves PulseAudio up. A full run gives the player
+  and the PC output the tablet's name; `--rename` can still make them differ, and a PC
+  added with `--this-pc` names its own output. A full run without network audio removes this
+  PC's output for that tablet. The debloat list and the charge-protection setting are per
   `ro.product.model`: another tablet, another case (Lenovo: `battery_protected_charge`).
 - Bash traps in `android.sh`: every `tablet_ssh` closes stdin (`ssh -n`), or ssh swallows the
   answers typed ahead for the next prompt (`tablet_ssh_in` is for heredoc-fed calls); and a
