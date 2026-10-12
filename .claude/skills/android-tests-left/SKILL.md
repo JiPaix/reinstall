@@ -133,6 +133,26 @@ Separate skills: `tablet-latency` (sweep, plays tones, needs the user's ears) an
 On 2026-10-04 the tunnel's journal showed a few underflows at the default 40 ms with no
 test running; if the user hears crackles when playing from a PC, run the sweep.
 
+## 5. What the component-based run hasn't done yet
+
+Both real runs of 2026-10-12 had all four components on. Never run for real:
+
+- a tablet without the music player (the boot script must keep PulseAudio and its watchdog
+  alive, `wait`ing), without network audio (no TCP line in `50-reinstall.pa`, no output
+  offered on the PC, the PC's old output removed), with neither (both files gone, nothing
+  left running), without Home Assistant or Moonlight (tablet-server refuses that order
+  with a 404, and its watcher stays off without Home Assistant);
+- a component whose app is missing (it must be left out with a warning);
+- `--this-pc`, `--add-pc` and `--pc-only` past their first prompt since the rewrite
+  (`--this-pc` was only taken to "Reconfigure / Stop");
+- the Moonlight prompts on a PC that isn't the Sunshine host (ids asked by hand);
+- a run without `--local` (needs a Release that has `tablet-server`);
+- a run over SSH alone, adb gone: the Android settings step must be skipped, and the
+  server must still be (re)installed;
+- "Set up another tablet?" answered yes with a real second tablet.
+
+Everything else left to test outside the tablet is in the `tests-left` skill.
+
 ## To do — dropouts that remain on the PC link at every latency
 
 Not a test of `android.sh`: an open problem found on 2026-10-12 while measuring the link
