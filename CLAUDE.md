@@ -166,13 +166,36 @@ gotchas below. What was written but never run for real is listed in two skills: 
   `param_eq` takes *in place of* the shared preset for that channel, so that file repeats the
   shared filters. The BlackShark's `right` (-1.5 dB, eased in the treble) was set by ear on
   this unit; Rtings' own unit measured 4.3 dB. AutoEq averages both ears, so it never shows.
-- **Every graph must be one line under 511 bytes**: an ALSA node drops a longer param value
-  (`spa.alsa: can't copy value`). Hence the correction graph is a `param_eq` naming a preset
+- **An output's graph stays on one line under 511 bytes** (`maxGraph`): past that the ALSA
+  node logs `spa.alsa: can't copy value … (max 511 bytes)` every time the graph is set. The
+  error is about the node's own copy only: the converter, which runs the graph, takes the
+  whole string and the graph loads (measured on PipeWire 1.6.9 with 1.2 kB, on a source and
+  on a sink; not tried on a Bluetooth node). So it is noise, not a failure — and the voice
+  chain below lives with it. Hence the correction graph is a `param_eq` naming a preset
   file (`~/.config/soundbar-setup/eq/`) and the mbeq graph uses the short plugin name. A set
-  graph can't be read back (`pw-dump` shows nothing) and a sink's monitor taps *before* the
-  graphs. To check one: raise the log level (`pw-metadata -n settings 0 log.level 4` for ALSA
-  nodes, `wpctl set-log-level 4` for Bluetooth ones, which live in WirePlumber) and look for
-  `load_filter_graph`, or measure the same graph on a `pw-record` stream.
+  graph can't be read back (`pw-dump` shows nothing; its controls do show in `pw-cli
+  enum-params <node> Props`, as `<node name>:<control>`, and can be set live the same way)
+  and a sink's monitor taps *before* the graphs. To check one: raise the log level
+  (`pw-metadata -n settings 0 log.level 4` for ALSA nodes, `wpctl set-log-level 4` for
+  Bluetooth ones, which live in WirePlumber) and look for `load_filter_graph`; or set
+  `debug.wav-path` on the node (`pw-cli set-param <id> Props '{ params = [ "debug.wav-path"
+  "/path.wav" ] }'`, `""` to stop): the converter then dumps what goes to the device on a
+  sink (after the graphs) and what comes from it on a source (before them).
+- A microphone's **voice chain** (EQ, compressor, de-esser, limiter) is a graph on the
+  mic's own node too, so apps keep picking the mic itself; never asked. One commented
+  filter graph per model in `audio/setup/mics/<bus>-<vendor>-<product>.conf`
+  (`micchain.go` strips it to one line; the same file name in
+  `~/.config/soundbar-setup/mics/` wins), set by one more rule of `98-device-graphs.conf`
+  matching `api.alsa.card.name` + `media.class = "Audio/Source"`. ALSA mics only. It is one
+  graph of ~3 kB — the de-esser's two parallel branches alone don't fit in 511 bytes — so
+  the error above shows up each time the mic appears. Don't move it to `monitor.alsa.rules`
+  (a node *property* `audioconvert.filter-graph.N` has no size limit) without solving the
+  match: `api.alsa.card.name` isn't on the node yet when those rules run, only the
+  serial-bearing `node.name`. The mic's gain comes before the chain: the BlackShark's is
+  calibrated at 100 % ("Mic" 67/67) for one voice, by ear, and its output level is the
+  limiter's input gain. To re-check it, dump the raw input with `debug.wav-path` while
+  `pw-record` takes the mic, render the dump with ffmpeg (`equalizer`/`highpass`… with
+  `t=q`, `ladspa=file=sc4m_1916:…`) and subtract: −85 dB on 2026-10-12.
 - **EQ on/off** is one global runtime switch with a single curve (`audio-eq
   on|off|status|apply`, `GET /eq`, `POST /eq/{on,off}`, the `eq` key of `GET /status`). Not a
   WirePlumber rule: `audio-eq` sets the mbeq graph at slot 8 (after the rules' graphs) with

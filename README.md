@@ -81,6 +81,13 @@ crackle, and has you rank them like the outputs: the highest one connected is
 the default, and stays it: a default picked by hand is put back. Apps can still
 use another one if you pick it inside the app.
 
+A microphone whose model has a voice chain (EQ, compressor, de-esser, limiter)
+gets it on the microphone itself: apps keep picking the same microphone and
+record it processed. The known ones are in
+[`audio/setup/mics/`](audio/setup/mics/), one filter graph per model, tuned by
+ear for one voice; put your own in `~/.config/soundbar-setup/mics/`, same file
+name, and yours is used instead.
+
 You can have every paired Bluetooth device reconnect automatically at boot.
 
 Running it again starts from your previous answers.

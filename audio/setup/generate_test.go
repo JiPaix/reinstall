@@ -261,7 +261,7 @@ func TestChoicesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := LoadChoices()
-	if len(old.Mics) != 1 || old.Mics[0] != (Mic{"alsa_input.x", "Old mic"}) || old.DefaultSource != "" {
+	if len(old.Mics) != 1 || old.Mics[0] != (Mic{Source: "alsa_input.x", Desc: "Old mic"}) || old.DefaultSource != "" {
 		t.Errorf("default mic not migrated: %+v", old)
 	}
 	// …and an output that was never tuned plays the default tone.
@@ -410,6 +410,110 @@ func TestRenderCorrectionEQ(t *testing.T) {
 	for _, f := range []string{preset, presetRight} {
 		if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), f)); !os.IsNotExist(err) {
 			t.Errorf("%s outlived its output", f)
+		}
+	}
+}
+
+// TestRenderMicChain checks the voice chain of a known microphone: one graph on
+// its own node, matched by card name (no serial), and replaced by the user's
+// file for that model.
+func TestRenderMicChain(t *testing.T) {
+	const conf = ".config/wireplumber/wireplumber.conf.d/98-device-graphs.conf"
+	razer := Mic{
+		Source:   "alsa_input.usb-1532_Razer_BlackShark_V2_Pro_2.4_O001-00.mono-fallback",
+		Desc:     "Razer BlackShark V2 Pro 2.4 Mono",
+		Model:    "usb:1532:0555",
+		CardName: "Razer BlackShark V2 Pro 2.4",
+	}
+	// No output of these has a graph: the microphone's rule stands alone.
+	c := Choices{
+		Outputs:    []Output{{Sink: "alsa_output.pci-0000_0b_00.1.analog-stereo", Desc: "Speakers"}},
+		StatusSink: "alsa_output.pci-0000_0b_00.1.analog-stereo",
+		Mics: []Mic{
+			razer,
+			// Same ids over Bluetooth: no card name to match, no chain.
+			{Source: "bluez_input.CC:DD", Desc: "Headset mic", Model: "usb:1532:0555"},
+		},
+	}
+	home, staged := render(t, c)
+
+	body := home(conf)
+	mustContain(t, "voice chain", body,
+		"# Razer BlackShark V2 Pro 2.4 Mono\n",
+		`matches = [{ api.alsa.card.name = "Razer BlackShark V2 Pro 2.4", media.class = "Audio/Source" }]`,
+		"# voice chain: built-in mics/usb-1532-0555.conf\n",
+	)
+	if n := strings.Count(body, "matches ="); n != 1 {
+		t.Errorf("want the Razer microphone's rule only, got %d", n)
+	}
+	if strings.Contains(body, "O001") {
+		t.Error("the rule must not depend on the unit's serial")
+	}
+	// The whole chain is one graph, on one line, its comments gone.
+	var graph string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, "nodes = [") {
+			graph = strings.TrimSpace(line)
+		}
+	}
+	mustContain(t, "graph", graph,
+		`{ nodes = [ { type = builtin name = hp label = bq_highpass control = { "Freq" = 80.0 "Q" = 0.707 } }`,
+		`plugin = sc4m_1916 label = sc4m control = { "RMS/peak" = 0.4 "Attack time (ms)" = 20.0`,
+		`{ output = "deess:Output" input = "sum:In 2" }`,
+		`plugin = fast_lookahead_limiter_1913 label = fastLookaheadLimiter control = { "Input gain (dB)" = -6.5`,
+	)
+	if !strings.HasSuffix(graph, `inputs = [ "hp:In" ] outputs = [ "lim:Output 1" ] }`) || strings.Contains(graph, "#") {
+		t.Errorf("not the chain on one line:\n%s", graph)
+	}
+	mustContain(t, "vars.sh", staged("vars.sh"), "'1. Razer BlackShark V2 Pro 2.4 Mono — voice chain'", "'2. Headset mic'")
+
+	// The user's file for the model wins over the embedded one.
+	mine := filepath.Join(userMicDir(), "usb-1532-0555.conf")
+	if err := os.MkdirAll(userMicDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(text string) {
+		t.Helper()
+		if err := os.WriteFile(mine, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("# mine\n{ nodes = [\n  { type = builtin name = g label = linear control = { \"Mult\" = 0.5 } } # half\n] }\n")
+	if _, err := Render(c, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	mustContain(t, "user chain", home(conf),
+		"# voice chain: "+mine+"\n",
+		"        { nodes = [ { type = builtin name = g label = linear control = { \"Mult\" = 0.5 } } ] }\n",
+	)
+	if strings.Contains(home(conf), "sc4m") {
+		t.Error("the embedded chain outlived the user's")
+	}
+	write("{ nodes = [ { type = builtin }\n")
+	if _, err := Render(c, t.TempDir()); err == nil || !strings.Contains(err.Error(), mine) {
+		t.Errorf("a graph left open must be rejected with its file, got %v", err)
+	}
+
+	// Same $HOME, the microphone gone: nothing is left to set.
+	write("{ }")
+	c.Mics = c.Mics[1:]
+	if _, err := Render(c, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(os.Getenv("HOME"), conf)); !os.IsNotExist(err) {
+		t.Error("the rules outlived the microphone")
+	}
+}
+
+// TestOneLine: comments and line breaks go, strings are kept as they are.
+func TestOneLine(t *testing.T) {
+	got, err := oneLine("# top\n{\n\tnodes = [ # the nodes\n\t\t{ name = \"a # b\"   label = \"q\\\"[\" }\n\t]\n}\n")
+	if want := `{ nodes = [ { name = "a # b" label = "q\"[" } ] }`; err != nil || got != want {
+		t.Errorf("got %q, %v; want %q", got, err, want)
+	}
+	for _, bad := range []string{"", "nodes = [ ]", "{ nodes = [ }", "{ nodes = [ ] ] }", `{ name = "a }`} {
+		if got, err := oneLine(bad); err == nil {
+			t.Errorf("%q: want an error, got %q", bad, got)
 		}
 	}
 }

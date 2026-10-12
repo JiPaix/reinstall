@@ -62,6 +62,14 @@ Left: a normal run (no `--local`) of `screen.sh` and `android.sh` that fetches t
   `linking.follow-default-target`, never observed with a source.
 - **Old answers**: a `choices.json` with a single `default_source` must show that mic first
   in the ranking (unit-tested only).
+- **Voice chain, through the installer.** The chain itself is checked on the real BlackShark
+  microphone (2026-10-12: same output as an offline ffmpeg render of the chain, back after a
+  card profile off/on), but its rule was put in `98-device-graphs.conf` by hand, rendered in
+  a throwaway `$HOME`. Left: an `audio.sh --local` (or a Release that has it) — the
+  microphone shows "— voice chain" on the "Detected devices" screen and in the summary,
+  `choices.json` gets its `model`/`card_name`, and the rule is still there afterwards. Also
+  never tried: a dongle unplugged and plugged back, and a file in
+  `~/.config/soundbar-setup/mics/` replacing the built-in chain (unit-tested only).
 
 ## Home Assistant side (the `ha` session's, on the server)
 

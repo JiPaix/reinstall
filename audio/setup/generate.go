@@ -50,6 +50,10 @@ type Output struct {
 type Mic struct {
 	Source string `json:"source"`
 	Desc   string `json:"desc"`
+	// Model and CardName are kept so a microphone that is off during a re-run
+	// still gets its voice chain (see micchain.go).
+	Model    string `json:"model,omitempty"`
+	CardName string `json:"card_name,omitempty"`
 }
 
 // Effects names what was asked for the output, for the summaries.
@@ -355,7 +359,7 @@ func writeVarsSh(path string, c Choices) error {
 	fmt.Fprintf(&b, "HAS_EQ=%t\n", hasEQ)
 	b.WriteString("MIC_SUMMARY=(")
 	for i, m := range c.Mics {
-		fmt.Fprintf(&b, " %s", shQuote(fmt.Sprintf("%d. %s", i+1, m.Desc)))
+		fmt.Fprintf(&b, " %s", shQuote(fmt.Sprintf("%d. %s%s", i+1, m.Desc, micLabel(m))))
 	}
 	b.WriteString(" )\n")
 	b.WriteString("DISABLED_CARDS=(")

@@ -80,6 +80,13 @@ func applySaved(devs Devices, c Choices, staging string) {
 			}
 		}
 	}
+	for i, m := range c.Mics {
+		for _, d := range devs.Sources {
+			if d.Name == m.Source {
+				c.Mics[i].Model, c.Mics[i].CardName = d.Model, d.CardName
+			}
+		}
+	}
 	written, err := Render(c, staging)
 	if err != nil {
 		fatalf("generating files: %v", err)
@@ -137,7 +144,11 @@ func detected(devs Devices, prev Choices) string {
 		sinks[i] += correctionLabel(Output{Desc: d.Desc, Model: d.Model})
 	}
 	list("Outputs", sinks)
-	list("Microphones", deviceLabels(devs.Sources))
+	mics := deviceLabels(devs.Sources)
+	for i, d := range devs.Sources {
+		mics[i] += micLabel(Mic{Source: d.Name, Model: d.Model, CardName: d.CardName})
+	}
+	list("Microphones", mics)
 
 	var absent []string
 	for _, p := range prev.Outputs {
@@ -192,12 +203,12 @@ func runWizard(devs Devices, prev Choices) Choices {
 	for _, p := range prev.Mics {
 		micOrder = append(micOrder, p.Source)
 		if !hasDevice(devs.Sources, p.Source) && !hidden[cardOf(p.Source, "")] {
-			mics = append(mics, Device{Name: p.Source, Desc: p.Desc, Absent: true})
+			mics = append(mics, Device{Name: p.Source, Desc: p.Desc, Model: p.Model, CardName: p.CardName, Absent: true})
 		}
 	}
 	for _, d := range rank(w, "Microphone priority",
 		"When several microphones are connected, the highest one is the default.", mics, micOrder) {
-		c.Mics = append(c.Mics, Mic{Source: d.Name, Desc: d.Desc})
+		c.Mics = append(c.Mics, Mic{Source: d.Name, Desc: d.Desc, Model: d.Model, CardName: d.CardName})
 	}
 
 	// 3. Outputs, by priority.
@@ -522,7 +533,7 @@ func summary(c Choices) string {
 	if len(c.Mics) > 0 {
 		b.WriteString("\nMicrophones, preferred first\n")
 		for i, m := range c.Mics {
-			fmt.Fprintf(&b, "  %d. %s\n", i+1, m.Desc)
+			fmt.Fprintf(&b, "  %d. %s%s\n", i+1, m.Desc, micLabel(m))
 		}
 	}
 	fmt.Fprintf(&b, "\nStatus server reports on: %s\n", c.StatusDesc)

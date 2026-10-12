@@ -17,7 +17,8 @@ import (
 //     them whenever the node appears (node.filter-graph.rules, numbered from 0).
 //     The swap comes first, so a correction's per-channel part (eqdb.go) lands
 //     on the driver it was meant for;
-//   - the equalizer has a switch: audio-eq sets or clears it at eqGraphIndex.
+//   - the equalizer has a switch: audio-eq sets or clears it at eqGraphIndex;
+//   - a microphone's voice chain (micchain.go) is permanent too.
 
 // graphsConf is the WirePlumber config holding the rules.
 const graphsConf = "98-device-graphs.conf"
@@ -26,8 +27,10 @@ const graphsConf = "98-device-graphs.conf"
 // WirePlumber hands out to the rules.
 const eqGraphIndex = 8
 
-// maxGraph: an ALSA node drops a param value over 511 bytes (spa.alsa: "can't
-// copy value … (max 511 bytes)"), so every graph has to fit on one short line.
+// maxGraph: over 511 bytes an ALSA node logs an error each time the graph is
+// set (spa.alsa: "can't copy value … (max 511 bytes)"). That is its own copy:
+// the converter, which runs the graph, takes the whole string. The outputs'
+// graphs are kept under it all the same; a voice chain can't be.
 const maxGraph = 511
 
 // swapGraph crosses left and right.
@@ -66,7 +69,7 @@ type GraphRule struct {
 }
 
 // buildRules returns one rule per output with swapped channels and/or a
-// correction EQ.
+// correction EQ, and one per microphone with a voice chain.
 func buildRules(c Choices) ([]GraphRule, error) {
 	db, err := loadEQDB()
 	if err != nil {
@@ -108,11 +111,33 @@ func buildRules(c Choices) ([]GraphRule, error) {
 		seen[r.Match] = true
 		rules = append(rules, r)
 	}
+	for _, m := range c.Mics {
+		graph, from, ok, err := micChain(m)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		// Well over maxGraph: its de-esser alone, two branches side by side,
+		// doesn't fit.
+		r := GraphRule{
+			Desc:   confString(m.Desc),
+			Match:  fmt.Sprintf(`api.alsa.card.name = "%s", media.class = "Audio/Source"`, confString(m.CardName)),
+			Graphs: []string{graph},
+			Notes:  []string{confString("voice chain: " + from)},
+		}
+		if seen[r.Match] {
+			continue
+		}
+		seen[r.Match] = true
+		rules = append(rules, r)
+	}
 	return rules, nil
 }
 
 // writeRules renders the rules to WirePlumber's conf.d with their preset
-// files, or removes the lot when no output needs one. It returns the path of
+// files, or removes the lot when no device needs one. It returns the path of
 // the rules when written.
 func writeRules(c Choices) (string, error) {
 	rules, err := buildRules(c)

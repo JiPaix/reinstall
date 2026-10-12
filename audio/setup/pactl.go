@@ -39,8 +39,9 @@ type Device struct {
 	Card  string // owning card (alsa_card.* / bluez_card.*), "" if none
 	Class string // properties["device.class"], e.g. "sound" | "monitor"
 
-	// Model and CardName come from the card: the model id a correction EQ is
-	// looked up by (see modelID), and the ALSA card name ("" on Bluetooth).
+	// Model and CardName come from the card: the model id a correction EQ or
+	// a voice chain is looked up by (see modelID), and the ALSA card name (""
+	// on Bluetooth).
 	Model    string
 	CardName string
 
@@ -123,6 +124,15 @@ func (n pactlNode) toDevice() Device {
 	}
 }
 
+// withCard fills in what only the device's card knows.
+func (d Device) withCard(cards map[string]pactlNode) Device {
+	if card, ok := cards[d.Card]; ok {
+		d.Model = modelID(card.Properties)
+		d.CardName = card.Properties["alsa.card_name"]
+	}
+	return d
+}
+
 // DetectDevices lists the cards plus the offerable sinks and (non-monitor)
 // sources. Cards include the ones whose profile is off, so a device hidden by
 // a previous run is still listed.
@@ -158,19 +168,14 @@ func DetectDevices() (Devices, error) {
 		if isVirtual(n.Name) || isNetwork(n) {
 			continue
 		}
-		dev := n.toDevice()
-		if card, ok := byName[dev.Card]; ok {
-			dev.Model = modelID(card.Properties)
-			dev.CardName = card.Properties["alsa.card_name"]
-		}
-		d.Sinks = append(d.Sinks, dev)
+		d.Sinks = append(d.Sinks, n.toDevice().withCard(byName))
 	}
 	for _, n := range sources {
 		dev := n.toDevice()
 		if isVirtual(n.Name) || isNetwork(n) || dev.Class == "monitor" || strings.HasSuffix(n.Name, ".monitor") {
 			continue
 		}
-		d.Sources = append(d.Sources, dev)
+		d.Sources = append(d.Sources, dev.withCard(byName))
 	}
 	return d, nil
 }
