@@ -15,15 +15,11 @@ Rules: read the "All installers" gotchas of `CLAUDE.md` first — an installer o
 never started with stdin closed or short of answers, and the Go-built parts only reach a
 normal run after a `v*` tag (`--local` builds from the checkout).
 
-## Release build
+## Release build — passed with v1.16.0 (2026-10-12)
 
-- The first tag after 2026-10-12 is the first time `release.yml` builds `inputhome.apk`
-  (`screen/inputhome/build.sh`, which downloads its pinned toolchain) and `tablet-server`
-  (android/arm64). Check the run, and that both are among the Release's assets.
-- `inputhome.apk` from the Release must carry the same certificate as a local build
-  (`INPUTHOME_KEYSTORE_B64` secret): `apksigner verify --print-certs`, SHA-256 starting
-  `c2f9a0ea`. If it differs, the installer still works (it replaces the app) but the
-  secret didn't apply.
+`release.yml` built `inputhome.apk` and `tablet-server` (android/arm64); the APK carries
+the same certificate as a local build, so the `INPUTHOME_KEYSTORE_B64` secret applies.
+Left: a normal run (no `--local`) of `screen.sh` and `android.sh` that fetches them.
 
 ## screen.sh
 
