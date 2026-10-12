@@ -22,6 +22,8 @@
 # - Enables Sunshine (if installed) so it starts with every graphical session
 # - amdgpu: writes a ddcutilrc that keeps ddcutil's I2C bus scan serial
 #   (ddcutil 3.0.0's parallel scan hangs the GPU at login)
+# - Offers Input Home for an Android TV (over adb): the TV's Home key, wake and
+#   boot open its HDMI input instead of the home screen
 # =============================================================================
 
 set -euo pipefail
@@ -29,7 +31,9 @@ set -euo pipefail
 # --local: build swapscreen-server/swapscreen-setup from this checkout with the
 # Go toolchain instead of downloading the Release assets. For testing engine
 # changes before they're tagged/released — see .github/workflows/release.yml
-# for the exact build this mirrors.
+# for the exact build this mirrors. Input Home, when asked for, is then built
+# from the checkout too (screen/inputhome/build.sh, which downloads its own
+# toolchain on the first build).
 LOCAL=false
 for arg in "$@"; do
   case "$arg" in
@@ -931,6 +935,294 @@ else
   print_ok "Wrote $DDCUTIL_RC (serial I2C bus scan)"
 fi
 
+# =============================================================================
+# STEP 13 — Input Home on an Android TV (optional)
+# =============================================================================
+# Input Home (screen/inputhome) is a small Android TV app: the Home key, a wake
+# from standby and a boot all land on the TV's HDMI input instead of the stock
+# home screen (a long press on Home still opens that one). Only offered when a
+# TV is configured, and asked every time: a TV is not necessarily an Android TV.
+# It goes in over adb, which the TV has to allow.
+# Last step on purpose: its prompts and network waits come once swapscreen
+# itself is fully installed, and whatever goes wrong here only skips a TV.
+INPUTHOME_PKG=net.homelab.inputhome
+INPUTHOME_A11Y="$INPUTHOME_PKG/.HomeKeyService"
+INPUTHOME_TVS_FILE="$HOME/.config/swapscreen-setup/android-tvs"   # addresses of the last run
+INPUTHOME_APK=""    # fetched or built once, for every TV of this run
+INPUTHOME_DONE=()   # "<address> (<pinned input>)", for the final summary
+TV_ADB=""           # host:port of the TV being set up
+TV_INPUT_ID=""      # the input picked for it ("" = none)
+TV_INPUT_LABEL=""
+
+tv_adb() { adb -s "$TV_ADB" "$@"; }
+# -n: adb shell reads stdin, and would swallow the answers typed ahead.
+tv_sh() { tv_adb shell -n "$@"; }
+adb_state() { adb devices | awk -v d="$1" '$1 == d { print $2 }'; }
+
+# Connects adb to $TV_ADB. A TV that doesn't know this PC shows a dialog and
+# answers "unauthorized" until it is accepted: wait for that instead of failing.
+tv_connect() {
+  local state waited=0 settle=0
+  timeout 10 adb connect "$TV_ADB" &>/dev/null || true
+  while :; do
+    state="$(adb_state "$TV_ADB")"
+    case "$state" in
+      device) return 0 ;;
+      unauthorized) ;;
+      offline|connecting|authorizing)
+        # transient right after the connection
+        if [ "$settle" -ge 6 ]; then return 1; fi
+        sleep 1; settle=$((settle + 1)); continue ;;
+      *) return 1 ;;
+    esac
+    if [ "$waited" -eq 0 ]; then
+      print_warn "The TV doesn't know this PC yet"
+      print_info "On its screen: tick 'Always allow from this computer', then Allow. Waiting…"
+    elif [ "$waited" -ge 120 ]; then
+      print_warn "Not authorized after 2 minutes"
+      return 1
+    elif [ $((waited % 30)) -eq 0 ]; then
+      # The dialog went away (timeout): a new connection shows it again.
+      adb disconnect "$TV_ADB" &>/dev/null || true
+      timeout 10 adb connect "$TV_ADB" &>/dev/null || true
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+}
+
+# The APK: built from this checkout with --local, else the Release's.
+inputhome_get_apk() {
+  if [ -n "$INPUTHOME_APK" ]; then return 0; fi
+  local apk="$WORK/inputhome.apk" src="$SCRIPT_DIR/screen/inputhome"
+  if $LOCAL; then
+    print_info "Building Input Home from $src (the first build downloads its toolchain, ~320 MB)"
+    if ! "$src/build.sh" > "$WORK/inputhome-build.log" 2>&1; then
+      print_warn "Build failed: $(tail -n 1 "$WORK/inputhome-build.log")"
+      return 1
+    fi
+    cp "$src/out/inputhome.apk" "$apk"
+  elif ! fetch inputhome.apk "$apk" 2>/dev/null; then
+    print_warn "The $RELEASE_TAG Release of $REPO has no inputhome.apk"
+    return 1
+  fi
+  INPUTHOME_APK="$apk"
+}
+
+# The TV's HDMI inputs, from `dumpsys tv_input` on stdin: one
+# "<port>\t<input id>\t<state>" line each, by port. State 0 is an input with a
+# live source on it (TvInputManager.INPUT_STATE_CONNECTED). The port comes from
+# the hardware list; a TV without one gets "?" and every input naming HDMI.
+tv_hdmi_inputs() {
+  awk '
+    # inputMap: "<id>: info: TvInputInfo{…}; state: N"
+    / info: TvInputInfo\{.*; state: [0-9]+/ {
+      id = $1; sub(/:$/, "", id)
+      st = $0; sub(/.*; state: /, "", st)
+      state[id] = st + 0
+    }
+    # "TvInputHardwareInfo {id=D, type=9, …, hdmi_port=P, …}"
+    /TvInputHardwareInfo \{id=[0-9]+,.*hdmi_port=[0-9]+/ {
+      d = $0; sub(/.*TvInputHardwareInfo \{id=/, "", d); sub(/,.*/, "", d)
+      p = $0; sub(/.*hdmi_port=/, "", p); sub(/[^0-9].*/, "", p)
+      port[d] = p
+    }
+    # mHardwareInputIdMap: "D: <id>" lines, until the next section
+    /mHardwareInputIdMap:/ { inmap = 1; next }
+    inmap && /^ +[0-9]+: / { d = $1; sub(/:$/, "", d); input[d] = $2; next }
+    { inmap = 0 }
+    END {
+      for (d in input)
+        if ((d in port) && (input[d] in state)) {
+          print port[d] "\t" input[d] "\t" state[input[d]]; n++
+        }
+      if (!n)
+        for (id in state)
+          if (tolower(id) ~ /hdmi/) print "?\t" id "\t" state[id]
+    }
+  ' | sort -n
+}
+
+# Picks the input this PC is plugged into: the only HDMI input with a live
+# source, else asked. Sets TV_INPUT_ID ("" = none: Input Home then opens the TV
+# app on its last input) and TV_INPUT_LABEL.
+inputhome_pick_input() {
+  local lines=() active=() line port id state i=0 choice
+  TV_INPUT_ID=""; TV_INPUT_LABEL="last input used"
+  mapfile -t lines < <(tv_sh dumpsys tv_input 2>/dev/null | tr -d '\r' | tv_hdmi_inputs)
+  if [ ${#lines[@]} -eq 0 ]; then
+    print_warn "Couldn't list the TV's HDMI inputs — no input set: Input Home opens the last one used"
+    return 0
+  fi
+  for line in "${lines[@]}"; do
+    IFS=$'\t' read -r port id state <<<"$line"
+    if [ "$state" = 0 ]; then active+=("$line"); fi
+  done
+  if [ ${#active[@]} -eq 1 ]; then
+    IFS=$'\t' read -r port id state <<<"${active[0]}"
+    TV_INPUT_ID="$id"; TV_INPUT_LABEL="HDMI $port"
+    print_ok "HDMI $port is the only input with a live source: this PC"
+    return 0
+  fi
+  if [ ${#active[@]} -eq 0 ]; then
+    print_warn "No HDMI input has a live source right now"
+  else
+    print_info "Several HDMI inputs have a live source."
+  fi
+  ask "Which input is this PC plugged into?"
+  for line in "${lines[@]}"; do
+    IFS=$'\t' read -r port id state <<<"$line"
+    i=$((i + 1))
+    if [ "$port" = "?" ]; then port="$id"; else port="HDMI $port"; fi
+    if [ "$state" = 0 ]; then echo "  $i) $port (live source)"; else echo "  $i) $port"; fi
+  done
+  echo "  0) none — open the last input used"
+  read -rp "Choice [0-$i]: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ]; then
+    IFS=$'\t' read -r port id state <<<"${lines[$((choice - 1))]}"
+    TV_INPUT_ID="$id"
+    if [ "$port" = "?" ]; then TV_INPUT_LABEL="$id"; else TV_INPUT_LABEL="HDMI $port"; fi
+  fi
+}
+
+# Installs and sets up Input Home on the connected $TV_ADB. Every value sent
+# through `adb shell` is re-read by the TV's shell, hence the inner quotes.
+inputhome_install_tv() {
+  local sdk out list
+  sdk="$(tv_sh getprop ro.build.version.sdk 2>/dev/null | tr -d '\r')"
+  if ! [[ "$sdk" =~ ^[0-9]+$ ]] || [ "$sdk" -lt 26 ]; then
+    print_warn "Android API ${sdk:-unknown}: Input Home needs Android 8 (API 26) or later — skipped"
+    return 1
+  fi
+  # No `grep -q` at the end of a pipe: it exits early and adb dies of SIGPIPE,
+  # which pipefail turns into a failure.
+  if ! tv_sh pm list features 2>/dev/null | grep -F 'android.software.leanback' >/dev/null; then
+    print_warn "$TV_ADB is an Android device but not an Android TV — skipped"
+    return 1
+  fi
+
+  out="$(tv_adb install -r "$INPUTHOME_APK" 2>&1)" || true
+  case "$out" in
+    *INSTALL_FAILED_UPDATE_INCOMPATIBLE*|*INSTALL_FAILED_VERSION_DOWNGRADE*)
+      # Signed by another key, or a newer build: Android only takes it as a
+      # fresh install. Nothing is lost, the settings below are redone anyway.
+      print_info "The Input Home already on the TV can't be updated in place — replacing it"
+      tv_adb uninstall "$INPUTHOME_PKG" &>/dev/null || true
+      out="$(tv_adb install "$INPUTHOME_APK" 2>&1)" || true ;;
+  esac
+  if [[ "$out" != *Success* ]]; then
+    print_warn "adb install failed: $(tail -n 1 <<<"$out")"
+    return 1
+  fi
+  print_ok "Installed Input Home on $TV_ADB"
+
+  # enabled_accessibility_services is a ':'-separated list shared with every
+  # other accessibility service of the TV: add to it, never replace it.
+  list="$(tv_sh settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r')"
+  if [ "$list" = null ]; then list=""; fi
+  case ":$list:" in
+    *":$INPUTHOME_A11Y:"*|*":$INPUTHOME_PKG/$INPUTHOME_PKG.HomeKeyService:"*) ;;
+    *) tv_sh settings put secure enabled_accessibility_services "'${list:+$list:}$INPUTHOME_A11Y'" ;;
+  esac
+  tv_sh settings put secure accessibility_enabled 1
+  sleep 2
+  if tv_sh dumpsys accessibility 2>/dev/null | grep -F 'Enabled services' | grep -F "$INPUTHOME_PKG/" >/dev/null; then
+    print_ok "Enabled its accessibility service (the Home key)"
+  else
+    print_warn "Its accessibility service doesn't show as enabled — on the TV: Settings → Accessibility → Input Home"
+  fi
+
+  inputhome_pick_input
+  if [[ "$TV_INPUT_ID" == *"'"* ]]; then
+    print_warn "Unexpected input id — no input set"
+    TV_INPUT_ID=""; TV_INPUT_LABEL="last input used"
+  fi
+  # Starting the activity with input_id stores it ("" clears it) — and opens
+  # that input on the TV right away.
+  if tv_sh am start -n "$INPUTHOME_PKG/.TvActivity" --es input_id "'$TV_INPUT_ID'" &>/dev/null; then
+    print_ok "Input Home opens: $TV_INPUT_LABEL"
+  else
+    print_warn "Couldn't set the input — Input Home opens the last one used"
+    TV_INPUT_LABEL="last input used"
+  fi
+  INPUTHOME_DONE+=("$TV_ADB ($TV_INPUT_LABEL)")
+}
+
+inputhome_one_tv() {  # $1 = host[:port]
+  TV_ADB="$1"
+  if [[ "$TV_ADB" != *:* ]]; then TV_ADB+=":5555"; fi
+  print_info "Connecting to $TV_ADB…"
+  if ! tv_connect; then
+    print_warn "adb can't reach $TV_ADB (is the TV on?) — skipped"
+    print_info "On the TV: Settings → Device Preferences → About → Build, 7 presses; then"
+    print_info "Developer options → USB debugging (and Network debugging where it exists)."
+    return 1
+  fi
+  inputhome_install_tv
+}
+
+inputhome_setup() {
+  local answer addr known=() kept=()
+  ask "Install Input Home on an Android TV? [y/N]"
+  print_info "Home key, wake and boot open the TV's HDMI input instead of the home screen."
+  print_info "Android TV only (8 or later), with adb debugging allowed on the TV."
+  read -rp "Choice: " answer
+  case "${answer,,}" in
+    y|yes) ;;
+    *) print_info "Skipped."; return 0 ;;
+  esac
+
+  if ! command -v adb &>/dev/null; then
+    print_warn "adb is not installed (Arch package: android-tools)"
+    # In a subshell: the helper exits on a wrong answer, and this is no reason
+    # to end the install on an error.
+    ( install_with_pkg_manager android-tools ) || true
+    if ! command -v adb &>/dev/null; then
+      print_warn "Still no adb — skipped"
+      return 0
+    fi
+  fi
+  # Before any address is asked: without the APK there is nothing to install.
+  inputhome_get_apk || return 0
+
+  if [ -f "$INPUTHOME_TVS_FILE" ]; then mapfile -t known < "$INPUTHOME_TVS_FILE"; fi
+  for addr in "${known[@]}"; do
+    [[ "$addr" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || continue
+    ask "Install it on $addr, as last time? [Y/n]"
+    read -rp "Choice: " answer
+    case "${answer,,}" in
+      n|no) continue ;;
+    esac
+    kept+=("$addr")
+    inputhome_one_tv "$addr" || true
+  done
+  while :; do
+    if [ ${#kept[@]} -eq 0 ]; then answer="an"; else answer="another"; fi
+    read -rp "Address of $answer Android TV (blank = none): " addr
+    if [ -z "$addr" ]; then break; fi
+    if ! [[ "$addr" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+      print_warn "Not an address: $addr (expected an IP or a host name, with an optional :port)"
+      continue
+    fi
+    if in_list "$addr" "${kept[@]}"; then continue; fi
+    kept+=("$addr")
+    inputhome_one_tv "$addr" || true
+  done
+
+  if [ ${#kept[@]} -gt 0 ]; then
+    mkdir -p "$(dirname "$INPUTHOME_TVS_FILE")"
+    printf '%s\n' "${kept[@]}" > "$INPUTHOME_TVS_FILE"
+  else
+    rm -f "$INPUTHOME_TVS_FILE"
+  fi
+}
+
+# GNOME's setup doesn't ask which screens are TVs: offered there regardless.
+if [ "$BACKEND" != kde ] || [ ${#TV_CONNECTORS[@]} -gt 0 ]; then
+  print_header "Input Home (Android TV)"
+  inputhome_setup || print_warn "Input Home setup stopped early — the rest of the install is unaffected"
+fi
+
 print_header "Setup Complete"
 if ! systemctl --user is-active -q "$SERVICE"; then
   print_warn "$SERVICE is not running — check: systemctl --user status $SERVICE"
@@ -947,6 +1239,9 @@ if [ "$BACKEND" = kde ]; then
   done
   echo -e "  TVs:          ${CYAN}${tv_line:-none}${NC}"
 fi
+for tv in "${INPUTHOME_DONE[@]}"; do
+  echo -e "  Input Home:   ${CYAN}$tv${NC}"
+done
 echo -e "  Switch:       ${CYAN}swapscreen --monitor | --tv | --taiko${NC} (no option: toggle; --help)"
 echo -e "  Server:       ${CYAN}http://localhost:$SERVER_PORT/mode${NC}"
 echo -e "  Access token: ${CYAN}$AUTH_TOKEN${NC}"

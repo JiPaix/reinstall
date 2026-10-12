@@ -1,10 +1,10 @@
 name: Release
 
 # Build the Go binaries (server + interactive setup, for each of screen and
-# audio; a single server for power) and attach them — plus the static systemd
-# unit files — to a GitHub Release. The install scripts (screen.sh / audio.sh /
-# power.sh) download these assets, so no Go toolchain is needed on the target
-# machine.
+# audio; a single server for power) and the Input Home APK (Android TV app,
+# screen/inputhome), and attach them — plus the static systemd unit files — to
+# a GitHub Release. The install scripts (screen.sh / audio.sh / power.sh)
+# download these assets, so no toolchain is needed on the target machine.
 #
 # Trigger: push a version tag, e.g.
 #     git tag v1.0.0 && git push origin v1.0.0
@@ -44,6 +44,22 @@ jobs:
       - name: Build power binary
         working-directory: power
         run: go build -trimpath -ldflags='-s -w' -o ../dist/poweroff-server .
+
+      # build.sh downloads its own pinned toolchain (build-tools, platform, JDK):
+      # nothing of the runner image's Android SDK is used. Signed with the
+      # keystore of the INPUTHOME_KEYSTORE_B64 secret (base64) when it is set;
+      # without it build.sh makes a throwaway key, and screen.sh then replaces
+      # the app on the TV instead of updating it.
+      - name: Build Input Home APK
+        env:
+          INPUTHOME_KEYSTORE_B64: ${{ secrets.INPUTHOME_KEYSTORE_B64 }}
+          INPUTHOME_KEYSTORE: ${{ runner.temp }}/inputhome.keystore
+        run: |
+          if [ -n "$INPUTHOME_KEYSTORE_B64" ]; then
+            printf '%s' "$INPUTHOME_KEYSTORE_B64" | base64 -d > "$INPUTHOME_KEYSTORE"
+          fi
+          screen/inputhome/build.sh
+          cp screen/inputhome/out/inputhome.apk dist/
 
       - name: Stage static systemd units
         run: |

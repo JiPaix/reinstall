@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="net.homelab.inputhome"
+    android:versionCode="3"
+    android:versionName="3.0">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="30" />
+
+    <!-- Lets resolveActivity see the TV app on Android 11+. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="vnd.android.cursor.item/channel" />
+        </intent>
+    </queries>
+
+    <application android:label="@string/app_name" android:allowBackup="false">
+
+        <!-- Opens the TV app on its last input, or on the input pinned by starting it
+             with the string extra input_id (an empty value unpins it). -->
+        <activity android:name=".TvActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Takes over the Home key: short press and boot go to TvActivity,
+             a long press opens the stock home screen. -->
+        <service android:name=".HomeKeyService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/service" />
+        </service>
+    </application>
+</manifest>

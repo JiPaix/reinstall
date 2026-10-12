@@ -1,0 +1,3 @@
+# build.sh: its output, and the toolchain it downloads
+/out/
+/.sdk/
