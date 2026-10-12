@@ -1,7 +1,8 @@
 name: Release
 
 # Build the Go binaries (server + interactive setup, for each of screen and
-# audio; a single server for power) and the Input Home APK (Android TV app,
+# audio; a single server for power; the tablet's server, for Android) and the
+# Input Home APK (Android TV app,
 # screen/inputhome), and attach them — plus the static systemd unit files — to
 # a GitHub Release. The install scripts (screen.sh / audio.sh / power.sh)
 # download these assets, so no toolchain is needed on the target machine.
@@ -44,6 +45,16 @@ jobs:
       - name: Build power binary
         working-directory: power
         run: go build -trimpath -ldflags='-s -w' -o ../dist/poweroff-server .
+
+      # Runs inside Termux on the tablet (android.sh pushes it there): Android,
+      # 64-bit ARM, no cgo.
+      - name: Build tablet binary
+        working-directory: tablet
+        env:
+          GOOS: android
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o ../dist/tablet-server .
 
       # build.sh downloads its own pinned toolchain (build-tools, platform, JDK):
       # nothing of the runner image's Android SDK is used. Signed with the
