@@ -213,6 +213,21 @@ gotchas below. What was written but never run for real is listed in two skills: 
   it live on the device while "kHz-percent" is typed. 100 % is ffmpeg's sine at 1/8 of full
   scale, so a typo can't blast a speaker. It replaced a udev rule and the
   `soundbar-keepalive`/`soundbar-loopback` units, which `audio.sh`'s cleanup removes.
+- **The tone's volume is the level at the device, whatever the output's volume.** Most
+  Bluetooth speakers have no absolute volume: the PC applies it to the samples
+  (`softVolumes` on the node), the tone's included — at 19 % a 5 % tone reached the soundbar
+  at −90 dBFS and it fell asleep after its 15 min (measured 2026-10-14; a tone reaching it at
+  −44 dBFS kept it awake, at 19 % and at 5 %). So the tone is boosted by 1/`softVolumes`
+  (`toneGain`, the same formula in `audio-watch`), sent as f32, and replayed when a
+  `'change' on sink` shows the volume moved: at once when it rose (the tone is too strong
+  meanwhile), after 0.5 s of quiet when it fell. **The boost stops where the tone reaches
+  full scale before the volume** (≈ 18 % for 5 %), so a volume raised in one go can never
+  clip it (a clipped 18 kHz tone is audible) — the user chose that over covering 5 %. Below,
+  the tone weakens again. No way around the volume on one node: a filter graph runs
+  *before* it (a `sine` graph was tried), and only the dropped two-node layout kept the
+  device at 100 %. The tone carries `node.dont-move`: boosted, it must never be dragged to
+  a headset. `channelmix.lock-volumes = true` (`pw-cli set-param <node> Props`) freezes a
+  node's applied volume — pactl still reports the requested one — a guard for live tests.
 - Restarting PipeWire/WirePlumber disconnects every Bluetooth audio device and they don't
   come back on their own. So `audio.sh` restarts before the wizard only when it removed a
   config, `restart_pipewire` reconnects the devices that had a node (retrying), and the

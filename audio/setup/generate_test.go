@@ -118,6 +118,9 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 		"KEEPALIVE=(\n  \"bluez_output.AA_BB.1\"\n)",
 		`hz["bluez_output.AA_BB.1"]=12500 vol["bluez_output.AA_BB.1"]=0.025`, // its own tone
 		`sine=frequency=${hz[$1]}:sample_rate=44100`,
+		`--format f32`, `-af "aformat=sample_fmts=flt,volume=$gain"`, // sized for the device's volume
+		`node.dont-move = true`,
+		`'change' on sink #`, // and replayed when it moves
 		"RANKED_MICS=(\n  \"alsa_input.usb-Mic-00.mono-fallback\"\n  \"bluez_input.CC:DD\"\n)",
 		`'new' on source #`,
 		`pactl set-default-source "$sink"`, // the top ranked mic there is forced

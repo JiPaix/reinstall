@@ -50,6 +50,80 @@ func toneVolume(percent float64) string {
 	return strconv.FormatFloat(percent/100, 'f', -1, 64)
 }
 
+// The tone's volume is what reaches the device, whatever the output's own
+// volume. Most Bluetooth speakers leave that volume to the PC (no absolute
+// volume): it scales every sample played there, the tone's too — at 19 % a
+// tone at 5 % reached the soundbar at -90 dBFS, and it fell asleep. So the
+// tone is played louder by the inverse of the volume applied to the samples,
+// but never past full scale before it: when the volume is raised in one go the
+// tone is too strong until it is replayed, and a clipped tone can be heard.
+// Below that point (about 18 % for a tone at 5 %) the tone weakens with the
+// volume. audio-watch does the same, and replays the tone when the volume
+// moves.
+
+// toneGain is ffmpeg's volume factor for a tone of vol percent on a device
+// whose samples are scaled by soft (1 when the device applies its volume).
+func toneGain(vol, soft float64) string {
+	f := vol / 100
+	if floor := f / 8; soft < floor { // where the boosted sine reaches full scale
+		soft = floor
+	}
+	return strconv.FormatFloat(f/soft, 'g', 6, 64)
+}
+
+// softVolume is the volume applied to a sink's samples, read on its node; 1
+// when it can't be read, which boosts nothing.
+func softVolume(sink string) float64 {
+	run := func(name string, args ...string) string {
+		cmd := exec.Command(name, args...)
+		cmd.Env = append(os.Environ(), "LC_ALL=C") // a decimal point, untranslated keys
+		out, _ := cmd.Output()
+		return string(out)
+	}
+	id := nodeID(run("pactl", "list", "sinks"), sink)
+	if id == "" {
+		return 1
+	}
+	return parseSoftVolume(run("pw-cli", "enum-params", id, "Props"))
+}
+
+// nodeID finds a sink's object.id in `pactl list sinks`.
+func nodeID(list, sink string) string {
+	on := false
+	for _, line := range strings.Split(list, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 2 && f[0] == "Name:":
+			on = f[1] == sink
+		case on && len(f) == 3 && f[0] == "object.id":
+			return strings.Trim(f[2], `"`)
+		}
+	}
+	return ""
+}
+
+// parseSoftVolume reads softVolumes in `pw-cli enum-params <id> Props`: the
+// louder channel, 1 when there is none.
+func parseSoftVolume(props string) float64 {
+	in, loudest := false, 0.0
+	for _, line := range strings.Split(props, "\n") {
+		switch f := strings.Fields(line); {
+		case strings.Contains(line, "Props:softVolumes"):
+			in = true
+		case in && strings.Contains(line, "Prop:"):
+			in = false
+		case in && len(f) == 2 && f[0] == "Float":
+			if v, err := strconv.ParseFloat(strings.ReplaceAll(f[1], ",", "."), 64); err == nil && v > loudest {
+				loudest = v
+			}
+		}
+	}
+	if loudest == 0 {
+		return 1
+	}
+	return loudest
+}
+
 // toneSpec is the tone as it is typed: "<kHz>-<percent>", e.g. "18-5".
 func toneSpec(hz int, vol float64) string {
 	return strconv.FormatFloat(float64(hz)/1000, 'f', -1, 64) + "-" + strconv.FormatFloat(vol, 'f', -1, 64)
@@ -134,13 +208,16 @@ func (p *tonePlayer) stop() {
 	p.quit, p.done = nil, nil
 }
 
+// startTone sizes the tone for the device's volume as it is now: the tuner
+// replays it at every edit, not when the volume moves. Float, because at its
+// most boosted the sine peaks at exactly full scale, a step past what s16 holds.
 func startTone(sink string, hz int, vol float64) (ff, pw *exec.Cmd, err error) {
 	ff = exec.Command("ffmpeg", "-nostdin", "-loglevel", "fatal",
 		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=%d:sample_rate=%d", hz, toneRate),
-		"-af", "volume="+toneVolume(vol), "-f", "s16le", "-")
-	pw = exec.Command("pw-cat", "--playback", "--raw", "--format", "s16",
+		"-af", "aformat=sample_fmts=flt,volume="+toneGain(vol, softVolume(sink)), "-f", "f32le", "-")
+	pw = exec.Command("pw-cat", "--playback", "--raw", "--format", "f32",
 		"--rate", strconv.Itoa(toneRate), "--channels", "1", "--target", sink,
-		"-P", "{ application.name = audio-keepalive node.name = audio-keepalive-tuning node.dont-reconnect = true }", "-")
+		"-P", "{ application.name = audio-keepalive node.name = audio-keepalive-tuning node.dont-reconnect = true node.dont-move = true }", "-")
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, nil, err

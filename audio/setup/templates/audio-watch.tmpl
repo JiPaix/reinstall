@@ -4,7 +4,8 @@
 #  - hands the equalizer state to a device that has one when it connects (the
 #    equalizer lives on the device node, and goes with it);
 #  - plays the keepalive tone on the devices that asked for one, only while
-#    they are connected (some speakers power off after minutes of silence);
+#    they are connected (some speakers power off after minutes of silence),
+#    and replays it whenever their volume moves (see start_tone);
 #  - forgets a hand-picked default whenever a ranked output or microphone
 #    appears or disappears, so the priority order picks again;
 #  - keeps the highest ranked microphone that is connected as the default one,
@@ -40,21 +41,72 @@ RANKED_MICS=(
 )
 
 declare -A eq     # equalized devices there at the last pass
-declare -A tone   # device -> pid of its tone
+declare -A tone   # device -> pid of its tone (kept while the device is there)
+declare -A node   # device -> node id its volume is read on
+declare -A level  # device -> the volume its tone is sized for
 present=unset     # ranked outputs and mics there at the last pass
+settle=""         # set: a volume moved, the tones are replayed once it settles
 
 alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
+# The volume applied to a node's samples (its louder channel); 1 when it can't
+# be read, which boosts nothing.
+soft_volume() {
+  pw-cli enum-params "$1" Props 2>/dev/null | awk '
+    /Props:softVolumes/ { in_soft = 1; next }
+    in_soft && /Prop:/ { exit }
+    in_soft && $1 == "Float" && $2 > loudest { loudest = $2 }
+    END { print (loudest > 0 ? loudest : 1) }'
+}
+
+# The volume a device's tone is sized for: the one applied to its samples, no
+# lower than where the boosted tone reaches full scale (ffmpeg's sine peaks at
+# 1/8 of it).
+tone_level() {
+  awk -v soft="$(soft_volume "${node[$1]}")" -v v="${vol[$1]}" \
+    'BEGIN { floor = v / 8; print (soft > floor ? soft : floor) }'
+}
+
 # Enough signal to keep the device awake, nothing to hear (18 kHz at 5% unless
-# tuned). dont-reconnect: the tone must never follow the streams to another
-# output.
+# tuned) — at the device: most Bluetooth speakers leave their volume to the PC
+# (no absolute volume), which scales every sample played there, the tone's
+# too. At 19% a tone at 5% reached the soundbar at -90 dBFS and it fell
+# asleep. So the tone is played louder by the inverse of that volume, but
+# never past full scale before it: a volume raised in one go leaves the tone
+# too strong until it is replayed, and a clipped tone can be heard. Below that
+# point (about 18% for a tone at 5%) the tone weakens with the volume.
+# Float: at its most boosted the sine peaks at exactly full scale, a step past
+# what s16 holds. dont-reconnect, dont-move: the tone must never follow the
+# streams to another output.
 start_tone() {
-  pw-cat --playback --raw --format s16 --rate 44100 --channels 1 --target "$1" \
-    -P '{ application.name = audio-keepalive node.name = audio-keepalive node.dont-reconnect = true }' - \
+  local gain
+  node[$1]=$(pactl list sinks | awk -v s="$1" '
+    $1 == "Name:" { on = ($2 == s) }
+    on && $1 == "object.id" { gsub(/"/, "", $3); print $3; exit }')
+  level[$1]=$(tone_level "$1")
+  gain=$(awk -v v="${vol[$1]}" -v l="${level[$1]}" 'BEGIN { printf "%.6g", v / l }')
+  pw-cat --playback --raw --format f32 --rate 44100 --channels 1 --target "$1" \
+    -P '{ application.name = audio-keepalive node.name = audio-keepalive node.dont-reconnect = true node.dont-move = true }' - \
     < <(exec ffmpeg -nostdin -loglevel fatal \
-          -f lavfi -i "sine=frequency=${hz[$1]}:sample_rate=44100" -af "volume=${vol[$1]}" -f s16le -) &
+          -f lavfi -i "sine=frequency=${hz[$1]}:sample_rate=44100" \
+          -af "aformat=sample_fmts=flt,volume=$gain" -f f32le -) &
   tone[$1]=$!
-  echo "keepalive on $1"
+}
+
+# A volume moved (or anything else about an output). A tone now too strong
+# stops at once; any tone sized for another volume is replayed once the
+# volume has settled — a slider sends a change at every step.
+volume_moved() {
+  local sink now
+  for sink in "${!tone[@]}"; do
+    alive "${tone[$sink]}" || continue
+    now=$(tone_level "$sink")
+    [ "$now" = "${level[$sink]}" ] && continue
+    if awk -v a="$now" -v b="${level[$sink]}" 'BEGIN { exit !(a > b) }'; then
+      kill "${tone[$sink]}" 2>/dev/null
+    fi
+    settle=1
+  done
 }
 
 reconcile() {
@@ -77,10 +129,18 @@ reconcile() {
 
   for sink in "${KEEPALIVE[@]}"; do
     if grep -qxF -- "$sink" <<<"$sinks"; then
-      alive "${tone[$sink]:-}" || start_tone "$sink"
+      if [ -z "${tone[$sink]:-}" ]; then
+        start_tone "$sink"
+        echo "keepalive on $sink"
+      elif ! alive "${tone[$sink]}"; then
+        start_tone "$sink"   # stopped for a louder volume, or died
+      elif [ "$(tone_level "$sink")" != "${level[$sink]}" ]; then
+        kill "${tone[$sink]}" 2>/dev/null   # sized for a volume that has moved
+        start_tone "$sink"
+      fi
     elif [ -n "${tone[$sink]:-}" ]; then
       kill "${tone[$sink]}" 2>/dev/null
-      unset "tone[$sink]"
+      unset "tone[$sink]" "node[$sink]" "level[$sink]"
       echo "keepalive off $sink"
     fi
   done
@@ -114,10 +174,15 @@ exec 3< <(exec pactl subscribe)
 events=$!
 reconcile
 while :; do
-  read -r -t 30 -u 3 line
+  wait_for=30
+  [ -z "$settle" ] || wait_for=0.5
+  read -r -t "$wait_for" -u 3 line
   rc=$?
   if [ "$rc" -gt 128 ]; then
-    reconcile   # nothing for 30s: safety pass, restarts what died
+    # Nothing for a while: a moved volume has settled, or it's the 30 s safety
+    # pass, which restarts what died.
+    settle=""
+    reconcile
     continue
   fi
   [ "$rc" -eq 0 ] || break   # event stream closed: pipewire-pulse went away
@@ -125,6 +190,7 @@ while :; do
     *"'new' on sink #"*|*"'remove' on sink #"*) reconcile ;;
     *"'new' on source #"*|*"'remove' on source #"*) reconcile ;;
     *"'change' on server"*) reconcile ;;   # the default was changed
+    *"'change' on sink #"*) volume_moved ;;
   esac
 done
 

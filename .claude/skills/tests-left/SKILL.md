@@ -54,6 +54,12 @@ Left: a normal run (no `--local`) of `screen.sh` and `android.sh` that fetches t
 - **Per-output tone in `audio-watch`**: after an install, `journalctl --user -u audio-watch`
   shows "keepalive on <sink>", and `pgrep -af sine=frequency` shows each device's own
   frequency and volume.
+- **The tone follows the volume** (written 2026-10-14, only run against stand-ins): with the
+  soundbar connected, `pgrep -af sine=frequency` shows `volume=` ≈ 7.29 at 19 % (5 % tone);
+  lower the volume, the gain rises 0.5 s after the last step, capped at 8 (≈ 18 %); raise it,
+  the tone stops at once and comes back weaker. Proof: `debug.wav-path` on the node (see
+  CLAUDE.md) gives ≈ −44 dBFS at 19 %, and the soundbar outlasts its 15 min with nothing
+  playing. The tuner plays the same compensated tone.
 - **Top-ranked mic forced as default**: pick another default by hand in the sound settings;
   it must come back at once (`'change' on server` event — an assumption: if that event
   doesn't come, the 30 s safety pass does it). Unplug the top mic: the next ranked one
