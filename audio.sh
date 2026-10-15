@@ -319,13 +319,19 @@ fi
 # =============================================================================
 # A Bluetooth speaker usually won't reconnect on its own, so after a reboot it
 # stays silent until someone connects it. This installs a root oneshot that
-# retries connecting every device BlueZ has paired, at every boot. It keeps no
-# device list of its own: whatever is paired when it runs is tried, so a device
-# paired after this install is picked up too.
+# retries connecting every paired Bluetooth audio output, at every boot. The set
+# comes from BlueZ at run time (paired + Audio Sink), so a speaker paired after
+# this install is picked up too; the wizard's ranking only sets the order.
+# Audio outputs only: the radio calls one device at a time, and while it calls
+# one that is off (5 s; 20 s for a Bluetooth LE controller) it hardly hears a
+# speaker switched on meanwhile — calling the controllers too once made the
+# soundbar wait ~20 s for its turn.
 # System unit, not --user: it must run before anyone logs in; once a device is
 # connected, audio-watch takes over.
 BT_HELPER=/usr/local/bin/bt-autoconnect
 BT_SERVICE=/etc/systemd/system/bt-autoconnect.service
+BT_ORDER=/etc/bt-autoconnect/order
+BT_HIDDEN=/etc/bt-autoconnect/hidden
 bt_auto=n
 
 if command -v bluetoothctl &>/dev/null; then
@@ -333,7 +339,7 @@ if command -v bluetoothctl &>/dev/null; then
   # Enter keeps what is there: a re-run must not drop the unit by accident.
   bt_hint="y/N"
   [ -f "$BT_SERVICE" ] && bt_auto=y && bt_hint="Y/n"
-  ask "Reconnect paired Bluetooth devices automatically at boot? [$bt_hint]"
+  ask "Reconnect paired Bluetooth audio outputs automatically at boot? [$bt_hint]"
   [ "${HAS_BT:-false}" = true ] && print_info "Recommended: one of your outputs is Bluetooth."
   read -rp "Choice: " bt_answer
   bt_auto="${bt_answer:-$bt_auto}"
@@ -341,20 +347,40 @@ fi
 
 case "${bt_auto,,}" in
   y|yes)
+    # The ranked Bluetooth outputs, best first: their MACs out of the sink names
+    # (bluez_output.<MAC with _>.N), in choices.json order (= the ranking).
+    # Rewritten at every run; outputs the wizard never saw come after them.
+    # The devices hidden in the wizard (disabled_bt: bluez_card.<MAC with _>) are
+    # never called: connecting one only brings back what was hidden.
+    sudo mkdir -p "${BT_ORDER%/*}"
+    grep -o '"sink": *"bluez_output\.[0-9A-Fa-f_]*' "$HOME/.config/soundbar-setup/choices.json" 2>/dev/null \
+      | sed 's/.*bluez_output\.//; s/_/:/g' | sudo tee "$BT_ORDER" >/dev/null
+    grep -o 'bluez_card\.[0-9A-Fa-f_]*' "$HOME/.config/soundbar-setup/choices.json" 2>/dev/null \
+      | sed 's/^bluez_card\.//; s/_/:/g' | sudo tee "$BT_HIDDEN" >/dev/null
+
     sudo tee "$BT_HELPER" >/dev/null <<'BTEOF'
 #!/bin/bash
-# bt-autoconnect — try to connect every device BlueZ already knows about,
-# retrying for a bounded window so devices that power on slowly still get
-# picked up. Keeps no device list of its own: the set comes from BlueZ's paired
-# registry, so pairing something new is enough for it to be picked up next boot.
+# bt-autoconnect — try to connect every paired Bluetooth audio output (Audio
+# Sink UUID), retrying for a bounded window so devices that power on slowly
+# still get picked up. The set comes from BlueZ's paired registry, so pairing a
+# new speaker is enough for it to be picked up next boot; /etc/bt-autoconnect/
+# order (the audio wizard's ranking, written by audio.sh) only puts those first,
+# and the devices hidden in that wizard (/etc/bt-autoconnect/hidden) are skipped.
+# Controllers, phones and the like are left alone: each one that is off would
+# keep the radio busy calling it while a speaker is trying to come in.
 # Installed by audio.sh; run at boot by bt-autoconnect.service. Optional
 # tunables come from /etc/bt-autoconnect/bt-autoconnect.env.
 
 set -u
 
+ORDER_FILE=/etc/bt-autoconnect/order
+HIDDEN_FILE=/etc/bt-autoconnect/hidden
+AUDIO_SINK_UUID=0000110b-0000-1000-8000-00805f9b34fb
+
 ATTEMPTS="${BT_AUTOCONNECT_ATTEMPTS:-12}"
 INTERVAL="${BT_AUTOCONNECT_INTERVAL:-10}"
 SKIP="${BT_AUTOCONNECT_SKIP:-}"   # space-separated MACs to leave alone
+[ -r "$HIDDEN_FILE" ] && SKIP="$SKIP $(tr '\n' ' ' < "$HIDDEN_FILE")"
 # Whole-run limit in seconds. An unreachable device costs ~5s per attempt, so
 # with a few of them off the attempts alone outlast the unit's TimeoutStartSec
 # and systemd kills the run as failed. Keep this below that timeout.
@@ -387,33 +413,54 @@ done
 
 bt power on >/dev/null 2>&1
 
+ranked=()
+[ -r "$ORDER_FILE" ] && mapfile -t ranked < "$ORDER_FILE"
+
 for attempt in $(seq 1 "$ATTEMPTS"); do
-  mapfile -t paired < <(bt devices Paired 2>/dev/null | awk '{print $2}')
+  # Only "Device <MAC> <name>" lines: right after boot bluetoothctl can print
+  # others ("[NEW] Controller …"), whose second word once got "connected" until
+  # the call timed out, 20 s per pass.
+  mapfile -t paired < <(bt devices Paired 2>/dev/null | awk '$1 == "Device" {print $2}')
 
   if [ "${#paired[@]}" -eq 0 ]; then
     echo "no paired devices known to BlueZ; nothing to do"
     exit 0
   fi
 
+  # Ranked outputs that are still paired first, then the rest in BlueZ order.
+  ordered=()
+  for mac in "${ranked[@]}" "${paired[@]}"; do
+    case " ${paired[*]^^} " in *" ${mac^^} "*) ;; *) continue ;; esac
+    case " ${ordered[*]^^} " in *" ${mac^^} "*) continue ;; esac
+    ordered+=("$mac")
+  done
+
   pending=0
-  for mac in "${paired[@]}"; do
+  for mac in "${ordered[@]}"; do
     skipped "$mac" && continue
 
     info=$(bt info "$mac" 2>/dev/null)
+    case $info in *"$AUDIO_SINK_UUID"*) ;; *) continue ;; esac
     case $info in *"Connected: yes"*) continue ;; esac
 
-    pending=1
     out_of_time && give_up
     name=$(printf '%s\n' "$info" | sed -n 's/^[[:space:]]*Name: //p' | head -1)
-    if bt connect "$mac" >/dev/null 2>&1; then
+    # No call outlives the budget: the unit's TimeoutStartSec is not far above
+    # (and `timeout 0` would mean no limit at all).
+    left=$((BUDGET - SECONDS))
+    [ "$left" -gt 0 ] || give_up
+    if timeout "$((left < CALL_TIMEOUT ? left : CALL_TIMEOUT))" bluetoothctl connect "$mac" >/dev/null 2>&1; then
       echo "connected ${name:-unknown} ($mac)"
     else
+      # Only a failure leaves work for the next pass: a last pass whose
+      # connects all succeeded ends as "all connected", not "giving up".
+      pending=1
       echo "attempt $attempt/$ATTEMPTS: ${name:-unknown} ($mac) not reachable"
     fi
   done
 
   if [ "$pending" -eq 0 ]; then
-    echo "all known devices connected"
+    echo "all paired audio outputs connected"
     exit 0
   fi
 
@@ -428,7 +475,7 @@ BTEOF
 
     sudo tee "$BT_SERVICE" >/dev/null <<'BTSVC'
 [Unit]
-Description=Connect all BlueZ-known Bluetooth devices at boot
+Description=Connect paired Bluetooth audio outputs at boot
 # System unit, not a --user one: bluetoothd is system-wide and the soundbar
 # should come up whether or not a session has started yet (same reasoning as
 # poweroff-server). The helper also waits for the adapter to be enumerated.
@@ -455,13 +502,13 @@ BTSVC
     sudo systemctl enable bt-autoconnect.service
     # --no-block: the first pass can retry for ~2 minutes; don't hold the install.
     sudo systemctl start --no-block bt-autoconnect.service
-    print_ok "Enabled bt-autoconnect.service (connecting paired devices now and at every boot)"
+    print_ok "Enabled bt-autoconnect.service (connecting paired audio outputs now and at every boot)"
     print_info "Optional tuning in /etc/bt-autoconnect/bt-autoconnect.env: BT_AUTOCONNECT_ATTEMPTS, BT_AUTOCONNECT_INTERVAL, BT_AUTOCONNECT_BUDGET, BT_AUTOCONNECT_SKIP (MACs)"
     ;;
   *)
     if [ -f "$BT_SERVICE" ] || [ -f "$BT_HELPER" ]; then
       sudo systemctl disable --now bt-autoconnect.service 2>/dev/null || true
-      sudo rm -f "$BT_SERVICE" "$BT_HELPER"
+      sudo rm -f "$BT_SERVICE" "$BT_HELPER" "$BT_ORDER" "$BT_HIDDEN"
       sudo systemctl daemon-reload
       print_ok "Removed bt-autoconnect service + helper"
     fi

@@ -254,10 +254,17 @@ gotchas below. What was written but never run for real is listed in two skills: 
   that way: a hand-picked one lasts until a ranked output comes or goes. A `choices.json`
   from before the ranking has a single `default_source`: it becomes the first ranked mic.
 - `bt-autoconnect` (optional) is a root system unit, like `poweroff-server`: it must run
-  before anyone logs in. It keeps no device list (`bluetoothctl devices Paired`) and retries
-  12×10 s within a 240 s budget that must stay under the unit's `TimeoutStartSec`; each
-  `bluetoothctl connect` has its own `timeout` (it can hang). `audio.sh` starts it
-  `--no-block`. Tunables: `/etc/bt-autoconnect/bt-autoconnect.env`.
+  before anyone logs in. It keeps no device list: every paired device with the Audio Sink
+  UUID, read from BlueZ at each pass, the wizard's ranked Bluetooth outputs first
+  (`/etc/bt-autoconnect/order`, rewritten by `audio.sh`), the ones hidden in the wizard
+  (`disabled_bt` → `/etc/bt-autoconnect/hidden`) skipped. **Audio outputs only, and calling
+  in parallel doesn't help**: the radio pages one device at a time (two parallel connects to
+  absent devices: 5 s, then 10 s) and while it pages an absent one (5 s; 20 s for a BLE
+  controller) a speaker switched on meanwhile waits — with the controllers in the loop, the
+  soundbar once waited ~20 s at boot. It retries 12×10 s within a 240 s budget that must
+  stay under the unit's `TimeoutStartSec`; each `bluetoothctl connect` has its own `timeout`
+  (it can hang), capped by what is left of the budget. `audio.sh` starts it `--no-block`.
+  Tunables: `/etc/bt-autoconnect/bt-autoconnect.env`.
 
 ### Android tablet
 
