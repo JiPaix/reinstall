@@ -39,6 +39,14 @@ Left: a normal run (no `--local`) of `screen.sh` and `android.sh` that fetches t
   state 0. On the one TV tried, HDMI 1 was both live and selected. To settle: with the TV
   showing another input, read `adb shell dumpsys tv_input` and see whether the PC's input
   is still state 0.
+- **Android TV step, whole.** Since 2026-10-12 the step also lightens the TV (animations and
+  screensaver off, the model's app list disabled, Chromecast built-in kept on) and opens on
+  the "TV on the network" notice and the address. Run for real: only `tv_lighten` +
+  `tv_keep_enabled`, extracted, on the Vestel TV that was already in that state (nothing
+  changed). Against a stubbed adb: Chromecast found disabled (enabled again), a list naming
+  it (skipped), unknown model, lightening declined, no APK, no TV. Left: a full `screen.sh`
+  on a TV where something actually changes — a factory-reset one is the real test of the
+  40-app list — then check Home Assistant still reaches the TV in standby.
 - **Single screen refused.** Tested with a fake `kscreen-doctor` returning one output.
   Never on a machine that really has one screen, nor through `screen.sh` (it must stop
   before its cleanup and leave the previous install alone).

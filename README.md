@@ -31,12 +31,19 @@ If Sunshine is installed, it's also enabled so it starts with every session. On
 AMD graphics cards it writes a small ddcutil config too: ddcutil 3.0 probes
 monitors in parallel, which freezes the GPU right after login.
 
-If one of your screens is an Android TV, the setup can also install Input Home
-on it: a tiny app that makes the TV's Home button, its wake from standby and
-its boot open the HDMI input instead of the home screen (a long press on Home
-still opens that one). The setup asks first, then for the TV's address; the TV
-needs USB/network debugging turned on in its developer options. It finds the
-input your PC is plugged into by itself when it is the only one with a signal.
+If one of your screens is an Android TV, the setup can also take care of it. It
+asks first, tells you the TV has to be switched on and on your network, with
+USB/network debugging turned on in its developer options, then asks for its IP
+address. Two things are done there:
+
+- the TV is lightened: animations and screensaver off, and on a known model the
+  preinstalled apps nobody uses are disabled (reversible). Chromecast built-in
+  is never one of them, and is switched back on if something disabled it: it is
+  what keeps the TV reachable on the network in standby;
+- Input Home is installed: a tiny app that makes the TV's Home button, its wake
+  from standby and its boot open the HDMI input instead of the home screen (a
+  long press on Home still opens that one). The setup finds the input your PC
+  is plugged into by itself when it is the only one with a signal.
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/JiPaix/reinstall/main/screen.sh)

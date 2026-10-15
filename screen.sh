@@ -22,8 +22,10 @@
 # - Enables Sunshine (if installed) so it starts with every graphical session
 # - amdgpu: writes a ddcutilrc that keeps ddcutil's I2C bus scan serial
 #   (ddcutil 3.0.0's parallel scan hangs the GPU at login)
-# - Offers Input Home for an Android TV (over adb): the TV's Home key, wake and
-#   boot open its HDMI input instead of the home screen
+# - Offers to set up an Android TV (over adb; it has to be on and on the
+#   network): lightened (animations and screensaver off, unused apps disabled),
+#   and Input Home installed — the TV's Home key, wake and boot open its HDMI
+#   input instead of the home screen
 # =============================================================================
 
 set -euo pipefail
@@ -936,23 +938,89 @@ else
 fi
 
 # =============================================================================
-# STEP 13 — Input Home on an Android TV (optional)
+# STEP 13 — Android TV: lightened, and Input Home (optional)
 # =============================================================================
-# Input Home (screen/inputhome) is a small Android TV app: the Home key, a wake
-# from standby and a boot all land on the TV's HDMI input instead of the stock
-# home screen (a long press on Home still opens that one). Only offered when a
-# TV is configured, and asked every time: a TV is not necessarily an Android TV.
-# It goes in over adb, which the TV has to allow.
+# Two things, both over adb — which the TV has to allow, switched on and on the
+# network: said before anything else, with its address asked.
+#  - The TV is lightened: animations and screensaver off, the apps of its
+#    model's list disabled (tv_debloat_list).
+#  - Input Home (screen/inputhome), a small Android TV app: the Home key, a wake
+#    from standby and a boot all land on the TV's HDMI input instead of the
+#    stock home screen (a long press on Home still opens that one).
+# Only offered when a TV is configured, and asked every time: a TV is not
+# necessarily an Android TV.
 # Last step on purpose: its prompts and network waits come once swapscreen
 # itself is fully installed, and whatever goes wrong here only skips a TV.
 INPUTHOME_PKG=net.homelab.inputhome
 INPUTHOME_A11Y="$INPUTHOME_PKG/.HomeKeyService"
 INPUTHOME_TVS_FILE="$HOME/.config/swapscreen-setup/android-tvs"   # addresses of the last run
-INPUTHOME_APK=""    # fetched or built once, for every TV of this run
-INPUTHOME_DONE=()   # "<address> (<pinned input>)", for the final summary
+INPUTHOME_APK=""    # fetched or built once, for every TV of this run ("" = none)
+ANDROIDTV_DONE=()   # "<address> — <what was done>", for the final summary
 TV_ADB=""           # host:port of the TV being set up
+TV_LIGHTEN=true     # asked once, for every TV of this run
 TV_INPUT_ID=""      # the input picked for it ("" = none)
 TV_INPUT_LABEL=""
+
+# Never disabled, and enabled again when found disabled: Chromecast built-in is
+# what keeps the TV on the network in deep standby (the one package outside
+# Google's services on the system Doze exemption list, `dumpsys deviceidle
+# whitelist`). With it off, Home Assistant's androidtv_remote link drops every
+# 20 to 60 s and can no longer switch the TV on; exempting the remote service
+# by hand doesn't make up for it.
+TV_KEEP=(com.google.android.apps.mediashell)
+
+# Apps disabled per TV model (`pm disable-user`: reversible with `pm enable`,
+# data kept). Preloads plus apps their owner doesn't use there; a package that
+# isn't on the TV is skipped. ro.product.model only says "Android TV" on these,
+# hence ro.product.device. Add a model: one more case.
+tv_debloat_list() {  # $1 = ro.product.device
+  case "$1" in
+    # Vestel "Cosmos" board (MediaTek m7322), Android TV 11
+    yeoksam) cat <<'EOF'
+com.amazon.amazonvideo.livingroom
+com.android.printspooler
+com.cltv.fast
+com.cxinventor.file.explorer
+com.desktop.launcher
+com.disney.disneyplus
+com.google.android.apps.chromecast.app
+com.google.android.apps.nbu.smartconnect.tv
+com.google.android.backdrop
+com.google.android.feedback
+com.google.android.katniss
+com.google.android.marvin.talkback
+com.google.android.play.games
+com.google.android.tvrecommendations
+com.google.android.videos
+com.google.android.youtube.tv
+com.google.android.youtube.tvmusic
+com.mediatek.tv.freeviewplay
+com.mediatek.wwtv.mediaplayer
+com.netflix.ninja
+com.pheenix.aniwatch
+com.tv.browser.open
+com.vestel.vestelreporter
+com.yablio.sendfilestotv
+fusion.android.tv.demo
+ph.spacedesk.beta
+uk.co.freeview.amc_catchup
+uk.co.freeview.amc_horror
+uk.co.freeview.bbc
+uk.co.freeview.bbc_sounds
+uk.co.freeview.ch4_vod
+uk.co.freeview.ch5
+uk.co.freeview.explore
+uk.co.freeview.fvpconfigauth
+uk.co.freeview.itv
+uk.co.freeview.mdsclient
+uk.co.freeview.onnow
+uk.co.freeview.stv
+uk.co.freeview.tifbridge
+uk.co.freeview.uktv
+EOF
+      ;;
+  esac
+}
 
 tv_adb() { adb -s "$TV_ADB" "$@"; }
 # -n: adb shell reads stdin, and would swallow the answers typed ahead.
@@ -1085,6 +1153,52 @@ inputhome_pick_input() {
   fi
 }
 
+# Lightens the connected $TV_ADB: no animations, no screensaver, and the apps
+# of its model's list disabled — never one of TV_KEEP, whatever the list says.
+tv_lighten() {
+  local device list enabled pkg count=0
+  if ! tv_sh 'settings put global window_animation_scale 0.0 &&
+settings put global transition_animation_scale 0.0 &&
+settings put global animator_duration_scale 0.0 &&
+settings put secure screensaver_enabled 0' &>/dev/null; then
+    print_warn "Couldn't change the TV's settings — not lightened"
+    return 1
+  fi
+  print_ok "Animations and screensaver off"
+
+  device="$(tv_sh getprop ro.product.device 2>/dev/null | tr -d '\r')"
+  list="$(tv_debloat_list "$device")"
+  if [ -z "$list" ]; then
+    print_info "No app list for this TV model ('$device') — nothing disabled"
+    return 0
+  fi
+  enabled="$(tv_sh pm list packages -e 2>/dev/null | tr -d '\r')"
+  while read -r pkg; do
+    if in_list "$pkg" "${TV_KEEP[@]}"; then continue; fi
+    grep -qxF "package:$pkg" <<<"$enabled" || continue
+    if tv_sh pm disable-user --user 0 "$pkg" &>/dev/null; then count=$((count + 1)); fi
+  done <<<"$list"
+  if [ "$count" -gt 0 ]; then
+    print_ok "Disabled $count unused app(s) (undo: adb shell pm enable <package>)"
+  else
+    print_ok "Its unused apps are already disabled"
+  fi
+}
+
+# Puts back what must never be off (TV_KEEP), whoever disabled it.
+tv_keep_enabled() {
+  local disabled pkg
+  disabled="$(tv_sh pm list packages -d 2>/dev/null | tr -d '\r')"
+  for pkg in "${TV_KEEP[@]}"; do
+    grep -qxF "package:$pkg" <<<"$disabled" || continue
+    if tv_sh pm enable "$pkg" &>/dev/null; then
+      print_ok "Enabled $pkg again: without it the TV drops off the network in standby"
+    else
+      print_warn "$pkg is disabled and wouldn't come back — try: adb shell pm enable $pkg"
+    fi
+  done
+}
+
 # Installs and sets up Input Home on the connected $TV_ADB. Every value sent
 # through `adb shell` is re-read by the TV's shell, hence the inner quotes.
 inputhome_install_tv() {
@@ -1092,12 +1206,6 @@ inputhome_install_tv() {
   sdk="$(tv_sh getprop ro.build.version.sdk 2>/dev/null | tr -d '\r')"
   if ! [[ "$sdk" =~ ^[0-9]+$ ]] || [ "$sdk" -lt 26 ]; then
     print_warn "Android API ${sdk:-unknown}: Input Home needs Android 8 (API 26) or later — skipped"
-    return 1
-  fi
-  # No `grep -q` at the end of a pipe: it exits early and adb dies of SIGPIPE,
-  # which pipefail turns into a failure.
-  if ! tv_sh pm list features 2>/dev/null | grep -F 'android.software.leanback' >/dev/null; then
-    print_warn "$TV_ADB is an Android device but not an Android TV — skipped"
     return 1
   fi
 
@@ -1145,31 +1253,85 @@ inputhome_install_tv() {
     print_warn "Couldn't set the input — Input Home opens the last one used"
     TV_INPUT_LABEL="last input used"
   fi
-  INPUTHOME_DONE+=("$TV_ADB ($TV_INPUT_LABEL)")
 }
 
-inputhome_one_tv() {  # $1 = host[:port]
+androidtv_one_tv() {  # $1 = host[:port]
+  local did=""
   TV_ADB="$1"
   if [[ "$TV_ADB" != *:* ]]; then TV_ADB+=":5555"; fi
   print_info "Connecting to $TV_ADB…"
   if ! tv_connect; then
-    print_warn "adb can't reach $TV_ADB (is the TV on?) — skipped"
+    print_warn "adb can't reach $TV_ADB (is the TV on, and on the network?) — skipped"
     print_info "On the TV: Settings → Device Preferences → About → Build, 7 presses; then"
     print_info "Developer options → USB debugging (and Network debugging where it exists)."
     return 1
   fi
-  inputhome_install_tv
+  # No `grep -q` at the end of a pipe: it exits early and adb dies of SIGPIPE,
+  # which pipefail turns into a failure.
+  if ! tv_sh pm list features 2>/dev/null | grep -F 'android.software.leanback' >/dev/null; then
+    print_warn "$TV_ADB is an Android device but not an Android TV — skipped"
+    return 1
+  fi
+
+  if $TV_LIGHTEN && tv_lighten; then did="lightened"; fi
+  tv_keep_enabled
+  if [ -n "$INPUTHOME_APK" ] && inputhome_install_tv; then
+    did+="${did:+, }Input Home on $TV_INPUT_LABEL"
+  fi
+  if [ -n "$did" ]; then ANDROIDTV_DONE+=("$TV_ADB — $did"); fi
 }
 
-inputhome_setup() {
-  local answer addr known=() kept=()
-  ask "Install Input Home on an Android TV? [y/N]"
-  print_info "Home key, wake and boot open the TV's HDMI input instead of the home screen."
-  print_info "Android TV only (8 or later), with adb debugging allowed on the TV."
+androidtv_setup() {
+  local answer addr known=() tvs=()
+  ask "Set up an Android TV? [y/N]"
+  print_info "Lightens it (animations and screensaver off, unused apps disabled) and installs"
+  print_info "Input Home: Home key, wake and boot open its HDMI input instead of the home screen."
   read -rp "Choice: " answer
   case "${answer,,}" in
     y|yes) ;;
     *) print_info "Skipped."; return 0 ;;
+  esac
+
+  # Before anything is fetched or installed: all of it goes over the network.
+  print_warn "The TV has to be switched on and on your network (Wi-Fi or cable) from now on,"
+  print_info "with adb debugging allowed: Settings → Device Preferences → About → Build, 7 presses;"
+  print_info "then Developer options → USB debugging (and Network debugging where it exists)."
+  print_info "Its IP address is in Settings → Network & Internet, under the connected network."
+  if [ -f "$INPUTHOME_TVS_FILE" ]; then mapfile -t known < "$INPUTHOME_TVS_FILE"; fi
+  for addr in "${known[@]}"; do
+    [[ "$addr" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || continue
+    ask "Set up $addr, as last time? [Y/n]"
+    read -rp "Choice: " answer
+    case "${answer,,}" in
+      n|no) continue ;;
+    esac
+    tvs+=("$addr")
+  done
+  while :; do
+    if [ ${#tvs[@]} -eq 0 ]; then answer="the"; else answer="another"; fi
+    read -rp "IP address of $answer Android TV (blank = none): " addr
+    if [ -z "$addr" ]; then break; fi
+    if ! [[ "$addr" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+      print_warn "Not an address: $addr (expected an IP or a host name, with an optional :port)"
+      continue
+    fi
+    if in_list "$addr" "${tvs[@]}"; then continue; fi
+    tvs+=("$addr")
+  done
+  if [ ${#tvs[@]} -eq 0 ]; then
+    rm -f "$INPUTHOME_TVS_FILE"
+    print_info "No TV — skipped."
+    return 0
+  fi
+  mkdir -p "$(dirname "$INPUTHOME_TVS_FILE")"
+  printf '%s\n' "${tvs[@]}" > "$INPUTHOME_TVS_FILE"
+
+  ask "Lighten it too? [Y/n]"
+  print_info "Animations and screensaver off; on a known model, its unused apps disabled"
+  print_info "(reversible: adb shell pm enable <package>). No = Input Home only."
+  read -rp "Choice: " answer
+  case "${answer,,}" in
+    n|no) TV_LIGHTEN=false ;;
   esac
 
   if ! command -v adb &>/dev/null; then
@@ -1182,45 +1344,20 @@ inputhome_setup() {
       return 0
     fi
   fi
-  # Before any address is asked: without the APK there is nothing to install.
-  inputhome_get_apk || return 0
-
-  if [ -f "$INPUTHOME_TVS_FILE" ]; then mapfile -t known < "$INPUTHOME_TVS_FILE"; fi
-  for addr in "${known[@]}"; do
-    [[ "$addr" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || continue
-    ask "Install it on $addr, as last time? [Y/n]"
-    read -rp "Choice: " answer
-    case "${answer,,}" in
-      n|no) continue ;;
-    esac
-    kept+=("$addr")
-    inputhome_one_tv "$addr" || true
-  done
-  while :; do
-    if [ ${#kept[@]} -eq 0 ]; then answer="an"; else answer="another"; fi
-    read -rp "Address of $answer Android TV (blank = none): " addr
-    if [ -z "$addr" ]; then break; fi
-    if ! [[ "$addr" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
-      print_warn "Not an address: $addr (expected an IP or a host name, with an optional :port)"
-      continue
-    fi
-    if in_list "$addr" "${kept[@]}"; then continue; fi
-    kept+=("$addr")
-    inputhome_one_tv "$addr" || true
-  done
-
-  if [ ${#kept[@]} -gt 0 ]; then
-    mkdir -p "$(dirname "$INPUTHOME_TVS_FILE")"
-    printf '%s\n' "${kept[@]}" > "$INPUTHOME_TVS_FILE"
-  else
-    rm -f "$INPUTHOME_TVS_FILE"
+  # Once, for every TV. Without the APK a TV is still lightened.
+  if ! inputhome_get_apk; then
+    if ! $TV_LIGHTEN; then return 0; fi
+    print_info "Going on without Input Home."
   fi
+  for addr in "${tvs[@]}"; do
+    androidtv_one_tv "$addr" || true
+  done
 }
 
 # GNOME's setup doesn't ask which screens are TVs: offered there regardless.
 if [ "$BACKEND" != kde ] || [ ${#TV_CONNECTORS[@]} -gt 0 ]; then
-  print_header "Input Home (Android TV)"
-  inputhome_setup || print_warn "Input Home setup stopped early — the rest of the install is unaffected"
+  print_header "Android TV"
+  androidtv_setup || print_warn "Android TV setup stopped early — the rest of the install is unaffected"
 fi
 
 print_header "Setup Complete"
@@ -1239,8 +1376,8 @@ if [ "$BACKEND" = kde ]; then
   done
   echo -e "  TVs:          ${CYAN}${tv_line:-none}${NC}"
 fi
-for tv in "${INPUTHOME_DONE[@]}"; do
-  echo -e "  Input Home:   ${CYAN}$tv${NC}"
+for tv in "${ANDROIDTV_DONE[@]}"; do
+  echo -e "  Android TV:   ${CYAN}$tv${NC}"
 done
 echo -e "  Switch:       ${CYAN}swapscreen --monitor | --tv | --taiko${NC} (no option: toggle; --help)"
 echo -e "  Server:       ${CYAN}http://localhost:$SERVER_PORT/mode${NC}"
