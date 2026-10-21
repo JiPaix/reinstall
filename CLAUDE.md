@@ -348,6 +348,24 @@ gotchas below. What was written but never run for real is listed in two skills: 
   unloads `module-suspend-on-idle` — keep that — and the boot script has a watchdog that
   replaces a daemon that stops answering `pactl info` (logged in `~/audio-watchdog.log`).
   Symptom: `pactl` hangs on the tablet, a PC's tunnel gets "connection failure: Timeout".
+  Plugging or unplugging the jack hung it the same way (the module closes its stream
+  from its own error callback when Android moves it), and the watchdog's restart
+  dropped the player from Music Assistant: hence `no_close_hack=1` on the AAudio sink
+  (stop, then a new stream; tested 2026-10-21, jack out and back in, music on, same
+  daemon). Keep it.
+- **The speakers' equalizer** (asked at a full run, `speaker_eqs`: one `name|controls` line
+  per speaker) is `module-ladspa-sink` with `peq`, a LADSPA plugin of our own
+  (`tablet/peq/`): Termux packages no LADSPA equalizer. It is built freestanding (no libc,
+  no libm, a fixed pool of instances) so clang and lld make it without an NDK; `build.sh
+  test` checks it on the host, `build.sh curve <controls>` prints a curve and its highest
+  point, which the preamp must cancel, and refuses a list that isn't exactly 25 values
+  (the module would refuse it too). Release asset `tablet-peq.so`, installed in
+  `$PREFIX/lib/ladspa` (the module's default path). With an EQ the AAudio sink becomes
+  `tablet_out` and the EQ sink takes the name `tablet`, so squeezelite's `-o tablet` and
+  the tunnels' `target.object` need no change. An EQ line the module refuses leaves the
+  daemon up without `tablet` (seen 2026-10-21): squeezelite exits, the player is gone. Controls can't be changed on a loaded sink without D-Bus: to try a
+  curve live, load a second EQ sink on top of `tablet` and `pactl move-sink-input` the
+  stream (no cut), then unload the first.
 - Network outputs (`node.network = true`: the tablets' tunnels) are invisible to the audio
   wizard (`isNetwork` in `audio/setup/pactl.go`). Their `priority.session` can't come from a
   WirePlumber rule — the node belongs to its own `pipewire -c` client — so `audio.sh`

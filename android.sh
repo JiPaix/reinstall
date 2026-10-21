@@ -1,3 +1,5 @@
+    line="$(sed -n 's/^eq=//p' <<<"$info")"
+    [ -n "$line" ] && print_info "Tablet: equalizer for $line"
 #!/bin/bash
 # =============================================================================
 # Android Tablet Setup Script
@@ -238,6 +240,21 @@ battery_protection() {  # $1 = ro.product.model
     # goes from "charging" to "not charging").
     "Lenovo TB128FU") echo "settings put global battery_protected_charge 1" ;;
   esac
+}
+
+# The speakers an equalizer is known for, one "name|controls" per line. The
+# controls are the peq plugin's (tablet/peq/peq.c): preamp dB, then six bands
+# of type,Hz,dB,Q (0 off, 1 peak, 2 low shelf, 3 high shelf, 4 high-pass, 5
+# low-pass). The preamp is minus the curve's highest point, or a boost clips
+# (`tablet/peq/build.sh curve <controls>` prints it). Add a speaker: one line.
+speaker_eqs() {
+  # Logitech Z120: no published EQ. One measurement (dsprobotics.com forum,
+  # 2013) finds +8 dB at 220 Hz, +5 dB around 3 kHz and beaming above 5 kHz.
+  # Tuned by ear with JiPaix (2026-10-21, final) for punch, not loudness, into
+  # a V: high-pass under what 2" drivers play, kick at 110 Hz, the 220 Hz hump
+  # trimmed, mids dipped at 1 kHz, attack at 5 kHz, a little air past 10 kHz
+  # (more was too much hi-hat).
+  echo "Logitech Z120|-5.5,4,55,0,0.7,1,110,6,0.9,1,250,-2,1.4,1,1000,-3,0.8,1,5000,3.5,1,3,10000,2.5,0.7"
 }
 
 # Installs a package from F-Droid's repository over adb, unless `$installed`
@@ -499,6 +516,7 @@ detect_existing() {
       grep -m1 '^ *squeezelite ' ~/.termux/boot/start-squeezelite 2>/dev/null | sed 's/^ */player=/'
       grep -q 'Written by android.sh' ~/.termux/boot/start-squeezelite 2>/dev/null && echo ours=yes
       sed -n 's/^load-module module-native-protocol-tcp.*auth-ip-acl=\([^ ]*\).*/acl=\1/p; s/^load-module module-native-protocol-tcp.*auth-anonymous.*/acl=any/p' $TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa 2>/dev/null
+      sed -n 's/^# speakers: /eq=/p' $TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa 2>/dev/null
       pgrep -x squeezelite >/dev/null && echo run_squeezelite=yes
       pgrep -x pulseaudio >/dev/null && echo run_pulseaudio=yes
       sed -n \"s/^TABLET_NAME='\\(.*\\)'\$/server=\\1/p; s/^COMPONENTS='\\(.*\\)'\$/components=\\1/p\" ~/.config/tablet-server/server.env 2>/dev/null
@@ -518,6 +536,8 @@ detect_existing() {
       any) print_info "Tablet: network audio open to any address"; found=true ;;
       *)   print_info "Tablet: network audio allowed for ${line//;/, }"; found=true ;;
     esac
+    line="$(sed -n 's/^eq=//p' <<<"$info")"
+    [ -n "$line" ] && print_info "Tablet: equalizer for $line"
     grep -q '^run_squeezelite=yes' <<<"$info" && state=running || state=stopped
     print_info "Tablet: squeezelite $state, PulseAudio $(grep -q '^run_pulseaudio=yes' <<<"$info" && echo running || echo stopped)"
     line="$(sed -n 's/^server=//p' <<<"$info")"
@@ -736,7 +756,7 @@ timeout 10 pactl load-module module-native-protocol-tcp port=$PULSE_PORT 'auth-i
 # every setting the other two need.
 choose_setup() {
   local pa_conf="$TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa"
-  local cur_line cur_name cur_server cur_mac cur_tcp apps defaults choice n dash answer serial
+  local cur_line cur_name cur_server cur_mac cur_tcp cur_eq apps defaults choice n dash answer serial eqs
 
   # What the tablet has now: the defaults of every question below.
   SERVER_ENV="$(tablet_ssh 'cat ~/.config/tablet-server/server.env 2>/dev/null' || true)"
@@ -745,6 +765,7 @@ choose_setup() {
   cur_server="$(sed -n 's/.* -s \([^ ]*\).*/\1/p' <<<"$cur_line")"
   cur_mac="$(sed -n 's/.* -m \([^ ]*\).*/\1/p' <<<"$cur_line")"
   cur_tcp="$(tablet_ssh "grep -m1 '^load-module module-native-protocol-tcp' $pa_conf 2>/dev/null" || true)"
+  cur_eq="$(tablet_ssh "sed -n 's/^# speakers: //p' $pa_conf 2>/dev/null" || true)"
   # Termux can tell which apps are there (not adb's job: a re-run has none).
   apps="$(tablet_ssh "for p in $HA_APP $HA_APP.minimal $MOONLIGHT_APP; do pm path \$p >/dev/null 2>&1 && echo \$p; done" || true)"
   HA_PKG="$(grep -m1 "^$HA_APP" <<<"$apps" || true)"
@@ -857,6 +878,37 @@ choose_setup() {
     fi
   fi
 
+  # ── an equalizer for the speakers plugged in ──
+  EQ_NAME=""; EQ_CONTROLS=""
+  if [ "$WANT_PLAYER" = true ] || [ "$WANT_AUDIO" = true ]; then
+    print_header "Speakers"
+    mapfile -t eqs < <(speaker_eqs)
+    defaults=0
+    ask "Which speakers does the tablet play through?"
+    echo "  0) None             no equalizer"
+    for n in "${!eqs[@]}"; do
+      echo "  $((n + 1))) ${eqs[n]%%|*}"
+      [ "${eqs[n]%%|*}" = "$cur_eq" ] && defaults=$((n + 1))
+    done
+    print_info "The equalizer is on whatever plays: the tablet's own speaker too, when they are unplugged."
+    read -rp "Choice [$defaults]: " choice || exit 0
+    choice="${choice:-$defaults}"
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -gt "${#eqs[@]}" ]; then
+      print_error "A number from 0 to ${#eqs[@]}."
+      exit 1
+    fi
+    if [ "$choice" -gt 0 ]; then
+      EQ_NAME="${eqs[choice - 1]%%|*}"
+      EQ_CONTROLS="${eqs[choice - 1]#*|}"
+      # 25 values exactly (preamp + 6 bands × 4): any other count and the
+      # module refuses to load, leaving no 'tablet' sink for the player.
+      if [ "$(tr -cd ',' <<<"$EQ_CONTROLS" | wc -c)" -ne 24 ]; then
+        print_error "The $EQ_NAME profile in speaker_eqs doesn't have 25 values — not applied."
+        exit 1
+      fi
+    fi
+  fi
+
   # ── Home Assistant: the page it shows ──
   HA_PAGE_VALUE=""
   if [ "$WANT_HA" = true ]; then
@@ -935,6 +987,29 @@ choose_setup() {
   fi
 }
 
+# The equalizer's plugin (tablet/peq), in the folder module-ladspa-sink looks
+# in. Termux packages no LADSPA equalizer. From the Release, or built with
+# --local (clang and lld, no NDK: the plugin uses no libc).
+install_peq() {
+  local so="$WORK/peq.so"
+  if [ "$LOCAL" = true ]; then
+    if ! command -v clang &>/dev/null || ! command -v ld.lld &>/dev/null; then
+      print_warn "--local builds the equalizer with clang and lld, not found here"
+      return 1
+    fi
+    print_info "Building the equalizer from $SCRIPT_DIR/tablet/peq"
+    "$SCRIPT_DIR/tablet/peq/build.sh" >/dev/null && cp "$SCRIPT_DIR/tablet/peq/out/peq.so" "$so" || return 1
+  elif ! fetch tablet-peq.so "$so" 2>/dev/null; then
+    print_warn "The $RELEASE_TAG Release of $REPO has no tablet-peq.so (the equalizer)"
+    return 1
+  fi
+  if [ "$(tablet_ssh 'uname -m')" != aarch64 ]; then
+    print_warn "The equalizer is built for 64-bit ARM tablets only"
+    return 1
+  fi
+  tablet_ssh_in "mkdir -p $TERMUX_PREFIX/lib/ladspa && cat > $TERMUX_PREFIX/lib/ladspa/peq.so.new && mv $TERMUX_PREFIX/lib/ladspa/peq.so.new $TERMUX_PREFIX/lib/ladspa/peq.so" < "$so"
+}
+
 # The tablet's sound: PulseAudio for the player and for the PCs, squeezelite.
 apply_audio() {
   local pa_conf="$TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa" pkgs=(pulseaudio)
@@ -960,13 +1035,30 @@ apply_audio() {
     fi
   fi
 
+  if [ -n "$EQ_NAME" ] && ! install_peq; then
+    print_warn "No equalizer this time: the sound goes out as it is"
+    EQ_NAME=""
+  fi
+
   # Stock default.pa includes default.pa.d/ and only offers the OpenSL ES sink.
   # AAudio is Android's low-latency path (~20 ms of buffer against ~150).
   # Suspend-on-idle has to go: the AAudio sink sometimes deadlocks the whole
   # daemon while suspending after 5 s of silence.
+  # no_close_hack: when Android moves the stream (a jack plugged or pulled) the
+  # module closes it from its own error callback, which waits for that very
+  # callback — the daemon hung and the watchdog cut the music. With it, the
+  # stream is stopped and a new one opened (0.2 s, same daemon; 2026-10-21).
+  # With an equalizer, 'tablet' is the equalizer's sink (in front of the AAudio
+  # one): squeezelite and the PCs' tunnels play to 'tablet' either way.
   tablet_ssh_in "mkdir -p $TERMUX_PREFIX/etc/pulse/default.pa.d && cat > $pa_conf" <<EOF
 # Written by android.sh (reinstall) — rewritten at every run.
-load-module module-aaudio-sink sink_name=tablet
+$(if [ -n "$EQ_NAME" ]; then cat <<EQ
+# speakers: $EQ_NAME
+load-module module-aaudio-sink sink_name=tablet_out no_close_hack=1
+load-module module-ladspa-sink sink_name=tablet sink_master=tablet_out plugin=peq label=peq control=$EQ_CONTROLS
+set-default-sink tablet
+EQ
+else echo "load-module module-aaudio-sink sink_name=tablet no_close_hack=1"; fi)
 unload-module module-suspend-on-idle
 $([ "$WANT_AUDIO" = true ] && echo "load-module module-native-protocol-tcp port=$PULSE_PORT $TCP_AUTH")
 EOF
@@ -975,6 +1067,7 @@ EOF
   else
     print_ok "PulseAudio: AAudio sink 'tablet', not open to the network"
   fi
+  [ -n "$EQ_NAME" ] && print_ok "Equalizer for $EQ_NAME on 'tablet'"
 
   tablet_ssh_in 'mkdir -p ~/.termux/boot && cat > ~/.termux/boot/start-squeezelite && chmod 700 ~/.termux/boot/start-squeezelite' <<EOF
 #!$TERMUX_PREFIX/bin/sh
@@ -1013,6 +1106,10 @@ EOF
   sleep 6
   if ! tablet_ssh 'timeout 10 pactl list short sinks | grep -q "tablet.*aaudio"'; then
     print_error "PulseAudio didn't come up — check on the tablet: pactl list short sinks"
+    exit 1
+  fi
+  if [ -n "$EQ_NAME" ] && ! tablet_ssh 'timeout 10 pactl list short sinks | grep -q "tablet	module-ladspa-sink"'; then
+    print_error "The equalizer's sink isn't there — check on the tablet: pactl list short sinks"
     exit 1
   fi
   if [ "$WANT_PLAYER" = true ]; then

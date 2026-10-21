@@ -168,6 +168,28 @@ Both real runs of 2026-10-12 had all four components on. Never run for real:
 
 Everything else left to test outside the tablet is in the `tests-left` skill.
 
+## To do — the speakers' equalizer, and the jack
+
+Written on 2026-10-21 (`speaker_eqs`, `install_peq`, `tablet/peq/`). JiPaix settled the
+Z120 curve by ear that evening (a V, treble shelf +2.5 dB): final, in `speaker_eqs`. The
+tablet then got, by hand, the `50-reinstall.pa` android.sh writes for it (EQ + jack fix,
+plugin copied from `--local`'s build): it plays through the EQ since 19:46. android.sh
+itself never ran it:
+
+- a full run choosing "Logitech Z120": `50-reinstall.pa` has `# speakers:`, `tablet_out`
+  (AAudio) and `tablet` (`module-ladspa-sink`); squeezelite and a PC's tunnel play
+  through the EQ; a re-run offers the same choice back, and "0" brings back a single
+  AAudio `tablet` sink;
+- a run without `--local`: needs a Release that has `tablet-peq.so`;
+- `tablet-latency` once with the EQ: the filter sink should add nothing measurable.
+
+The jack: **fixed and tested the same day** (CLAUDE.md, Android tablet). Pulled and put back
+while music played (19:49): Android moved the stream both ways, a new stream opened in
+0.2 s, same daemon, watchdog quiet. Left to see: a long run of plugs (`no_close_hack`
+never closes the old stream, one leaked per move; check the daemon's memory after a few
+dozen), and whether it also cures the idle-suspend hang (`module-suspend-on-idle` stays
+unloaded until someone tries).
+
 ## To do — dropouts that remain on the PC link at every latency
 
 Not a test of `android.sh`: an open problem found on 2026-10-12 while measuring the link

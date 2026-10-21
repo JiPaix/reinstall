@@ -56,6 +56,14 @@ jobs:
           CGO_ENABLED: '0'
         run: go build -trimpath -ldflags='-s -w' -o ../dist/tablet-server .
 
+      # The tablet's equalizer, a LADSPA plugin with no libc: clang and lld, no NDK.
+      - name: Build tablet equalizer
+        run: |
+          command -v ld.lld >/dev/null || sudo apt-get install -y lld
+          tablet/peq/build.sh test
+          tablet/peq/build.sh
+          cp tablet/peq/out/peq.so dist/tablet-peq.so
+
       # build.sh downloads its own pinned toolchain (build-tools, platform, JDK):
       # nothing of the runner image's Android SDK is used. Signed with the
       # keystore of the INPUTHOME_KEYSTORE_B64 secret (base64) when it is set;
