@@ -172,9 +172,10 @@ Everything else left to test outside the tablet is in the `tests-left` skill.
 
 Written on 2026-10-21 (`speaker_eqs`, `install_peq`, `tablet/peq/`). JiPaix settled the
 Z120 curve by ear that evening (a V, treble shelf +2.5 dB): final, in `speaker_eqs`. The
-tablet then got, by hand, the `50-reinstall.pa` android.sh writes for it (EQ + jack fix,
-plugin copied from `--local`'s build): it plays through the EQ since 19:46. android.sh
-itself never ran it:
+tablet played through it from 19:46 until ~21:15, when JiPaix, with Dolby off, chose no
+equalizer: its `50-reinstall.pa` is back to the no-EQ shape (the EQ one is
+`~/50-reinstall.pa.eq-z120.bak`; the 21:15:30 watchdog line is that restart, not a hang).
+The profile stays in the installer. android.sh itself never ran it:
 
 - a full run choosing "Logitech Z120": `50-reinstall.pa` has `# speakers:`, `tablet_out`
   (AAudio) and `tablet` (`module-ladspa-sink`); squeezelite and a PC's tunnel play
@@ -189,6 +190,19 @@ while music played (19:49): Android moved the stream both ways, a new stream ope
 never closes the old stream, one leaked per move; check the daemon's memory after a few
 dozen), and whether it also cures the idle-suspend hang (`module-suspend-on-idle` stays
 unloaded until someone tries).
+
+## To do — Dolby off, at the next reboot
+
+`sound_effect_apps` (2026-10-21) disables Lenovo's `com.dolby.daxservice` and
+`com.dolby.daxappui2`. Done by hand on the kitchen tablet that evening (`pm list packages
+-d` lists both), but daxservice is a persistent app: `disable-user` and `force-stop` leave
+its process (and the DAP effect it made on session 0, switched off from its screen
+beforehand) up until the tablet reboots. After the next reboot, check: no
+`com.dolby.daxservice` process (`pidof`), `dumpsys media.audio_flinger | grep -c "name:
+DAP$"` → 0, and audio still plays. The "Music Listener" effects (Dolby's, from
+`/vendor/etc/audio_effects.xml`, on every music stream) can't be removed without root:
+they report streams to DAP and should do nothing without it — not checked by ear. A
+reboot drops `adb tcpip`: Wireless debugging by hand afterwards.
 
 ## To do — dropouts that remain on the PC link at every latency
 

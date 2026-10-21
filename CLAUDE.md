@@ -387,8 +387,12 @@ gotchas below. What was written but never run for real is listed in two skills: 
   loop already read the old name), and leaves PulseAudio up. A full run gives the player
   and the PC output the tablet's name; `--rename` can still make them differ, and a PC
   added with `--this-pc` names its own output. A full run without network audio removes this
-  PC's output for that tablet. The debloat list and the charge-protection setting are per
-  `ro.product.model`: another tablet, another case (Lenovo: `battery_protected_charge`).
+  PC's output for that tablet. The debloat list, the charge-protection setting and the
+  maker's sound processing (`sound_effect_apps`) are per `ro.product.model`: another
+  tablet, another case (Lenovo: `battery_protected_charge`; Dolby's DAP, which levels
+  everything the tablet plays, after PulseAudio — it made a 12 dB quieter Assist voice
+  sound the same. No `settings` key holds it: its service is disabled, and being a
+  persistent app it keeps running until the next reboot).
 - Bash traps in `android.sh`: every `tablet_ssh` closes stdin (`ssh -n`), or ssh swallows the
   answers typed ahead for the next prompt (`tablet_ssh_in` is for heredoc-fed calls); and a
   `pkill -f` pattern must not appear literally anywhere on the same remote command line —

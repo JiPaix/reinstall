@@ -353,6 +353,19 @@ EOF
   esac
 }
 
+# The maker's sound processing per tablet model, disabled like the apps above.
+# It sits on Android's whole output, after PulseAudio: whatever the tablet
+# plays goes through it, equalizer and Home Assistant's voice included.
+sound_effect_apps() {  # $1 = ro.product.model
+  case "$1" in
+    # Dolby Sound: its DAP effect, created on output session 0 by daxservice
+    # (the app is only its settings screen), levels every sound — a voice
+    # Home Assistant lowered by 12 dB sounded the same (2026-10-21). No
+    # `settings` key holds it: without its service, no effect.
+    "Lenovo TB128FU") printf '%s\n' com.dolby.daxservice com.dolby.daxappui2 ;;
+  esac
+}
+
 # Connects adb and sets HAVE_ADB. A PC the tablet has never seen comes up
 # "unauthorized" until the dialog on the tablet's screen is accepted: wait for
 # that instead of failing, whatever the route (first install or --add-pc).
@@ -1539,6 +1552,14 @@ settings put global stay_on_while_plugged_in 7'
       print_ok "Disabled $count unused app(s) for $MODEL (undo: adb shell pm enable <package>)"
     else
       print_info "No app list for model '$MODEL' — nothing disabled"
+    fi
+    if [ -n "$(sound_effect_apps "$MODEL")" ]; then
+      enabled="$(adb_sh pm list packages -e | tr -d '\r')"
+      while read -r pkg; do
+        grep -qx "package:$pkg" <<<"$enabled" || continue
+        adb_sh "pm disable-user --user 0 $pkg" >/dev/null
+      done < <(sound_effect_apps "$MODEL")
+      print_ok "The maker's sound processing off (undo: adb shell pm enable <package>)"
     fi
   fi
 

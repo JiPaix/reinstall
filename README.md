@@ -140,7 +140,9 @@ Over adb, with nothing to tap on the tablet, it installs F-Droid, then
 the light KISS launcher as home screen. As a music player, it starts
 [squeezelite](https://github.com/ralph-irving/squeezelite) at every boot, so the
 tablet shows up as a player in Lyrion or Music Assistant. It also sets a few
-things on the tablet so the player isn't put to sleep. If speakers are plugged
+things on the tablet so the player isn't put to sleep, and turns off the
+maker's sound processing where it knows it (Dolby on the Lenovo tablet), which
+evens out every sound the tablet plays. If speakers are plugged
 into the tablet and their model is in the list (Logitech Z120 for now), it can
 put an equalizer made for them on everything the tablet plays.
 
