@@ -262,8 +262,10 @@ gotchas below. What was written but never run for real is listed in two skills: 
   absent devices: 5 s, then 10 s) and while it pages an absent one (5 s; 20 s for a BLE
   controller) a speaker switched on meanwhile waits — with the controllers in the loop, the
   soundbar once waited ~20 s at boot. It retries 12×10 s within a 240 s budget that must
-  stay under the unit's `TimeoutStartSec`; each `bluetoothctl connect` has its own `timeout`
-  (it can hang), capped by what is left of the budget. `audio.sh` starts it `--no-block`.
+  stay under the unit's `RuntimeMaxSec`; each `bluetoothctl connect` has its own `timeout`
+  (it can hang), capped by what is left of the budget. **The unit is `Type=exec`, never
+  `oneshot`**: `multi-user.target` waits for a oneshot it wants, so with the speakers off the
+  whole boot (lactd, power-profiles-daemon…) sat behind the 240 s budget (2026-10-25).
   Tunables: `/etc/bt-autoconnect/bt-autoconnect.env`.
 
 ### Android tablet

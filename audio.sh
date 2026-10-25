@@ -15,7 +15,7 @@
 #   order whenever one comes or goes).
 # - The equalizers are switched on and off together, at any time: `audio-eq
 #   on|off`, or POST /eq/on and /eq/off on the status server. Swaps stay.
-# - Optional: a root oneshot reconnects every paired Bluetooth device at boot.
+# - Optional: a root service reconnects every paired Bluetooth device at boot.
 # - Optional MPD server on PipeWire, with a generated password.
 # - Microphones never suspend (no crackle at the start of a recording; the
 #   mic-wake unit opens them once per WirePlumber start), and they are ranked
@@ -318,7 +318,7 @@ fi
 # STEP 5 — Bluetooth auto-connect at boot (optional; needs root)
 # =============================================================================
 # A Bluetooth speaker usually won't reconnect on its own, so after a reboot it
-# stays silent until someone connects it. This installs a root oneshot that
+# stays silent until someone connects it. This installs a root service that
 # retries connecting every paired Bluetooth audio output, at every boot. The set
 # comes from BlueZ at run time (paired + Audio Sink), so a speaker paired after
 # this install is picked up too; the wizard's ranking only sets the order.
@@ -382,8 +382,8 @@ INTERVAL="${BT_AUTOCONNECT_INTERVAL:-10}"
 SKIP="${BT_AUTOCONNECT_SKIP:-}"   # space-separated MACs to leave alone
 [ -r "$HIDDEN_FILE" ] && SKIP="$SKIP $(tr '\n' ' ' < "$HIDDEN_FILE")"
 # Whole-run limit in seconds. An unreachable device costs ~5s per attempt, so
-# with a few of them off the attempts alone outlast the unit's TimeoutStartSec
-# and systemd kills the run as failed. Keep this below that timeout.
+# with a few of them off the attempts alone outlast the unit's RuntimeMaxSec
+# and systemd kills the run as failed. Keep this below that limit.
 BUDGET="${BT_AUTOCONNECT_BUDGET:-240}"
 CALL_TIMEOUT="${BT_AUTOCONNECT_CALL_TIMEOUT:-20}"
 
@@ -445,7 +445,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
 
     out_of_time && give_up
     name=$(printf '%s\n' "$info" | sed -n 's/^[[:space:]]*Name: //p' | head -1)
-    # No call outlives the budget: the unit's TimeoutStartSec is not far above
+    # No call outlives the budget: the unit's RuntimeMaxSec is not far above
     # (and `timeout 0` would mean no limit at all).
     left=$((BUDGET - SECONDS))
     [ "$left" -gt 0 ] || give_up
@@ -484,7 +484,10 @@ After=bluetooth.service
 Wants=bluetooth.service
 
 [Service]
-Type=oneshot
+# exec, not oneshot: a target waits for the oneshots it wants, so a boot with
+# the speakers off held multi-user.target (and every unit after it) for the
+# whole budget. exec lets the boot go on while the helper keeps trying.
+Type=exec
 ExecStart=/usr/local/bin/bt-autoconnect
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # Optional tuning: BT_AUTOCONNECT_ATTEMPTS / _INTERVAL / _SKIP. Leading "-" so
@@ -493,14 +496,15 @@ EnvironmentFile=-/etc/bt-autoconnect/bt-autoconnect.env
 # Backstop only: the helper stops itself after BT_AUTOCONNECT_BUDGET (240s) and
 # puts a timeout on every bluetoothctl call. Keep this above the budget, or a
 # boot with the devices off ends with the unit killed and marked failed.
-TimeoutStartSec=300
+# RuntimeMaxSec, not TimeoutStartSec: with Type=exec the start is over at once.
+RuntimeMaxSec=300
 
 [Install]
 WantedBy=multi-user.target
 BTSVC
     sudo systemctl daemon-reload
     sudo systemctl enable bt-autoconnect.service
-    # --no-block: the first pass can retry for ~2 minutes; don't hold the install.
+    # --no-block: with Type=exec it returns at once anyway; kept as a guard.
     sudo systemctl start --no-block bt-autoconnect.service
     print_ok "Enabled bt-autoconnect.service (connecting paired audio outputs now and at every boot)"
     print_info "Optional tuning in /etc/bt-autoconnect/bt-autoconnect.env: BT_AUTOCONNECT_ATTEMPTS, BT_AUTOCONNECT_INTERVAL, BT_AUTOCONNECT_BUDGET, BT_AUTOCONNECT_SKIP (MACs)"
