@@ -282,6 +282,18 @@ gotchas below. What was written but never run for real is listed in two skills: 
   `$PREFIX/etc/pulse/default.pa.d/50-reinstall.pa`, `~/.termux/boot/20-tablet-server`,
   `~/.local/bin/tablet-server{,-run}` and `~/.config/tablet-server/server.env` (its own
   answers, read back as the next run's defaults); `00-sshd` is created only when missing.
+  **Android's low-memory killer can take Termux, foreground service and all** (2026-11-01:
+  the Home Assistant WebView at 1.2 GB; `dumpsys activity exit-info com.termux` says
+  `LOW_MEMORY`). Shell can't resend BOOT_COMPLETED, so `~/.local/bin/tablet-keepalive`
+  runs as Termux:API scheduled job 7923 (persisted, every 15 min, Android's minimum) and
+  restarts sshd, the sound boot script and tablet-server when seen down twice 10 s apart
+  (`~/keepalive.log`). It never runs `10-dashboard`. Termux:API must be on the battery
+  allowlist like Termux (never opened, it sits in the NEVER standby bucket, whose jobs may
+  never run). With `--network none` `termux-job-scheduler -p` lists nothing (Termux:API hits
+  a null pointer printing the job): read `/system/bin/dumpsys jobscheduler` instead. Test it
+  with `adb shell cmd jobscheduler run -f com.termux.api 7923`. Before the job, or without
+  it: open Termux over adb, `input text sshd`, then the boot scripts with `setsid nohup`
+  over SSH.
   `10-dashboard` and the Home Assistant app's own settings belong to the Home Assistant
   session's config — never touch. Home Assistant and Moonlight themselves are installed and
   signed in by hand (Play Store, accounts, the Sunshine PIN): a prerequisite, not a step.

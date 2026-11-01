@@ -191,6 +191,24 @@ never closes the old stream, one leaked per move; check the daemon's memory afte
 dozen), and whether it also cures the idle-suspend hang (`module-suspend-on-idle` stays
 unloaded until someone tries).
 
+## To do — the keepalive job, half tested (2026-11-01)
+
+Done on the kitchen tablet: `apply_keepalive` run alone registered job 7923 (in `adb shell
+dumpsys jobscheduler`: `JOB #u0a237/7923`, periodic 15 min), Termux:API put on the battery
+allowlist by hand (bucket 50 → 5). Then tablet-server alone killed (`pkill -f
+'bin/[t]ablet-server-run'` and `pkill -x tablet-server`, in two calls) + `cmd jobscheduler
+run -f com.termux.api 7923`: 7923 back after ~12 s, one line in `~/keepalive.log`, one
+server loop. An unforced run fired on its own ~30 min after registering (14:01). The real
+case at 14:10:30: lmkd killed Termux again (Home Assistant WebView at 1.37 GB); the job,
+forced at 14:11:58 rather than wait up to 19 min, brought sshd, sound and tablet-server back
+from the background (~30 s, one wait per part then; one wait in all since: ~12 s). Not yet
+seen:
+- an *unforced* run after a kill, i.e. the whole outage with nobody stepping in
+  (`~/keepalive.log` against `dumpsys activity exit-info com.termux`);
+- the job still listed after a reboot (`--persisted true`);
+- the new `com.termux.api` allowlist line and the dumpsys check, in a full run of
+  `android.sh`.
+
 ## To do — Dolby off, at the next reboot
 
 `sound_effect_apps` (2026-10-21) disables Lenovo's `com.dolby.daxservice` and

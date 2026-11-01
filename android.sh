@@ -265,22 +265,36 @@ speaker_eqs() {
 # offers its updates.
 FDROID=org.fdroid.fdroid
 fdroid_install() {  # $1 = package
-  local pkg="$1" code flags=()
+  local pkg="$1" json code name codes c out flags=()
   if grep -qx "package:$pkg" <<<"$installed"; then
     print_ok "$pkg already installed"
     return 1
   fi
-  code="$(curl -fsSL --proto '=https' --tlsv1.2 "https://f-droid.org/api/v1/packages/$pkg" |
-    sed -n 's/.*"suggestedVersionCode":\([0-9]*\).*/\1/p')"
+  json="$(curl -fsSL --proto '=https' --tlsv1.2 "https://f-droid.org/api/v1/packages/$pkg")"
+  code="$(sed -n 's/.*"suggestedVersionCode":\([0-9]*\).*/\1/p' <<<"$json")"
   if [ -z "$code" ]; then
     print_error "Couldn't read $pkg's version from F-Droid."
     exit 1
   fi
-  print_info "Downloading $pkg ($code) from F-Droid"
-  curl -fSL --proto '=https' --tlsv1.2 "https://f-droid.org/repo/${pkg}_${code}.apk" -o "$WORK/$pkg.apk" || exit 1
+  # Some apps come as one build per CPU type, each its own version code of the
+  # same version, and the suggested one can be another CPU's (LensCast's was
+  # x86_64): adb refuses it with NO_MATCHING_ABIS and the next one is tried.
+  name="$(grep -o '"versionName":"[^"]*","versionCode":'"$code"'[,}]' <<<"$json" | sed 's/^"versionName":"\([^"]*\)".*/\1/')"
+  codes="$code $(grep -o '"versionName":"[^"]*","versionCode":[0-9]*' <<<"$json" |
+    grep -F "\"versionName\":\"$name\"," | sed 's/.*://' | grep -vx "$code")"
   [ "$pkg" = "$FDROID" ] || flags=(-i "$FDROID")
-  adb_ install "${flags[@]}" "$WORK/$pkg.apk" >/dev/null || { print_error "adb couldn't install $pkg"; exit 1; }
-  print_ok "Installed $pkg"
+  for c in $codes; do
+    print_info "Downloading $pkg ($c) from F-Droid"
+    curl -fSL --proto '=https' --tlsv1.2 "https://f-droid.org/repo/${pkg}_${c}.apk" -o "$WORK/$pkg.apk" || exit 1
+    if out="$(adb_ install "${flags[@]}" "$WORK/$pkg.apk" 2>&1)"; then
+      print_ok "Installed $pkg"
+      return 0
+    fi
+    grep -q NO_MATCHING_ABIS <<<"$out" || break
+    print_info "That build is for another processor: trying the next one"
+  done
+  print_error "adb couldn't install $pkg${out:+: $(tail -n1 <<<"$out")}"
+  exit 1
 }
 
 # The launcher a tablet that only does this gets: KISS, a search box and
@@ -1224,6 +1238,59 @@ EOF
   esac
 }
 
+# Android's low-memory killer can take Termux even as a foreground service: on
+# 2026-11-01 the Home Assistant app's WebView reached 1.2 GB and lmkd killed
+# down to the foreground app, Termux with sshd, the player and tablet-server.
+# Nothing brought them back short of a reboot. A job of Termux:API's scheduler
+# outlives the process (the system holds it, and it survives a reboot) and
+# restarts what is down, every 15 min at best (Android's minimum).
+apply_keepalive() {
+  local job_id=7923
+  print_header "Tablet Keepalive"
+
+  if ! tablet_ssh 'command -v termux-job-scheduler >/dev/null'; then
+    tablet_pkg termux-api || { print_warn "Termux couldn't install termux-api — no keepalive"; return 0; }
+  fi
+  # Only a part seen down twice, 10 s apart, is restarted: android.sh restarting
+  # it at that moment never reads as dead (a second player would join under the
+  # same name). One wait for all: after a kill everything is down (2026-11-01:
+  # a wait per part made it 30 s).
+  # 10-dashboard is the Home Assistant session's: never run from here.
+  tablet_ssh_in 'mkdir -p ~/.local/bin && cat > ~/.local/bin/tablet-keepalive && chmod 700 ~/.local/bin/tablet-keepalive' <<EOF
+#!$TERMUX_PREFIX/bin/sh
+# Written by android.sh (reinstall). Termux:API's job scheduler runs this about
+# every 15 min: restarts what the boot scripts started when Android killed it.
+down() {
+    [ -e ~/.termux/boot/00-sshd ] && ! pgrep -x sshd >/dev/null && echo sshd
+    [ -x ~/.termux/boot/start-squeezelite ] && ! pgrep -f 'boot/[s]tart-squeezelite' >/dev/null && echo sound
+    [ -x ~/.termux/boot/20-tablet-server ] && ! pgrep -f 'bin/[t]ablet-server-run' >/dev/null && echo tablet-server
+}
+before="\$(down)"
+[ -n "\$before" ] || exit 0
+sleep 10
+for part in \$(down); do
+    case " \$(echo \$before) " in *" \$part "*) ;; *) continue ;; esac
+    case \$part in
+        sshd) sshd ;;
+        sound) setsid nohup ~/.termux/boot/start-squeezelite >/dev/null 2>&1 & ;;
+        tablet-server) setsid nohup ~/.termux/boot/20-tablet-server >/dev/null 2>&1 & ;;
+    esac
+    echo "\$(date '+%F %T') \$part was down: restarted" >> ~/keepalive.log
+done
+EOF
+  # --network none: no network required (the default waits for one). Termux:API
+  # then can't print the job (null pointer formatting it): -p lists nothing,
+  # yet the job is there. Hence the check in Android's own list, which the DUMP
+  # permission granted to Termux at STEP 4 lets it read.
+  # The Termux:API app missing makes its commands hang: hence the timeout.
+  tablet_ssh "timeout 20 termux-job-scheduler --job-id $job_id --script ~/.local/bin/tablet-keepalive --period-ms 900000 --persisted true --network none --battery-not-low false" >/dev/null 2>&1 || true
+  if tablet_ssh "/system/bin/dumpsys jobscheduler 2>/dev/null | grep -qE 'JOB #u0a[0-9]+/$job_id: [0-9a-f]+ com\.termux\.api/'"; then
+    print_ok "Keepalive every 15 min (restarts logged in ~/keepalive.log)"
+  else
+    print_warn "Termux:API didn't take the keepalive job — check with adb: dumpsys jobscheduler | grep /$job_id:"
+  fi
+}
+
 # One tablet from the menu to the summary. A function only so that the end of
 # the script can run it again for the next tablet: its body is the script's
 # main flow and stays at the margin (the heredocs in it can't be indented).
@@ -1494,9 +1561,11 @@ EOF
     adb_sh 'pm grant com.termux android.permission.DUMP; pm grant com.termux android.permission.PACKAGE_USAGE_STATS'
     print_ok "Termux may read what the tablet shows"
 
-    # Without the exemption Android stops Termux in the background.
-    adb_sh 'for p in com.termux com.termux.boot; do dumpsys deviceidle whitelist +$p; done' >/dev/null
-    print_ok "Battery optimisation off for Termux and Termux:Boot"
+    # Without the exemption Android stops Termux in the background. Termux:API
+    # too: never opened, it sits in the NEVER standby bucket, whose jobs (the
+    # keepalive's) Android may hold back indefinitely.
+    adb_sh 'for p in com.termux com.termux.boot com.termux.api; do dumpsys deviceidle whitelist +$p; done' >/dev/null
+    print_ok "Battery optimisation off for Termux, Termux:Boot and Termux:API"
 
     # "Display over other apps": what lets a boot script start an activity.
     adb_sh 'appops set com.termux SYSTEM_ALERT_WINDOW allow'
@@ -1568,6 +1637,7 @@ settings put global stay_on_while_plugged_in 7'
   else
     apply_audio
     apply_server
+    apply_keepalive
 
     # The tablet as an output of this PC: only with network audio, and asked.
     WANT_PC_OUTPUT=false
