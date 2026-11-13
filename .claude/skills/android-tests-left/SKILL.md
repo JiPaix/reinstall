@@ -201,16 +201,24 @@ run -f com.termux.api 7923`: 7923 back after ~12 s, one line in `~/keepalive.log
 server loop. An unforced run fired on its own ~30 min after registering (14:01). The real
 case at 14:10:30: lmkd killed Termux again (Home Assistant WebView at 1.37 GB); the job,
 forced at 14:11:58 rather than wait up to 19 min, brought sshd, sound and tablet-server back
-from the background (~30 s, one wait per part then; one wait in all since: ~12 s). Not yet
-seen:
+from the background (~30 s, one wait per part then; one wait in all since: ~12 s). After
+the reboot at 21:57 the job was still listed (`--persisted true` holds; Termux back with
+sshd, sound and tablet-server 58 s after `adb reboot`). Not yet seen:
 - an *unforced* run after a kill, i.e. the whole outage with nobody stepping in
   (`~/keepalive.log` against `dumpsys activity exit-info com.termux`);
-- the job still listed after a reboot (`--persisted true`);
 - the new `com.termux.api` allowlist line and the dumpsys check, in a full run of
   `android.sh`.
 
-## To do — Dolby off, at the next reboot
+## Half done — Dolby off (checked at the reboot of 2026-11-01)
 
+After the reboot: `dumpsys media.audio_flinger` shows no `DAP` effect and music plays, so
+the levelling is gone. But a `com.dolby.daxservice` process is still started at boot
+(`*PERS*` in `dumpsys activity processes`, both packages listed by `pm list packages -d`):
+Android starts a persistent system app even disabled. Harmless as far as seen; to watch if
+the DAP effect ever comes back. Read dumps into a file first (never `| grep -m`/`| head`:
+cutting `dumpsys media.camera` short killed the camera HAL once).
+
+What was asked before the reboot:
 `sound_effect_apps` (2026-10-21) disables Lenovo's `com.dolby.daxservice` and
 `com.dolby.daxappui2`. Done by hand on the kitchen tablet that evening (`pm list packages
 -d` lists both), but daxservice is a persistent app: `disable-user` and `force-stop` leave
