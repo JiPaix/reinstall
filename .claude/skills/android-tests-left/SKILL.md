@@ -203,7 +203,11 @@ case at 14:10:30: lmkd killed Termux again (Home Assistant WebView at 1.37 GB); 
 forced at 14:11:58 rather than wait up to 19 min, brought sshd, sound and tablet-server back
 from the background (~30 s, one wait per part then; one wait in all since: ~12 s). After
 the reboot at 21:57 the job was still listed (`--persisted true` holds; Termux back with
-sshd, sound and tablet-server 58 s after `adb reboot`). Not yet seen:
+sshd, sound and tablet-server 58 s after `adb reboot`). It can also fire at boot *before*
+Termux:Boot: on 2026-11-13 it started everything 9 s after boot, Termux:Boot started it all
+again 11 s later, and two players with one MAC flooded Music Assistant. Harmless since
+`e4218bb` (both loops refuse a second instance); such a boot still logs a "was down:
+restarted" line in `~/keepalive.log`. Not yet seen:
 - an *unforced* run after a kill, i.e. the whole outage with nobody stepping in
   (`~/keepalive.log` against `dumpsys activity exit-info com.termux`);
 - the new `com.termux.api` allowlist line and the dumpsys check, in a full run of
