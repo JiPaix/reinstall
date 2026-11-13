@@ -287,7 +287,10 @@ gotchas below. What was written but never run for real is listed in two skills: 
   `LOW_MEMORY`). Shell can't resend BOOT_COMPLETED, so `~/.local/bin/tablet-keepalive`
   runs as Termux:API scheduled job 7923 (persisted, every 15 min, Android's minimum) and
   restarts sshd, the sound boot script and tablet-server when seen down twice 10 s apart
-  (`~/keepalive.log`). It never runs `10-dashboard`. Termux:API must be on the battery
+  (`~/keepalive.log`). It never runs `10-dashboard`. The persisted job can fire at boot
+  *before* Termux:Boot (2026-11-13: both started everything, two players with one MAC
+  flooded Music Assistant), so `start-squeezelite` and `tablet-server-run` each refuse a
+  second instance (a pid file in `$PREFIX/var/run`, checked against `/proc`): keep it. Termux:API must be on the battery
   allowlist like Termux (never opened, it sits in the NEVER standby bucket, whose jobs may
   never run). With `--network none` `termux-job-scheduler -p` lists nothing (Termux:API hits
   a null pointer printing the job): read `/system/bin/dumpsys jobscheduler` instead. Test it

@@ -1101,6 +1101,14 @@ EOF
 # Written by android.sh (reinstall). Termux:Boot runs this once at boot. The
 # wake lock keeps Android from suspending Termux; the loop restarts squeezelite
 # if it exits. android.sh reads the squeezelite line back: keep its shape.
+# One instance only: the keepalive job can fire at boot before Termux:Boot ran
+# this, and both start it (2026-11-13: two players with one MAC, flooding Music
+# Assistant). The pid file is checked against /proc, so a stale one is ignored.
+mkdir -p $TERMUX_PREFIX/var/run
+pidfile=$TERMUX_PREFIX/var/run/start-squeezelite.pid
+old="\$(cat "\$pidfile" 2>/dev/null)"
+[ -n "\$old" ] && [ "\$old" != \$\$ ] && grep -q start-squeezelite "/proc/\$old/cmdline" 2>/dev/null && exit 0
+echo \$\$ > "\$pidfile"
 termux-wake-lock
 pulseaudio --start --exit-idle-time=-1
 
@@ -1205,7 +1213,13 @@ EOF
   tablet_ssh_in 'cat > ~/.local/bin/tablet-server-run && chmod 700 ~/.local/bin/tablet-server-run' <<EOF
 #!$TERMUX_PREFIX/bin/sh
 # Written by android.sh (reinstall): tablet-server with its settings, restarted
-# if it exits.
+# if it exits. One instance only (see start-squeezelite): a second one would
+# retry the bound port forever and empty the log.
+mkdir -p $TERMUX_PREFIX/var/run
+pidfile=$TERMUX_PREFIX/var/run/tablet-server-run.pid
+old="\$(cat "\$pidfile" 2>/dev/null)"
+[ -n "\$old" ] && [ "\$old" != \$\$ ] && grep -q tablet-server-run "/proc/\$old/cmdline" 2>/dev/null && exit 0
+echo \$\$ > "\$pidfile"
 set -a
 . ~/.config/tablet-server/server.env
 set +a
