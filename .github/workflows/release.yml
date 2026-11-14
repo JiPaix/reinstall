@@ -1,9 +1,9 @@
 name: Release
 
 # Build the Go binaries (server + interactive setup, for each of screen and
-# audio; a single server for power; the tablet's server, for Android) and the
-# Input Home APK (Android TV app,
-# screen/inputhome), and attach them — plus the static systemd unit files — to
+# audio; a single server for power; the tablet's server, for Android), the
+# Input Home APK (Android TV app, screen/inputhome) and the tablet's adbwifi APK
+# (tablet/adbwifi), and attach them — plus the static systemd unit files — to
 # a GitHub Release. The install scripts (screen.sh / audio.sh / power.sh)
 # download these assets, so no toolchain is needed on the target machine.
 #
@@ -79,6 +79,9 @@ jobs:
           fi
           screen/inputhome/build.sh
           cp screen/inputhome/out/inputhome.apk dist/
+          # The tablet's Wireless debugging at boot (android.sh): same tools, same key.
+          tablet/adbwifi/build.sh
+          cp tablet/adbwifi/out/adbwifi.apk dist/tablet-adbwifi.apk
 
       - name: Stage static systemd units
         run: |

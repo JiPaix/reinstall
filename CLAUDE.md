@@ -27,7 +27,7 @@ gotchas below. What was written but never run for real is listed in two skills: 
   wizard (`cd tablet && go vet . && go test .`; it is built for `android/arm64`).
 - The `*.sh` run from the checkout, but everything built — the Go binaries, including the
   engine template `//go:embed`ded into `swapscreen-setup`, `tablet-server`, and the Input Home
-  APK — comes from the latest GitHub Release. A change under `screen/`/`audio/`/`power/`/
+  and adbwifi APKs — comes from the latest GitHub Release. A change under `screen/`/`audio/`/`power/`/
   `tablet/` reaches a reinstall only after an annotated `v*` tag (`vX.Y.0: summary`) is
   pushed (`release.yml`); pushing to main is not enough. `screen.sh`, `audio.sh` and
   `android.sh` take `--local` to build from the checkout instead.
@@ -109,8 +109,9 @@ gotchas below. What was written but never run for real is listed in two skills: 
   enables then restarts it, so `global_prep_cmd` applies at once.
 - Input Home (`screen/inputhome/`, an Android TV app: Home key, wake and boot open the HDMI
   input) is `screen.sh`'s last step, asked only when a TV is configured, and never aborts the
-  run. It is the one non-Go Release asset: `build.sh` (no Gradle, nothing to install) builds
-  `inputhome.apk`, in `release.yml` or with `screen.sh --local`, with a toolchain it downloads
+  run. `build.sh` (no Gradle, nothing to install) builds `inputhome.apk` (and, with an app
+  dir as argument, the tablet's `adbwifi.apk`: same tools, same key), in `release.yml` or
+  with `screen.sh --local`, with a toolchain it downloads
   itself into the gitignored `screen/inputhome/.sdk/` — build-tools, platform and JDK pinned
   by URL and sha256 at the top of the script. Signed with
   `~/.local/share/inputhome/debug.keystore`, created only when missing; an APK from another
@@ -301,8 +302,8 @@ gotchas below. What was written but never run for real is listed in two skills: 
   session's config — never touch. Home Assistant and Moonlight themselves are installed and
   signed in by hand (Play Store, accounts, the Sunshine PIN): a prerequisite, not a step.
 - `tablet-server` (`tablet/`, stdlib-only like `power/`, built `GOOS=android GOARCH=arm64`
-  with no cgo — the `linux` build doesn't answer in Termux) is the one Release asset of
-  `android.sh`, or built with `--local`. Port 7923, same `ALLOWED_IPS`/`AUTH_TOKEN`
+  with no cgo — the `linux` build doesn't answer in Termux) is a Release asset of
+  `android.sh` (with `tablet-peq.so` and `tablet-adbwifi.apk`), or built with `--local`. Port 7923, same `ALLOWED_IPS`/`AUTH_TOKEN`
   middleware as the PC's three; the script sets an allowlist only (Home Assistant is to need
   nothing but the address) and adds 127.0.0.1 to check it from the tablet. `GET
   /capabilities`, `GET /state` (display / screen / battery), `POST
@@ -332,12 +333,16 @@ gotchas below. What was written but never run for real is listed in two skills: 
   user lacks the permission), so a fresh install pushes a script to `/sdcard/Download` and
   *types* `sh …` into the Termux window; everything after goes over SSH (8022). That
   first-install path has never been run for real (see the `android-tests-left` skill).
-  SSH survives a tablet reboot, `adb tcpip` doesn't, and nothing root-free brings it back
-  unattended (`persist.adb.tcp.port` is refused; the `settings` command is refused to app
-  uids on Android 13 even with `WRITE_SECURE_SETTINGS`). By hand: Wireless debugging on, then
-  `connect_adb` finds its random port (mDNS through `avahi-browse`: this adb build has no
-  mdns of its own; else by probing 30000–60999) and runs `adb tcpip` to return to the fixed
-  one. An unpaired PC gets a plain "failed to connect", never "unauthorized": when the port
+  SSH survives a tablet reboot, `adb tcpip` doesn't (`persist.adb.tcp.port` is refused).
+  Android also turns Wireless debugging off at every boot; `adbwifi` (`tablet/adbwifi/`, a
+  ~13 kB app installed at STEP 4) turns it back on. The `settings` *command* is refused to
+  app uids even with `WRITE_SECURE_SETTINGS`, but the API is not: the app holds that
+  permission (`pm grant`) and sets `adb_wifi_enabled` from a boot-scheduled job once Wi-Fi
+  is up, plus a persisted 15-min job for Wi-Fi drops (`adb logcat -s adbwifi`). No tap only
+  on a network once ticked "Always allow"; tested with a real reboot 2026-11-15 (~70 s).
+  `connect_adb` finds the random port (mDNS through `avahi-browse`: this adb build has no
+  mdns of its own, and avahi caches the ports of earlier boots, so each is probed; else by
+  probing 30000–60999) and runs `adb tcpip` to return to the fixed one. An unpaired PC gets a plain "failed to connect", never "unauthorized": when the port
   is announced yet refuses, `pair_adb` finds the pairing port the same way and asks for the
   code. A re-run without adb only skips
   the Android settings step. `pkg install` can fail on a tablet whose Termux mirror

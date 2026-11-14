@@ -25,10 +25,10 @@
 #   priority here: audio.sh, when used, ranks these network outputs under
 #   every local device.
 # - tablet-server comes from the GitHub Release, or is built from this
-#   checkout with --local. Everything else is adb and ssh. adb is only needed
-#   for the first install and the Android settings; once Termux has sshd, a
-#   re-run works over SSH alone (adb over Wi-Fi does not survive a tablet
-#   reboot, SSH does).
+#   checkout with --local, and so is adbwifi (tablet/adbwifi), a small app
+#   that turns Wireless debugging back on at every boot. Everything else is
+#   adb and ssh. adb is only needed for the first install and the Android
+#   settings; once Termux has sshd, a re-run works over SSH alone.
 # - SSH: this PC's public key (~/.ssh/id_ed25519.pub, else id_rsa.pub) is
 #   authorized in Termux by the first-install step, whenever SSH doesn't
 #   answer yet — including on a tablet another PC set up.
@@ -388,10 +388,18 @@ adb_state() { adb devices | awk -v d="$1" '$1 == d { print $2 }'; }
 # Android's Wireless debugging announces itself on the network (mDNS): its
 # connection port, and its pairing port for as long as the pairing dialog is
 # open. Echoes that port, or nothing (no avahi-browse, nothing announced).
+# avahi's cache keeps the ports of earlier boots (a new one at each): only a
+# port that takes a connection counts.
 adb_mdns_port() {  # $1 = connect|pairing
   command -v avahi-browse &>/dev/null || return 0
-  timeout 8 avahi-browse -rtp "_adb-tls-$1._tcp" 2>/dev/null |
-    awk -F';' -v ip="$TABLET_IP" '$1 == "=" && $8 == ip { print $9; exit }'
+  local port
+  for port in $(timeout 8 avahi-browse -rtp "_adb-tls-$1._tcp" 2>/dev/null |
+      awk -F';' -v ip="$TABLET_IP" '$1 == "=" && $8 == ip { print $9 }' | sort -u); do
+    if timeout 1 bash -c "</dev/tcp/$TABLET_IP/$port" 2>/dev/null; then
+      echo "$port"
+      return 0
+    fi
+  done
 }
 
 # Wireless debugging only talks to a PC it was paired with, and refuses the
@@ -1037,6 +1045,63 @@ install_peq() {
   tablet_ssh_in "mkdir -p $TERMUX_PREFIX/lib/ladspa && cat > $TERMUX_PREFIX/lib/ladspa/peq.so.new && mv $TERMUX_PREFIX/lib/ladspa/peq.so.new $TERMUX_PREFIX/lib/ladspa/peq.so" < "$so"
 }
 
+# adbwifi (tablet/adbwifi): Android turns Wireless debugging off at every boot,
+# and Termux can't turn it back on (the `settings` command is refused to apps).
+# This small app can: it holds WRITE_SECURE_SETTINGS (granted here) and sets
+# adb_wifi_enabled through the API at boot, once Wi-Fi is up, then every 15 min
+# in case Wi-Fi dropped. Without a tap only on a network ticked "Always allow"
+# once on the tablet. From the Release, or built with --local (Input Home's
+# toolchain, downloaded on the first build).
+ADBWIFI_PKG=net.homelab.adbwifi
+install_adbwifi() {
+  local apk="$WORK/adbwifi.apk" sdk out waited=0
+  sdk="$(adb_sh getprop ro.build.version.sdk | tr -d '\r')"
+  if ! [[ "$sdk" =~ ^[0-9]+$ ]] || [ "$sdk" -lt 30 ]; then
+    print_info "Android API ${sdk:-unknown}: Wireless debugging needs Android 11 (API 30) — adb at boot skipped"
+    return 1
+  fi
+  if [ "$LOCAL" = true ]; then
+    print_info "Building adbwifi from $SCRIPT_DIR/tablet/adbwifi (the first build downloads its toolchain, ~320 MB)"
+    if ! "$SCRIPT_DIR/tablet/adbwifi/build.sh" > "$WORK/adbwifi-build.log" 2>&1; then
+      print_warn "Build failed: $(tail -n 1 "$WORK/adbwifi-build.log")"
+      return 1
+    fi
+    cp "$SCRIPT_DIR/tablet/adbwifi/out/adbwifi.apk" "$apk"
+  elif ! fetch tablet-adbwifi.apk "$apk" 2>/dev/null; then
+    print_warn "The $RELEASE_TAG Release of $REPO has no tablet-adbwifi.apk (adb at boot)"
+    return 1
+  fi
+  out="$(adb_ install -r "$apk" 2>&1)" || true
+  case "$out" in
+    *INSTALL_FAILED_UPDATE_INCOMPATIBLE*|*INSTALL_FAILED_VERSION_DOWNGRADE*)
+      # Signed by another key, or a newer build: it keeps no state, replace it.
+      adb_ uninstall "$ADBWIFI_PKG" &>/dev/null || true
+      out="$(adb_ install "$apk" 2>&1)" || true ;;
+  esac
+  if [[ "$out" != *Success* ]]; then
+    print_warn "adb install of adbwifi failed: $(tail -n 1 <<<"$out")"
+    return 1
+  fi
+  if ! adb_sh "pm grant $ADBWIFI_PKG android.permission.WRITE_SECURE_SETTINGS"; then
+    print_warn "Couldn't grant adbwifi WRITE_SECURE_SETTINGS"
+    return 1
+  fi
+  # Started once: an app never opened is "stopped" and gets no boot broadcast.
+  # The activity schedules the jobs and closes at once.
+  adb_sh "am start -n $ADBWIFI_PKG/.StartActivity" >/dev/null
+  # Its first job runs ~3 s later and checks its work 5 s after that.
+  while [ "$(adb_sh settings get global adb_wifi_enabled | tr -d '\r')" != 1 ] && [ "$waited" -lt 20 ]; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ "$waited" -ge 20 ]; then
+    print_warn "Wireless debugging didn't come on: on the tablet, accept it for this Wi-Fi with 'Always allow on this network'"
+    print_info "Its log: adb logcat -s adbwifi"
+    return 1
+  fi
+  print_ok "Wireless debugging comes back by itself at every boot (undo: adb uninstall $ADBWIFI_PKG)"
+}
+
 # The tablet's sound: PulseAudio for the player and for the PCs, squeezelite.
 apply_audio() {
   local pa_conf="$TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa" pkgs=(pulseaudio)
@@ -1580,6 +1645,9 @@ EOF
     # keepalive's) Android may hold back indefinitely.
     adb_sh 'for p in com.termux com.termux.boot com.termux.api; do dumpsys deviceidle whitelist +$p; done' >/dev/null
     print_ok "Battery optimisation off for Termux, Termux:Boot and Termux:API"
+
+    # adb back after a reboot, so the next run (or a repair) needs no one at the tablet.
+    install_adbwifi || true
 
     # "Display over other apps": what lets a boot script start an activity.
     adb_sh 'appops set com.termux SYSTEM_ALERT_WINDOW allow'

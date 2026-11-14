@@ -1,6 +1,11 @@
 #!/bin/sh
 # Builds out/inputhome.apk with the bare SDK tools (no Gradle).
 #
+# build.sh <app dir> <name> builds another app the same way, into
+# <app dir>/out/<name>.apk, with the same toolchain and the same key: the
+# tablet's adbwifi (tablet/adbwifi/build.sh) is built like that. An app dir
+# holds AndroidManifest.xml, res/ and src/.
+#
 # Nothing to install: the toolchain is downloaded on the first build into .sdk/
 # (gitignored, ~320 MB to fetch, x86_64 Linux) and checked against the sha256
 # below. The versions are pinned here, so this checkout and release.yml build
@@ -12,6 +17,8 @@
 # new one has to replace the installed app instead of updating it.
 set -eu
 cd "$(dirname "$0")"
+APP="$(cd "${1:-.}" && pwd)"
+NAME="${2:-inputhome}"
 
 BT_DIR=build-tools-r37
 BT_URL=https://dl.google.com/android/repository/build-tools_r37_linux.zip
@@ -55,13 +62,14 @@ JAR="$SDK/$PLATFORM_DIR/android.jar"
 export JAVA_HOME="$SDK/$JDK_DIR"
 export PATH="$JAVA_HOME/bin:$PATH"
 
-rm -rf out && mkdir -p out/classes
-"$BT/aapt2" compile --dir res -o out/res.zip
-"$BT/aapt2" link -o out/base.apk --manifest AndroidManifest.xml -I "$JAR" out/res.zip
-find src -name '*.java' -exec javac -Xlint:-options -source 8 -target 8 -bootclasspath "$JAR" -d out/classes {} +
-find out/classes -name '*.class' -exec "$BT/d8" --min-api 26 --lib "$JAR" --output out {} +
-(cd out && jar u0Mf base.apk classes.dex)
-"$BT/zipalign" -f 4 out/base.apk out/aligned.apk
+OUT="$APP/out"
+rm -rf "$OUT" && mkdir -p "$OUT/classes"
+"$BT/aapt2" compile --dir "$APP/res" -o "$OUT/res.zip"
+"$BT/aapt2" link -o "$OUT/base.apk" --manifest "$APP/AndroidManifest.xml" -I "$JAR" "$OUT/res.zip"
+find "$APP/src" -name '*.java' -exec javac -Xlint:-options -source 8 -target 8 -bootclasspath "$JAR" -d "$OUT/classes" {} +
+find "$OUT/classes" -name '*.class' -exec "$BT/d8" --min-api 26 --lib "$JAR" --output "$OUT" {} +
+(cd "$OUT" && jar u0Mf base.apk classes.dex)
+"$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/aligned.apk"
 if [ ! -f "$KEYSTORE" ]; then
     mkdir -p "$(dirname "$KEYSTORE")"
     keytool -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
@@ -70,5 +78,5 @@ if [ ! -f "$KEYSTORE" ]; then
     chmod 600 "$KEYSTORE"
     echo "created signing key $KEYSTORE"
 fi
-"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --out out/inputhome.apk out/aligned.apk
-ls -l out/inputhome.apk
+"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --out "$OUT/$NAME.apk" "$OUT/aligned.apk"
+ls -l "$OUT/$NAME.apk"
