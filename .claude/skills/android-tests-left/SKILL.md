@@ -213,6 +213,69 @@ restarted" line in `~/keepalive.log`. Not yet seen:
 - the new `com.termux.api` allowlist line and the dumpsys check, in a full run of
   `android.sh`.
 
+## Half done — Wireless debugging at boot (adbwifi, 2026-11-15)
+
+`tablet/adbwifi/` (`net.homelab.adbwifi`, built by Input Home's `build.sh`, Release asset
+`tablet-adbwifi.apk`) is installed by `install_adbwifi` at STEP 4; CLAUDE.md ("Channels")
+says how it works. Tested on the kitchen tablet:
+- the setting turned off by hand → the app's job turned it back on, new port, the PC's
+  pairing still valid;
+- `adb reboot` at 00:36:37 → `BOOT_COMPLETED` at 00:37:43, on at 00:37:48, a live port over
+  mDNS and `adb connect` at once, nobody at the tablet (the prototype, same code);
+- `install_adbwifi` and the new `adb_mdns_port` (skips avahi's stale ports), pulled out of
+  the script and run with `--local`: in-place update over the prototype, grant held.
+
+Not yet seen:
+- a full `android.sh` run going through STEP 4 with it, and the Release build (needs a
+  `v*` tag; the step reuses Input Home's key secret);
+- a tablet on a network never "always allowed": `install_adbwifi` should warn after 20 s;
+  what Android shows meanwhile (a dialog at each retry of the boot job?) is unknown;
+- a Wi-Fi drop and reconnect without a reboot (the 15-min job should catch it).
+
+## To do — the camera (LensCast), before it becomes a component
+
+Not in `android.sh` yet: a trial set up by hand on the kitchen tablet on 2026-11-01
+(LensCast 0.1.8, RTSP on 8554, Home Assistant's `camera.tablette_cuisine`). The RTSP
+server was down from 2026-11-11 22:33 to 2026-11-14 22:03 (8554 refused, the web server
+on 8080 still up, the camera closed since the 11th, a reboot on the 13th in between).
+Two LensCast settings were off; the `ha` session switched both on by hand on 2026-11-14,
+and its `ha-android-devices` skill says they must stay on — tell `ha` if the component
+changes where or how they are set:
+- **"Activer la surveillance"** = `watchdogEnabled` (with `watchdogMaxRetries` 5,
+  `watchdogCheckIntervalSeconds` 5) in `GET/PUT /api/settings`: the component can set it
+  with the other settings. `GET /api/status` shows it under `watchdog`.
+- **"Reprendre les flux au démarrage de l'appareil"** (`resume_streams_on_boot` in the
+  APK): in neither `/api/settings` nor `/api/settings/export` (checked 2026-11-14), and
+  Termux/adb can't read the app's data. Screen-only: the component must ask for it by hand,
+  or start the stream itself at boot and when `/snapshot` fails (the 2026-11-01 sequence).
+  Without it, at boot `BootCompletedReceiver` starts the web server, not the RTSP. Both are
+  lost with a reinstall or a data wipe.
+
+**Why the stream had no picture after a boot (found 2026-11-15 with adb).** Android
+gives a foreground service the camera only if it was started while the app was on screen
+(`dumpsys activity services com.raulshma.lenscast` → `allowWhileInUsePermissionInFgs`;
+the process capability in `dumpsys activity processes` reads `-C-N` with it, `---N`
+without). At boot `BootCompletedReceiver` creates `StreamingService` from the background
+(`createdFromFg=false`): the RTSP server answers, but the camera is refused, so no frames
+come out (`/snapshot` 404 "No frame available", ffmpeg gets no stream), whatever the
+resume and watchdog settings. Bringing `MainActivity` up alone isn't enough either.
+What works, tested 2026-11-15 00:25: with `MainActivity` on top, `POST /api/stream/stop`
+then `/api/stream/start` (Bearer) → the flag turns `true`; set lens 1 (cookie login, see
+the memory), then `POST :7923/display/homeassistant`. Frames keep coming with the
+dashboard on top (`/snapshot` 200, an RTSP frame from the PC, front camera). After that a
+stop/start from the background keeps the camera **and** the lens: the one foreground pass
+is needed once per service lifetime (each boot, each process restart). Dead ends:
+`cmd appops set --uid … CAMERA allow` exits 0 but the uid mode stays `foreground` (on
+Android 13 the system drives it from the permission); a stop/start from the background
+leaves the flag `false`.
+
+So the component's boot step: wait for :8080, `am start` MainActivity, stream
+stop/start, lens 1, put the previous display back — and the same after any LensCast
+process restart. Not yet seen: whether the watchdog's "hard" recovery keeps the flag (it
+should, if it stays in the same service), and a whole reboot through that sequence. Nothing
+yet catches a dead camera: a tablet-server check of `/snapshot` in `/state` is one option
+(the RTSP port answering proves nothing).
+
 ## Half done — Dolby off (checked at the reboot of 2026-11-01)
 
 After the reboot: `dumpsys media.audio_flinger` shows no `DAP` effect and music plays, so
