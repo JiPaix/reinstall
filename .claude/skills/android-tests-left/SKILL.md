@@ -223,11 +223,11 @@ says how it works. Tested on the kitchen tablet:
 - `adb reboot` at 00:36:37 → `BOOT_COMPLETED` at 00:37:43, on at 00:37:48, a live port over
   mDNS and `adb connect` at once, nobody at the tablet (the prototype, same code);
 - `install_adbwifi` and the new `adb_mdns_port` (skips avahi's stale ports), pulled out of
-  the script and run with `--local`: in-place update over the prototype, grant held.
+  the script and run with `--local`: in-place update over the prototype, grant held;
+- the v1.20.0 Release's `tablet-adbwifi.apk` updates it in place too (same key in CI).
 
 Not yet seen:
-- a full `android.sh` run going through STEP 4 with it, and the Release build (needs a
-  `v*` tag; the step reuses Input Home's key secret);
+- a full `android.sh` run going through STEP 4 with it;
 - a tablet on a network never "always allowed": `install_adbwifi` should warn after 20 s;
   what Android shows meanwhile (a dialog at each retry of the boot job?) is unknown;
 - a Wi-Fi drop and reconnect without a reboot (the 15-min job should catch it).
