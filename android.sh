@@ -4,13 +4,15 @@
 # =============================================================================
 # Android Tablet Setup Script
 # - Sets up an Android tablet that lives on its charger (adb debugging on, no
-#   root), for any of four things, chosen at each run:
+#   root), for any of five things, chosen at each run:
 #     music player    squeezelite, started at boot towards a Lyrion / Music
 #                     Assistant server
 #     network audio   the tablet's PulseAudio opened on TCP, so a PC can use
 #                     the tablet as an audio output
 #     Home Assistant  its app brought to the front, on the tablet's own page
 #     Moonlight       the stream of this PC's screen started on command
+#     camera          the tablet's camera streamed over RTSP (LensCast, from
+#                     F-Droid), brought back by tablet-server when it stops
 #   Home Assistant drives the last two through tablet-server (tablet/), a small
 #   HTTP server left on the tablet: what is on screen, the battery, two orders.
 #   It also brings Home Assistant back by itself when a stream ends.
@@ -113,6 +115,12 @@ HA_APP=io.homeassistant.companion.android
 MOONLIGHT_APP=com.limelight
 # The Sunshine app Moonlight streams on command.
 MOONLIGHT_STREAM="${MOONLIGHT_STREAM:-Desktop}"
+# The camera: LensCast (F-Droid), set up over its API, kept streaming by
+# tablet-server (tablet/camera.go says why it needs the screen at each boot).
+LENSCAST_APP=com.raulshma.lenscast
+LENSCAST_PORT=8080   # its web server and API, on the tablet
+RTSP_PORT=8554
+LENSCAST_CREDS='~/.config/lenscast/credentials'   # on the tablet; kept across runs
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -791,7 +799,7 @@ timeout 10 pactl load-module module-native-protocol-tcp port=$PULSE_PORT 'auth-i
 # every setting the other two need.
 choose_setup() {
   local pa_conf="$TERMUX_PREFIX/etc/pulse/default.pa.d/50-reinstall.pa"
-  local cur_line cur_name cur_server cur_mac cur_tcp cur_eq apps defaults choice n dash answer serial eqs
+  local cur_line cur_name cur_server cur_mac cur_tcp cur_eq apps defaults choice n dash answer serial eqs creds
 
   # What the tablet has now: the defaults of every question below.
   SERVER_ENV="$(tablet_ssh 'cat ~/.config/tablet-server/server.env 2>/dev/null' || true)"
@@ -802,7 +810,7 @@ choose_setup() {
   cur_tcp="$(tablet_ssh "grep -m1 '^load-module module-native-protocol-tcp' $pa_conf 2>/dev/null" || true)"
   cur_eq="$(tablet_ssh "sed -n 's/^# speakers: //p' $pa_conf 2>/dev/null" || true)"
   # Termux can tell which apps are there (not adb's job: a re-run has none).
-  apps="$(tablet_ssh "for p in $HA_APP $HA_APP.minimal $MOONLIGHT_APP; do pm path \$p >/dev/null 2>&1 && echo \$p; done" || true)"
+  apps="$(tablet_ssh "for p in $HA_APP $HA_APP.minimal $MOONLIGHT_APP $LENSCAST_APP; do pm path \$p >/dev/null 2>&1 && echo \$p; done" || true)"
   HA_PKG="$(grep -m1 "^$HA_APP" <<<"$apps" || true)"
   TABLET_MODEL="$(tablet_ssh '/system/bin/getprop ro.product.model' 2>/dev/null | tr -d "\r'" || true)"
 
@@ -814,6 +822,12 @@ choose_setup() {
     [ -n "$cur_tcp" ] && defaults+="2 "
     case ",$(prev_env COMPONENTS)," in *,homeassistant,*) defaults+="3 " ;; esac
     case ",$(prev_env COMPONENTS)," in *,moonlight,*) defaults+="4 " ;; esac
+    case ",$(prev_env COMPONENTS)," in
+      *,camera,*) defaults+="5 " ;;
+      # Never asked (a run from before the camera was a component): LensCast
+      # there means a camera was set up by hand.
+      *) [ -z "$(prev_env CAMERA_FACING)" ] && grep -qx "$LENSCAST_APP" <<<"$apps" && defaults+="5 " ;;
+    esac
   else
     # First run of this version: what an earlier one set up, and both apps
     # when they are there. A tablet with nothing yet gets everything it can.
@@ -822,6 +836,7 @@ choose_setup() {
     if [ -n "$cur_tcp" ] || [ -z "$cur_line" ]; then defaults+="2 "; fi
     [ -n "$HA_PKG" ] && defaults+="3 "
     grep -qx "$MOONLIGHT_APP" <<<"$apps" && defaults+="4 "
+    grep -qx "$LENSCAST_APP" <<<"$apps" && defaults+="5 "
   fi
   defaults="${defaults% }"
   ask "What should this tablet do?"
@@ -829,20 +844,22 @@ choose_setup() {
   echo "  2) Network audio    PCs can use the tablet as an audio output"
   echo "  3) Home Assistant   show its dashboard on command$([ -n "$HA_PKG" ] || echo '  (app not installed)')"
   echo "  4) Moonlight        stream this PC's screen on command$(grep -qx "$MOONLIGHT_APP" <<<"$apps" || echo '  (app not installed)')"
+  echo "  5) Camera           stream the tablet's camera (RTSP), brought back when it stops$(grep -qx "$LENSCAST_APP" <<<"$apps" || echo '  (LensCast: installed over adb)')"
   print_info "Several numbers, separated by spaces. 0 = none of them."
   read -rp "Choice [${defaults:-0}]: " choice || exit 0
   choice="${choice:-${defaults:-0}}"
-  if ! [[ "$choice" =~ ^[0-4](\ +[0-4])*$ ]]; then
-    print_error "Numbers from 0 to 4, separated by spaces."
+  if ! [[ "$choice" =~ ^[0-5](\ +[0-5])*$ ]]; then
+    print_error "Numbers from 0 to 5, separated by spaces."
     exit 1
   fi
-  WANT_PLAYER=false; WANT_AUDIO=false; WANT_HA=false; WANT_MOONLIGHT=false
+  WANT_PLAYER=false; WANT_AUDIO=false; WANT_HA=false; WANT_MOONLIGHT=false; WANT_CAMERA=false
   for n in $choice; do
     case "$n" in
       1) WANT_PLAYER=true ;;
       2) WANT_AUDIO=true ;;
       3) WANT_HA=true ;;
       4) WANT_MOONLIGHT=true ;;
+      5) WANT_CAMERA=true ;;
     esac
   done
   if [ "$WANT_HA" = true ] && [ -z "$HA_PKG" ]; then
@@ -852,6 +869,10 @@ choose_setup() {
   if [ "$WANT_MOONLIGHT" = true ] && ! grep -qx "$MOONLIGHT_APP" <<<"$apps"; then
     print_warn "Moonlight isn't installed on the tablet — left out (install it, pair it, run this again)"
     WANT_MOONLIGHT=false
+  fi
+  if [ "$WANT_CAMERA" = true ] && [ "$HAVE_ADB" != true ] && ! grep -qx "$LENSCAST_APP" <<<"$apps"; then
+    print_warn "LensCast is installed over adb, not connected — camera left out (Wireless debugging on, run this again)"
+    WANT_CAMERA=false
   fi
 
   # ── the tablet's name: its player, its output on a PC, its page in Home
@@ -1002,6 +1023,41 @@ choose_setup() {
         exit 1
       fi
     fi
+  fi
+
+  # ── camera: which lens, and LensCast's login ──
+  # The login is kept on the tablet across runs: Home Assistant's camera has it
+  # in its RTSP address. Read back even when the camera isn't wanted this time,
+  # so that taking it back later keeps the same one.
+  creds="$(tablet_ssh "cat $LENSCAST_CREDS 2>/dev/null" || true)"
+  CAM_USER="$(sed -n "s/^LENSCAST_USER='\(.*\)'\$/\1/p" <<<"$creds")"
+  CAM_PASS="$(sed -n "s/^LENSCAST_PASSWORD='\(.*\)'\$/\1/p" <<<"$creds")"
+  CAM_TOKEN="$(sed -n "s/^LENSCAST_API_TOKEN='\(.*\)'\$/\1/p" <<<"$creds")"
+  CAM_FACING="$(prev_env CAMERA_FACING)"
+  CAM_NEW=false
+  if [ "$WANT_CAMERA" = true ]; then
+    print_header "Camera"
+    defaults=1
+    [ "$CAM_FACING" = back ] && defaults=2
+    ask "Which camera streams?"
+    echo "  1) Front   the screen's side"
+    echo "  2) Back"
+    read -rp "Choice [$defaults]: " choice || exit 0
+    case "${choice:-$defaults}" in
+      1) CAM_FACING=front ;;
+      2) CAM_FACING=back ;;
+      *) print_error "1 or 2."; exit 1 ;;
+    esac
+    CAM_USER="${CAM_USER:-homeassistant}"
+    if [ -z "$CAM_PASS" ]; then
+      CAM_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"
+      CAM_NEW=true
+      print_info "LensCast gets a new login ($CAM_USER), shown at the end for Home Assistant's camera"
+    else
+      print_ok "LensCast keeps its login ($CAM_USER)"
+    fi
+    # The token is only this tablet's own (tablet-server): a new one costs nothing.
+    [ -n "$CAM_TOKEN" ] || CAM_TOKEN="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
   fi
 
   # ── who may give the tablet orders ──
@@ -1226,6 +1282,123 @@ EOF
 
 # The server Home Assistant talks to (tablet/main.go). A missing binary, or a
 # tablet it can't run on, is no reason to stop: sound doesn't depend on it.
+# The camera: LensCast set up through its API, then its stream started the one
+# way that gets the camera (tablet/camera.go): restarted with the app on
+# screen. tablet-server does that again by itself after each boot.
+#   - a fresh LensCast's API is open: settings, then its login switched on;
+#   - after that everything takes the login (a session cookie): the API token
+#     only reads and starts/stops the stream, and can't choose a lens.
+# An empty apiToken in a PUT keeps the stored one; this sends it anyway.
+# LensCast's "resume streams at boot" switch exists only on its own screen,
+# and doesn't matter: tablet-server restarts the stream after a boot anyway.
+apply_camera() {
+  [ "$WANT_CAMERA" = true ] || return 0
+  local out ha_uri=""
+  print_header "Camera"
+
+  if ! tablet_ssh "pm path $LENSCAST_APP >/dev/null 2>&1"; then
+    print_warn "LensCast isn't installed — camera left out (it is installed over adb: Wireless debugging on, run this again)"
+    WANT_CAMERA=false
+    return 0
+  fi
+  if ! tablet_ssh 'command -v jq >/dev/null' && ! tablet_pkg jq; then
+    print_warn "Termux couldn't install jq — camera left out"
+    WANT_CAMERA=false
+    return 0
+  fi
+  # Written first: if a step below fails after LensCast took the login, the
+  # next run still knows it.
+  tablet_ssh_in "mkdir -p \$(dirname $LENSCAST_CREDS) && umask 077 && cat > $LENSCAST_CREDS" <<EOF
+LENSCAST_USER='$CAM_USER'
+LENSCAST_PASSWORD='$CAM_PASS'
+LENSCAST_API_TOKEN='$CAM_TOKEN'
+EOF
+  [ "$WANT_HA" = true ] && ha_uri="homeassistant://navigate/$HA_PAGE_VALUE"
+
+  # The values go in through stdin (printf %q), not on a command line.
+  out="$( { printf 'U=%q P=%q T=%q FRONT=%q PORT=%q RTSP=%q HA_URI=%q\n' \
+              "$CAM_USER" "$CAM_PASS" "$CAM_TOKEN" "$([ "$CAM_FACING" = back ] && echo false || echo true)" \
+              "$LENSCAST_PORT" "$RTSP_PORT" "$ha_uri"
+            cat <<'EOF'
+B=http://127.0.0.1:$PORT
+X='X-Requested-With: XMLHttpRequest'
+J=$TMPDIR/lenscast.cookies
+JSON='Content-Type: application/json'
+rm -f "$J"
+code() { curl -s -m 10 -o /dev/null -w '%{http_code}' -H "$X" "$@"; }
+frames() { [ "$(code -H "Authorization: Bearer $T" "$B/snapshot")" = 200 ]; }
+login() { jq -nc --arg u "$U" --arg p "$P" '{username:$u,password:$p}' | code -c "$J" -H "$JSON" --data @- "$B/api/auth/login"; }
+
+# On screen first: a stream started there gets the camera.
+am start -n com.raulshma.lenscast/.MainActivity >/dev/null 2>&1
+for i in $(seq 30); do curl -s -m 2 -o /dev/null "$B/api/auth/status" && break; sleep 1; done
+case "$(curl -s -m 5 "$B/api/auth/status")" in
+  *'"required":false'*) auth=() ;;
+  *'"required":true'*) [ "$(login)" = 200 ] || { echo "ERR login"; exit 0; }; auth=(-b "$J") ;;
+  *) echo "ERR down"; exit 0 ;;
+esac
+
+settings="$(curl -s -m 10 -H "$X" "${auth[@]}" "$B/api/settings" | jq -c --arg t "$T" --argjson rtsp "$RTSP" '
+  .camera.resolution = "HD_720P" | .camera.frameRate = 15
+  | .streaming += {rtspEnabled: true, rtspPort: $rtsp, rtspResolution: "720p", onvifEnabled: true,
+                   streamAudioEnabled: false, recordingAudioEnabled: false,
+                   watchdogEnabled: true, apiTokenEnabled: true, apiToken: $t}')"
+[ -n "$settings" ] || { echo "ERR settings-read"; exit 0; }
+c="$(printf '%s' "$settings" | code "${auth[@]}" -X PUT -H "$JSON" --data @- "$B/api/settings")"
+[ "$c" = 200 ] || { echo "ERR settings $c"; exit 0; }
+c="$(jq -nc --arg u "$U" --arg p "$P" '{enabled:true, username:$u, password:$p, viewerEnabled:false, viewerPassword:""}' |
+     code "${auth[@]}" -X PUT -H "$JSON" --data @- "$B/api/auth/config")"
+[ "$c" = 200 ] || { echo "ERR auth $c"; exit 0; }
+echo "OK settings"
+
+# The stream, restarted on screen; then the lens (the login, without the token).
+code -X POST -H "Authorization: Bearer $T" "$B/api/stream/stop" >/dev/null
+sleep 2
+code -X POST -H "Authorization: Bearer $T" "$B/api/stream/start" >/dev/null
+for i in $(seq 15); do frames && break; sleep 1; done
+rm -f "$J"
+if [ "$(login)" = 200 ]; then
+  lenses="$(curl -s -m 10 -H "Authorization: Bearer $T" "$B/api/camera/lenses")"
+  want="$(jq --argjson f "$FRONT" '[.lenses[] | select(.isFront == $f) | .index][0] // empty' <<<"$lenses")"
+  if [ -n "$want" ] && [ "$want" != "$(jq '.selectedIndex' <<<"$lenses")" ]; then
+    c="$(code -b "$J" -X POST -H "$JSON" -d "{\"index\":$want}" "$B/api/camera/lens")"
+    [ "$c" = 200 ] && echo "OK lens $want" || echo "WARN lens $c"
+  fi
+  code -b "$J" -X POST "$B/api/auth/logout" >/dev/null
+fi
+rm -f "$J"
+
+# The screen back, then the proof: frames with LensCast behind.
+if [ -n "$HA_URI" ]; then
+  am start -a android.intent.action.VIEW -d "$HA_URI" >/dev/null 2>&1
+else
+  am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1
+fi
+sleep 5
+frames && echo "OK frames" || echo "WARN no-frames"
+EOF
+          } | tablet_ssh_in 'bash -s' 2>&1 )" || true
+
+  case "$out" in
+    *"ERR login"*)
+      print_warn "LensCast asks for a login this script doesn't know (set by hand?) — camera left out"
+      print_info "Put it in $LENSCAST_CREDS on the tablet (LENSCAST_USER / LENSCAST_PASSWORD), or clear LensCast's data, and run this again."
+      WANT_CAMERA=false; return 0 ;;
+    *"ERR down"*)
+      print_warn "LensCast's API doesn't answer on port $LENSCAST_PORT — camera left out"
+      WANT_CAMERA=false; return 0 ;;
+    *ERR*)
+      print_warn "Setting LensCast up failed ($(grep -m1 ERR <<<"$out")) — camera left out"
+      WANT_CAMERA=false; return 0 ;;
+  esac
+  print_ok "LensCast: 720p, 15 fps, RTSP on port $RTSP_PORT, its watchdog on, the $CAM_FACING camera"
+  if grep -q "OK frames" <<<"$out"; then
+    print_ok "The camera streams, with LensCast behind the screen"
+  else
+    print_warn "No frame from the camera yet — tablet-server tries again within a few minutes (GET /state: camera)"
+  fi
+}
+
 apply_server() {
   local bin="$WORK/tablet-server" components="" state
   print_header "Tablet Server"
@@ -1254,6 +1427,7 @@ apply_server() {
   [ "$WANT_HA" = true ] && components+="homeassistant,"
   [ "$WANT_MOONLIGHT" = true ] && components+="moonlight,"
   [ "$WANT_PLAYER" = true ] && components+="squeezelite,"
+  [ "$WANT_CAMERA" = true ] && components+="camera,"
 
   # Termux's pkill -x compares with the command as it was typed: the server is
   # started by its bare name for that. (-f for one started by its full path,
@@ -1272,6 +1446,7 @@ HA_PACKAGE='$([ "$WANT_HA" = true ] && echo "$HA_PKG")'
 HA_PAGE='$HA_PAGE_VALUE'
 MOONLIGHT_UUID='$ML_UUID'
 MOONLIGHT_APP_ID='$ML_APPID'
+CAMERA_FACING='$CAM_FACING'
 EOF
   # The loop lives in a script of its own, started in the background: a boot
   # script that never returned could hold back the ones after it.
@@ -1287,6 +1462,8 @@ old="\$(cat "\$pidfile" 2>/dev/null)"
 echo \$\$ > "\$pidfile"
 set -a
 . ~/.config/tablet-server/server.env
+# LensCast's login and token, for the camera (kept apart: they outlive a run).
+[ -f $LENSCAST_CREDS ] && . $LENSCAST_CREDS
 set +a
 PATH="\$HOME/.local/bin:\$PATH"
 : > ~/tablet-server.log
@@ -1685,6 +1862,18 @@ settings put global stay_on_while_plugged_in 7'
       print_ok "Home Assistant app: battery optimisation off, may display over other apps"
     fi
 
+    # The camera's app, and what it takes to run unattended: the camera (not
+    # the mic: no sound is streamed), its notification (it streams from a
+    # foreground service), no battery optimisation.
+    if [ "$WANT_CAMERA" = true ]; then
+      installed="$(adb_sh pm list packages | tr -d '\r')"
+      fdroid_install "$LENSCAST_APP" || true
+      adb_sh "pm grant $LENSCAST_APP android.permission.CAMERA
+pm grant $LENSCAST_APP android.permission.POST_NOTIFICATIONS 2>/dev/null
+dumpsys deviceidle whitelist +$LENSCAST_APP" >/dev/null
+      print_ok "LensCast: camera allowed, battery optimisation off"
+    fi
+
     MODEL="$(adb_sh getprop ro.product.model | tr -d '\r')"
     # The tablet lives on its charger.
     if [ -n "$(battery_protection "$MODEL")" ]; then
@@ -1718,6 +1907,7 @@ settings put global stay_on_while_plugged_in 7'
     add_allowed_ips
   else
     apply_audio
+    apply_camera
     apply_server
     apply_keepalive
 
@@ -1979,9 +2169,17 @@ if [ "$PC_ONLY" = false ] && [ "$ADD_PC" = false ]; then
   [ "$WANT_AUDIO" = true ] && does+="network audio, "
   [ "$WANT_HA" = true ] && does+="Home Assistant, "
   [ "$WANT_MOONLIGHT" = true ] && does+="Moonlight, "
+  [ "$WANT_CAMERA" = true ] && does+="camera, "
   echo -e "  Tablet:             ${CYAN}$TABLET_NAME${NC} (${does%, })"
   echo -e "  For Home Assistant: ${CYAN}http://$TABLET_IP:$SERVER_PORT${NC} (/capabilities, /state, POST /display/…)"
   [ "$WANT_HA" = true ] && echo -e "  Its page there:     ${CYAN}$HA_PAGE_VALUE${NC}"
+  if [ "$WANT_CAMERA" = true ]; then
+    if [ "$CAM_NEW" = true ]; then
+      echo -e "  Camera (new login): ${CYAN}rtsp://$CAM_USER:$CAM_PASS@$TABLET_IP:$RTSP_PORT/stream${NC}"
+    else
+      echo -e "  Camera:             ${CYAN}rtsp://$TABLET_IP:$RTSP_PORT/stream${NC} (login unchanged: $LENSCAST_CREDS on the tablet)"
+    fi
+  fi
 fi
 if [ "$WANT_PC_OUTPUT" = true ]; then
   echo -e "  Output on this PC:  ${CYAN}$PLAYER_NAME${NC} (tablet-sink@$SLUG.service, $LATENCY ms)"

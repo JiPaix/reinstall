@@ -232,49 +232,34 @@ Not yet seen:
   what Android shows meanwhile (a dialog at each retry of the boot job?) is unknown;
 - a Wi-Fi drop and reconnect without a reboot (the 15-min job should catch it).
 
-## To do — the camera (LensCast), before it becomes a component
+## Half done — the camera component (LensCast, 2026-11-15)
 
-Not in `android.sh` yet: a trial set up by hand on the kitchen tablet on 2026-11-01
-(LensCast 0.1.8, RTSP on 8554, Home Assistant's `camera.tablette_cuisine`). The RTSP
-server was down from 2026-11-11 22:33 to 2026-11-14 22:03 (8554 refused, the web server
-on 8080 still up, the camera closed since the 11th, a reboot on the 13th in between).
-Two LensCast settings were off; the `ha` session switched both on by hand on 2026-11-14,
-and its `ha-android-devices` skill says they must stay on — tell `ha` if the component
-changes where or how they are set:
-- **"Activer la surveillance"** = `watchdogEnabled` (with `watchdogMaxRetries` 5,
-  `watchdogCheckIntervalSeconds` 5) in `GET/PUT /api/settings`: the component can set it
-  with the other settings. `GET /api/status` shows it under `watchdog`.
-- **"Reprendre les flux au démarrage de l'appareil"** (`resume_streams_on_boot` in the
-  APK): in neither `/api/settings` nor `/api/settings/export` (checked 2026-11-14), and
-  Termux/adb can't read the app's data. Screen-only: the component must ask for it by hand,
-  or start the stream itself at boot and when `/snapshot` fails (the 2026-11-01 sequence).
-  Without it, at boot `BootCompletedReceiver` starts the web server, not the RTSP. Both are
-  lost with a reinstall or a data wipe.
+Component 5 of `android.sh` (`apply_camera`) and tablet-server's keeper
+(`tablet/camera.go`); CLAUDE.md ("The camera") says how it works and why. History: the
+kitchen tablet's RTSP was down 2026-11-11 22:33 → 11-14 22:03 (no keeper then); after a
+reboot the stream had no frames until LensCast was brought on screen (the service started
+from the background has no camera); `cmd appops set --uid … CAMERA allow` exits 0 and
+changes nothing on Android 13.
 
-**Why the stream had no picture after a boot (found 2026-11-15 with adb).** Android
-gives a foreground service the camera only if it was started while the app was on screen
-(`dumpsys activity services com.raulshma.lenscast` → `allowWhileInUsePermissionInFgs`;
-the process capability in `dumpsys activity processes` reads `-C-N` with it, `---N`
-without). At boot `BootCompletedReceiver` creates `StreamingService` from the background
-(`createdFromFg=false`): the RTSP server answers, but the camera is refused, so no frames
-come out (`/snapshot` 404 "No frame available", ffmpeg gets no stream), whatever the
-resume and watchdog settings. Bringing `MainActivity` up alone isn't enough either.
-What works, tested 2026-11-15 00:25: with `MainActivity` on top, `POST /api/stream/stop`
-then `/api/stream/start` (Bearer) → the flag turns `true`; set lens 1 (cookie login, see
-the memory), then `POST :7923/display/homeassistant`. Frames keep coming with the
-dashboard on top (`/snapshot` 200, an RTSP frame from the PC, front camera). After that a
-stop/start from the background keeps the camera **and** the lens: the one foreground pass
-is needed once per service lifetime (each boot, each process restart). Dead ends:
-`cmd appops set --uid … CAMERA allow` exits 0 but the uid mode stays `foreground` (on
-Android 13 the system drives it from the permission); a stop/start from the background
-leaves the flag `false`.
+Tested on the kitchen tablet, 2026-11-15:
+- the keeper, live (built from the checkout, `camera` added to `server.env` by hand):
+  LensCast force-stopped → `app_down` twice → `recovering` → lens 1 → `ok` in ~15 s, the
+  dashboard back, `allowWhileInUsePermissionInFgs=true`;
+- `apply_camera` pulled out of the script, on a LensCast whose login was set (the re-run
+  path): settings, login kept, on-screen pass, frames with the dashboard back; Home
+  Assistant's RTSP address still answers with that login;
+- `go test` covers the boot case, app down, backoff, a Moonlight stream on screen, the
+  wrong lens, and the HTTP client against a fake LensCast.
 
-So the component's boot step: wait for :8080, `am start` MainActivity, stream
-stop/start, lens 1, put the previous display back — and the same after any LensCast
-process restart. Not yet seen: whether the watchdog's "hard" recovery keeps the flag (it
-should, if it stays in the same service), and a whole reboot through that sequence. Nothing
-yet catches a dead camera: a tablet-server check of `/snapshot` in `/state` is one option
-(the RTSP port answering proves nothing).
+Not yet seen:
+- **a reboot with the keeper**: frames back on their own within ~3 min, front lens, the
+  dashboard on top (`~/tablet-server.log`: `camera: recovering` then `ok`);
+- a fresh LensCast (open API) through `apply_camera`, i.e. a new tablet or cleared data,
+  and the F-Droid install at STEP 4 (`fdroid_install` already handles its per-CPU builds);
+- a full `android.sh` run with the component, from the Release;
+- the back camera (`CAMERA_FACING=back`), and a tablet without HA (the screen goes Home);
+- a lost camera HAL (`failed`, retries 10 min → 2 h). Termux can't restart LensCast; the
+  Termux adb client (port 5555 work) could force-stop it.
 
 ## Half done — Dolby off (checked at the reboot of 2026-11-01)
 

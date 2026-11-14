@@ -8,6 +8,9 @@
 //	POST /display/moonlight     -> start the Moonlight stream of the configured PC
 //	GET  /healthz               -> liveness probe
 //
+// With the camera component, /state also says whether LensCast streams, and a
+// keeper brings its stream back when no frame comes out (camera.go).
+//
 // "moonlight" as a display state means the stream itself: Moonlight's stream
 // screen is in front AND holds the focus. Its error box ("connection
 // terminated") sits on that same screen without a stream behind it, and reads
@@ -26,11 +29,13 @@
 //
 //	PORT, ALLOWED_IPS, AUTH_TOKEN  -> as for the PC's servers
 //	TABLET_ID, TABLET_NAME, TABLET_MODEL
-//	COMPONENTS       -> comma-separated: homeassistant, moonlight, squeezelite
+//	COMPONENTS       -> comma-separated: homeassistant, moonlight, squeezelite, camera
 //	HA_PACKAGE       -> the Home Assistant app's package
 //	HA_PAGE          -> the dashboard page to open, e.g. lovelace/kitchen
 //	MOONLIGHT_UUID   -> the PC's id in Moonlight
 //	MOONLIGHT_APP_ID -> the id of the app to stream (Sunshine's "Desktop")
+//	CAMERA_FACING    -> front (default) or back: the lens LensCast streams
+//	LENSCAST_USER, LENSCAST_PASSWORD, LENSCAST_API_TOKEN -> LensCast's login and token
 package main
 
 import (
@@ -78,6 +83,7 @@ type config struct {
 	HAPage          string
 	MoonlightUUID   string
 	MoonlightAppID  string
+	CameraFront     bool
 }
 
 func (c config) has(component string) bool { return slices.Contains(c.Components, component) }
@@ -106,6 +112,11 @@ type server struct {
 	unfocus int       // looks in a row with the stream screen in front but unfocused
 	pending time.Time // an ordered stream must be up by then; zero = none ordered
 	now     func() time.Time
+	sleep   func(time.Duration) // nil: time.Sleep (tests make it instant)
+
+	lc    camera // LensCast; nil without the camera component
+	camMu sync.Mutex
+	cam   cameraState
 }
 
 func main() {
@@ -123,6 +134,14 @@ func main() {
 		log.Printf("requiring bearer token auth")
 	}
 	go s.watch()
+	if s.cfg.has(componentCamera) {
+		if lc := lenscastFromEnv(); lc != nil {
+			s.lc = lc
+			go s.keepCamera()
+		} else {
+			log.Printf("camera: no LENSCAST_API_TOKEN, the camera isn't watched")
+		}
+	}
 
 	addr := resolveAddr(*addrFlag)
 	log.Printf("tablet-server (%s) listening on %s, components: %s", s.cfg.Name, addr, strings.Join(s.cfg.Components, ", "))
@@ -140,6 +159,7 @@ func configFromEnv() config {
 		HAPage:         os.Getenv("HA_PAGE"),
 		MoonlightUUID:  os.Getenv("MOONLIGHT_UUID"),
 		MoonlightAppID: os.Getenv("MOONLIGHT_APP_ID"),
+		CameraFront:    os.Getenv("CAMERA_FACING") != "back",
 	}
 	for _, part := range strings.Split(os.Getenv("COMPONENTS"), ",") {
 		if part = strings.TrimSpace(part); part != "" {
@@ -193,6 +213,7 @@ type state struct {
 	Display  string   `json:"display"`
 	ScreenOn *bool    `json:"screen_on"`
 	Battery  *battery `json:"battery"`
+	Camera   string   `json:"camera,omitempty"` // with the camera component (camera.go)
 }
 
 func (s *server) state() state {
@@ -202,6 +223,9 @@ func (s *server) state() state {
 	}
 	if b, err := s.sys.battery(); err == nil {
 		st.Battery = b
+	}
+	if s.cfg.has(componentCamera) {
+		st.Camera = s.cameraStatus()
 	}
 	return st
 }

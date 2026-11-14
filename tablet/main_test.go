@@ -22,6 +22,9 @@ const (
 	dumpErrorBox = `    topResumedActivity=ActivityRecord{81a22f1 u0 com.limelight/.Game} t152}
   mCurrentFocus=Window{ef530f u0 Connexion interrompue}
 `
+	dumpLensCast = `    topResumedActivity=ActivityRecord{5e1c2aa u0 com.raulshma.lenscast/.MainActivity} t586}
+  mCurrentFocus=Window{7a1b2c3 u0 com.raulshma.lenscast/com.raulshma.lenscast.MainActivity}
+`
 	dumpPCList = `    topResumedActivity=ActivityRecord{77b1a90 u0 com.limelight/.PcView} t152}
   mCurrentFocus=Window{12ab34c u0 com.limelight/com.limelight.PcView}
 `
@@ -94,6 +97,8 @@ func (f *fake) start(args ...string) {
 	}
 	if strings.Contains(line, "ShortcutTrampoline") {
 		f.dump = dumpStream
+	} else if strings.Contains(line, lenscastActivity) {
+		f.dump = dumpLensCast
 	} else {
 		f.dump = dumpHA
 	}

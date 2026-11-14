@@ -272,8 +272,8 @@ gotchas below. What was written but never run for real is listed in two skills: 
 ### Android tablet
 
 - `android.sh` works by adb and ssh against a tablet, and has no wizard. What the tablet
-  does is chosen per run, four components: music player (squeezelite), network audio
-  (PulseAudio on TCP 4713), Home Assistant, Moonlight. Over adb it installs F-Droid, then
+  does is chosen per run, five components: music player (squeezelite), network audio
+  (PulseAudio on TCP 4713), Home Assistant, Moonlight, camera. Over adb it installs F-Droid, then
   Termux, Termux:Boot and Termux:API with `-i org.fdroid.fdroid` so they count as F-Droid
   installs; the KISS launcher becomes the home screen only when the script is what installs
   it. PC side: `tablet-sink@<slug>.service` (`pipewire -c ~/.config/tablet-sink/<slug>.conf`,
@@ -320,6 +320,32 @@ gotchas below. What was written but never run for real is listed in two skills: 
   `pkill -x` compares with the command as typed, so the server is started by its bare name;
   a boot script must return (the server's loop is a script of its own, started with
   `setsid`); Termux can't wake the screen, stop another app or read `/sys` power files.
+- **The camera** is LensCast (`com.raulshma.lenscast`, F-Droid, installed over adb with
+  CAMERA and POST_NOTIFICATIONS, no mic), RTSP on 8554, set up through its API on 8080 by
+  `apply_camera`, and kept streaming by tablet-server (`tablet/camera.go`). **Android gives
+  LensCast's streaming service the camera only if the service was (re)started while the app
+  was on screen** (`dumpsys activity services com.raulshma.lenscast` →
+  `allowWhileInUsePermissionInFgs`). At boot `BootCompletedReceiver` starts it from the
+  background: the RTSP port answers, no frame ever comes out (`/snapshot` 404 "No frame
+  available"). So the keeper checks `/snapshot` every minute (from 90 s after start: the
+  dashboard's boot script goes first) and, two misses in a row, brings LensCast on screen,
+  restarts the stream there, picks the lens, gives the screen back (Home Assistant, else
+  Home); then stream restarts from the background keep the camera until the process ends.
+  Never while a Moonlight stream is up; after a recovery that didn't bring frames back (a
+  lost camera HAL needs LensCast's process restarted) it waits 10 min, doubling to 2 h.
+  `GET /state` → `camera`: `ok`/`no_frames`/`app_down`/`recovering`/`failed`. The lens is
+  never saved (every app start opens the back one), so it is checked on every look. Only
+  `/snapshot` is a health check: the port answering and `/api/status` "Ready" prove
+  nothing. API: writes need `X-Requested-With` ("CSRF check failed"); the API token reads
+  and starts/stops the stream but can't change settings nor the lens, which take a login
+  cookie sent *without* the token; a fresh LensCast's API is open until `PUT
+  /api/auth/config`; an empty `apiToken` in a `PUT /api/settings` keeps the stored one. The
+  login lives in `~/.config/lenscast/credentials` on the tablet, kept across runs (Home
+  Assistant's RTSP address holds it; tablet-server-run sources it), `CAMERA_FACING` in
+  `server.env`. The "resume streams at boot" and watchdog switches: the watchdog is set by
+  the API, resume is screen-only and needn't be on. `dumpsys media.camera` cut short (`grep
+  -m`, `head`) killed the camera HAL once: dump to a file. The `ha` session's
+  `ha-android-devices` skill describes this: tell it when it changes.
 - Moonlight on command needs the PC's id and the app's: `sunshine_uuid` reads
   `~/.config/sunshine/sunshine_state.json`, `sunshine_app_id` computes Sunshine's own id
   (CRC32 of the name + the SHA-256 of its image, as a positive int32 — `gzip | tail -c8` for
