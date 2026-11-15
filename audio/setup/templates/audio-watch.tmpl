@@ -10,7 +10,9 @@
 #    appears or disappears, so the priority order picks again;
 #  - keeps the highest ranked microphone that is connected as the default one,
 #    at all times: a default picked by hand is put back at once (an app can
-#    still record from another microphone chosen in its own settings).
+#    still record from another microphone chosen in its own settings);
+#  - restarts KDE's daemon when the default output becomes a device that has
+#    just appeared, so the volume keys follow it (see kde_follow_default).
 
 export LC_ALL=C   # `pactl subscribe` is parsed below, and it is translated
 
@@ -46,6 +48,8 @@ declare -A node   # device -> node id its volume is read on
 declare -A level  # device -> the volume its tone is sized for
 present=unset     # ranked outputs and mics there at the last pass
 settle=""         # set: a volume moved, the tones are replayed once it settles
+declare -A fresh  # output -> $SECONDS when it appeared (none at the first pass)
+outputs=unset     # every output there at the last pass
 
 alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
@@ -109,6 +113,36 @@ volume_moved() {
   done
 }
 
+# KDE's volume keys act on the default output as KDE sees it (kded6's
+# audioshortcutsservice). On 2026-11-16 the soundbar dropped and came back
+# 15 s later: KDE followed the drop to the headset, then missed the return,
+# and the keys kept moving the headset's volume while the sound played on the
+# soundbar, PipeWire's default. Restarting plasmashell or reloading that kded
+# module didn't help (the library holding the state stays loaded in kded6);
+# restarting kded6 did. The cause is unknown, so the restart is kept to that
+# case: the default output is a device that appeared within the last 15 s.
+# A device leaving needs nothing: the fallback is an output KDE already had,
+# and it followed that one. Every output counts, ranked or not, but no device
+# at the first pass: kded6 starts with the session too and reads it all fresh.
+kde_follow_default() {
+  local sink default
+  if [ "$outputs" != unset ]; then
+    for sink in $1; do
+      grep -qxF -- "$sink" <<<"$outputs" || fresh[$sink]=$SECONDS
+    done
+  fi
+  outputs=$1
+  for sink in "${!fresh[@]}"; do
+    (( SECONDS - ${fresh[$sink]} <= 15 )) || unset "fresh[$sink]"
+  done
+  default=$(pactl get-default-sink) || return
+  [ -n "${fresh[$default]:-}" ] || return
+  unset "fresh[$default]"
+  systemctl --user -q is-active plasma-kded6.service || return
+  systemctl --user --no-block restart plasma-kded6.service &&
+    echo "KDE restarted (kded6): volume keys on $default"
+}
+
 reconcile() {
   local sinks sources sink now=""
   sinks=$(pactl list short sinks | awk '{print $2}') || return
@@ -164,6 +198,9 @@ reconcile() {
     fi
     break
   done
+
+  # Last: a clear-default above changes the default only at the next event.
+  kde_follow_default "$sinks"
 }
 
 # Stopping the service must not leave a tone behind.

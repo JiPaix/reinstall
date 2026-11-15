@@ -127,6 +127,8 @@ func TestRenderProducesExpectedBodies(t *testing.T) {
 		`'change' on server`,
 		"RANKED=(\n  \"bluez_output.AA_BB.1\"\n  \"bluez_output.CC_DD.1\"\n  \"alsa_output.pci-0000_0b_00.1.analog-stereo\"\n)",
 		`/.local/bin/audio-eq apply "$sink"`,
+		`kde_follow_default "$sinks"`, // KDE's volume keys follow a default that just appeared
+		`restart plasma-kded6.service`,
 	)
 	if strings.Contains(watch, "audio_fx") || strings.Contains(watch, "pipewire -c") {
 		t.Error("audio-watch must not run outputs of its own")

@@ -209,7 +209,11 @@ gotchas below. What was written but never run for real is listed in two skills: 
   plays the keepalive tone on the devices that want one while they are connected (and
   kills it itself: a `pw-cat` with `node.dont-reconnect` whose target is gone just sits
   there), and runs `wpctl clear-default` whenever a ranked output or mic comes or goes so
-  the priority order decides again. The tone is per output (18 kHz at 5 % unless tuned;
+  the priority order decides again. When the default output becomes a device that
+  appeared within 15 s (any device, not at its first pass), it restarts `plasma-kded6`:
+  KDE's volume keys live there (`audioshortcutsservice`) and once stayed on the headset
+  after the soundbar dropped and came back (2026-11-16, cause unknown; plasmashell or a
+  module reload didn't help). The tone is per output (18 kHz at 5 % unless tuned;
   `tone_hz`/`tone_vol` in `choices.json`): the wizard's tuner (`audio/setup/tone.go`) plays
   it live on the device while "kHz-percent" is typed. 100 % is ffmpeg's sine at 1/8 of full
   scale, so a typo can't blast a speaker. It replaced a udev rule and the
