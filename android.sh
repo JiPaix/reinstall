@@ -28,8 +28,9 @@
 #   every local device.
 # - tablet-server comes from the GitHub Release, or is built from this
 #   checkout with --local, and so is adbwifi (tablet/adbwifi), a small app
-#   that turns Wireless debugging back on at every boot. Everything else is
-#   adb and ssh. adb is only needed for the first install and the Android
+#   that turns Wireless debugging back on at every boot; tablet-server then
+#   puts adb back on port 5555 with Termux's own adb client, allowed once on
+#   the tablet's screen. Everything else is adb and ssh. adb is only needed for the first install and the Android
 #   settings; once Termux has sshd, a re-run works over SSH alone.
 # - SSH: this PC's public key (~/.ssh/id_ed25519.pub, else id_rsa.pub) is
 #   authorized in Termux by the first-install step, whenever SSH doesn't
@@ -1034,6 +1035,8 @@ choose_setup() {
   CAM_PASS="$(sed -n "s/^LENSCAST_PASSWORD='\(.*\)'\$/\1/p" <<<"$creds")"
   CAM_TOKEN="$(sed -n "s/^LENSCAST_API_TOKEN='\(.*\)'\$/\1/p" <<<"$creds")"
   CAM_FACING="$(prev_env CAMERA_FACING)"
+  # Allowed at an earlier run: kept when this one has no adb (STEP 4 skipped).
+  ADB_FIXED="$(prev_env ADB_FIXED_PORT)"
   CAM_NEW=false
   if [ "$WANT_CAMERA" = true ]; then
     print_header "Camera"
@@ -1156,6 +1159,46 @@ install_adbwifi() {
     return 1
   fi
   print_ok "Wireless debugging comes back by itself at every boot (undo: adb uninstall $ADBWIFI_PKG)"
+}
+
+# Termux's own adb client, allowed once on the tablet's screen: tablet-server
+# uses it to put adb back on port $ADB_PORT after each boot, once adbwifi has
+# brought Wireless debugging back on its random port (tablet/adbport.go). Only
+# an adb client can do that (`adb tcpip`); the persist property is refused.
+# Sets ADB_FIXED. Needs adb on $ADB_PORT now (connect_adb put it there) and SSH.
+setup_termux_adb() {
+  local state="" waited=0
+  tablet_ssh true 2>/dev/null || return 1
+  # abseil-cpp named too: Termux's mirror once had an adb newer than its
+  # library, which then didn't start (CANNOT LINK EXECUTABLE).
+  if ! tablet_ssh 'adb version >/dev/null 2>&1'; then
+    tablet_pkg android-tools abseil-cpp || true
+    if ! tablet_ssh 'adb version >/dev/null 2>&1'; then
+      print_warn "Termux's adb doesn't start — adb won't come back on port $ADB_PORT after a reboot"
+      return 1
+    fi
+  fi
+  state="$(tablet_ssh "adb connect 127.0.0.1:$ADB_PORT >/dev/null 2>&1; sleep 2; adb -s 127.0.0.1:$ADB_PORT get-state 2>/dev/null" || true)"
+  if [ "$state" != device ]; then
+    print_warn "Termux's own adb has to be allowed once, like this PC was"
+    print_info "On the tablet's screen: tick 'Always allow from this computer', then Allow (the key is Termux's). Waiting…"
+    while [ "$state" != device ] && [ "$waited" -lt 120 ]; do
+      sleep 3
+      waited=$((waited + 3))
+      if [ $((waited % 30)) -eq 0 ]; then
+        # The dialog went away (screen off, timeout): a new connection shows it again.
+        tablet_ssh "adb disconnect 127.0.0.1:$ADB_PORT >/dev/null 2>&1; adb connect 127.0.0.1:$ADB_PORT >/dev/null 2>&1" || true
+      fi
+      state="$(tablet_ssh "adb -s 127.0.0.1:$ADB_PORT get-state 2>/dev/null" || true)"
+    done
+  fi
+  tablet_ssh 'adb kill-server >/dev/null 2>&1' || true
+  if [ "$state" != device ]; then
+    print_warn "Not allowed — after a reboot adb is back on Wireless debugging's random port only"
+    return 1
+  fi
+  ADB_FIXED="$ADB_PORT"
+  print_ok "adb comes back on port $ADB_PORT after each boot (tablet-server moves it, ~1 min after Wi-Fi)"
 }
 
 # The tablet's sound: PulseAudio for the player and for the PCs, squeezelite.
@@ -1447,6 +1490,7 @@ HA_PAGE='$HA_PAGE_VALUE'
 MOONLIGHT_UUID='$ML_UUID'
 MOONLIGHT_APP_ID='$ML_APPID'
 CAMERA_FACING='$CAM_FACING'
+ADB_FIXED_PORT='$ADB_FIXED'
 EOF
   # The loop lives in a script of its own, started in the background: a boot
   # script that never returned could hold back the ones after it.
@@ -1823,8 +1867,11 @@ EOF
     adb_sh 'for p in com.termux com.termux.boot com.termux.api; do dumpsys deviceidle whitelist +$p; done' >/dev/null
     print_ok "Battery optimisation off for Termux, Termux:Boot and Termux:API"
 
-    # adb back after a reboot, so the next run (or a repair) needs no one at the tablet.
-    install_adbwifi || true
+    # adb back after a reboot, so the next run (or a repair) needs no one at the
+    # tablet: Wireless debugging, then the fixed port.
+    if install_adbwifi; then
+      setup_termux_adb || true
+    fi
 
     # "Display over other apps": what lets a boot script start an activity.
     adb_sh 'appops set com.termux SYSTEM_ALERT_WINDOW allow'

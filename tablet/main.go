@@ -36,6 +36,7 @@
 //	MOONLIGHT_APP_ID -> the id of the app to stream (Sunshine's "Desktop")
 //	CAMERA_FACING    -> front (default) or back: the lens LensCast streams
 //	LENSCAST_USER, LENSCAST_PASSWORD, LENSCAST_API_TOKEN -> LensCast's login and token
+//	ADB_FIXED_PORT   -> keep adb on this TCP port across reboots (adbport.go)
 package main
 
 import (
@@ -134,6 +135,9 @@ func main() {
 		log.Printf("requiring bearer token auth")
 	}
 	go s.watch()
+	if port := os.Getenv("ADB_FIXED_PORT"); port != "" {
+		go keepADBPort(port) // adbport.go
+	}
 	if s.cfg.has(componentCamera) {
 		if lc := lenscastFromEnv(); lc != nil {
 			s.lc = lc

@@ -366,7 +366,16 @@ gotchas below. What was written but never run for real is listed in two skills: 
   permission (`pm grant`) and sets `adb_wifi_enabled` from a boot-scheduled job once Wi-Fi
   is up, plus a persisted 15-min job for Wi-Fi drops (`adb logcat -s adbwifi`). No tap only
   on a network once ticked "Always allow"; tested with a real reboot 2026-11-15 (~70 s).
-  `connect_adb` finds the random port (mDNS through `avahi-browse`: this adb build has no
+  Then tablet-server (`tablet/adbport.go`, with `ADB_FIXED_PORT` in `server.env`) puts adb
+  back on 5555: every minute it reads `service.adb.tcp.port` (readable by Termux), and when
+  it isn't 5555 scans 127.0.0.1:30000–60999 in Go (Termux's adb has no mdns, the TLS port is
+  in no readable property, a shell scan took 70 s), `adb connect`s Termux's own adb client
+  to each open port and runs `adb tcpip 5555` on the one that says `device`. That client's
+  key is allowed once on the tablet's screen (`setup_termux_adb`, STEP 4): **ticking that
+  dialog by injected taps is refused to Claude by its auto-mode classifier — a person taps
+  it.** Termux's `android-tools` once failed to start (an `abseil-cpp` older than it was
+  built against): it is installed with `abseil-cpp` named. With that key, Termux has adb
+  shell rights on its own tablet. `connect_adb` finds the random port (mDNS through `avahi-browse`: this adb build has no
   mdns of its own, and avahi caches the ports of earlier boots, so each is probed; else by
   probing 30000–60999) and runs `adb tcpip` to return to the fixed one. An unpaired PC gets a plain "failed to connect", never "unauthorized": when the port
   is announced yet refuses, `pair_adb` finds the pairing port the same way and asks for the

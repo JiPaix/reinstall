@@ -226,8 +226,16 @@ says how it works. Tested on the kitchen tablet:
   the script and run with `--local`: in-place update over the prototype, grant held;
 - the v1.20.0 Release's `tablet-adbwifi.apk` updates it in place too (same key in CI).
 
+**Port 5555 after a boot** (tablet-server `adbport.go`, `setup_termux_adb` at STEP 4),
+tested 2026-11-15: Termux's key allowed by a tap on the tablet (by JiPaix: Claude's
+auto-mode classifier refused injected taps on that dialog); `adb usb` from the PC → back on
+5555 35 s later (the TLS port takes a key allowed through that dialog, no pairing needed);
+then a reboot: Wireless debugging at +66 s, `adb: moved to port 5555` at +2:17, the PC
+connected on 5555. `setup_termux_adb` pulled out of the script: passes on an allowed key.
+
 Not yet seen:
-- a full `android.sh` run going through STEP 4 with it;
+- a full `android.sh` run going through STEP 4 with it, and `setup_termux_adb` on a key
+  not yet allowed (the wait and the 30-s reconnects);
 - a tablet on a network never "always allowed": `install_adbwifi` should warn after 20 s;
   what Android shows meanwhile (a dialog at each retry of the boot job?) is unknown;
 - a Wi-Fi drop and reconnect without a reboot (the 15-min job should catch it).
@@ -251,15 +259,20 @@ Tested on the kitchen tablet, 2026-11-15:
 - `go test` covers the boot case, app down, backoff, a Moonlight stream on screen, the
   wrong lens, and the HTTP client against a fake LensCast.
 
+- **a reboot (01:05:14)**: `camera: no_frames` at +2:38 (the RTSP server answered, no
+  frame), `recovering` at +3:43, lens 1, `ok` at +3:56 with the dashboard on top, RTSP
+  frames from the PC. Nobody at the tablet.
+
 Not yet seen:
-- **a reboot with the keeper**: frames back on their own within ~3 min, front lens, the
-  dashboard on top (`~/tablet-server.log`: `camera: recovering` then `ok`);
 - a fresh LensCast (open API) through `apply_camera`, i.e. a new tablet or cleared data,
   and the F-Droid install at STEP 4 (`fdroid_install` already handles its per-CPU builds);
 - a full `android.sh` run with the component, from the Release;
 - the back camera (`CAMERA_FACING=back`), and a tablet without HA (the screen goes Home);
-- a lost camera HAL (`failed`, retries 10 min → 2 h). Termux can't restart LensCast; the
-  Termux adb client (port 5555 work) could force-stop it.
+- a lost camera HAL (`failed`, retries 10 min → 2 h). Termux's own adb client (shell
+  rights since the port 5555 work) could now force-stop LensCast: not done yet.
+- the kitchen tablet's `server.env` still has the `LENSCAST_*` lines added by hand for the
+  live test, and its `tablet-server-run` predates sourcing `~/.config/lenscast/credentials`:
+  a full run of `android.sh` rewrites both.
 
 ## Half done — Dolby off (checked at the reboot of 2026-11-01)
 
